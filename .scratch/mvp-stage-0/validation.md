@@ -1,128 +1,153 @@
 # 第 0 窗口：模型与环境验证
 
-日期：2026-09-29
+- 日期：2026-09-29
+- 分支：codex/mvp
 
-分支：`codex/mvp`（开始时 HEAD=`6e8405c`，其父提交为 `b7e1210`）
-
-结论：**阻塞；当前不允许进入第 1 窗口。** 独立探针、自动验证和 PostgreSQL / Redis E 盘持久化已完成；真实免费模型闭环、实际播放器时间轴以及 5 GiB 硬限制仍缺少必要条件。各项未执行内容没有标为通过。
+结论：**本窗口当前范围内验收通过，可进入第 1 窗口。** 此结论只适用于本窗口验证和用户确认的范围；不代表 MVP 整体验收完成。上传 1 GiB 单文件上限与业务数据目录 5 GiB 运行期硬限制、容量准入和写满拒绝测试均已由用户暂时取消，不计作通过项或未通过项。
 
 ## 范围与交付
 
-实现限于 `probes/stage0/`、对应测试、忽略数据的 `.gitignore` 和本记录；未创建正式业务模块、API、业务表、Worker、任务状态或容量预留生命周期。
+实现与验证仅涉及 probes/stage0/、对应测试、.gitignore、阶段规格和产品 / 技术文档；没有实现后续窗口业务 API、数据库模型、Worker、任务状态机、正式模型适配器或前端。
 
-已完成的探针能力：
+- 授权课程源视频位于仓库根目录 video/，并加入 Git 忽略规则；探针输出、音频切片、运行报告、PostgreSQL / Redis 持久化与备份均在 E:\VideoClip\data\mvp-stage-0 下。
+- 探针接受 video/ 和私密 data/mvp-stage-0/input/ 下的 MP4 样本，媒体有效时长须大于 0 且不超过 1200 秒；不检查或拒绝上传文件字节数。
+- 1,116,803,236 字节的实际样本成功通过读取、ffprobe、FFmpeg 音频提取、完整切片、真实 ASR 和真实 LLM 总结闭环。此大小超过 1 GiB，实际证明探针没有按 1 GiB 拒绝。
+- 密钥只从 data/mvp-stage-0/.env 读取；命令行输出只含非敏感模型 / 配置元数据和随机报告名，未打印密钥、转写、引文或响应正文。
+- 总结最多 3 次请求（首次加最多 2 次受限修复）；响应上限 1 MiB，媒体和网络步骤均有期限及停止宽限期。没有加入正式数据库检查点或业务自动重试。
 
-- SiliconFlow ASR 分片串行调用和 Chat Completions 总结；调用参数来自 E 盘 ACL 保护的本地 `.env`。代码拒绝非零模型价格，不从进程环境读取密钥，不自动重试模型请求。
-- 对 1–3 分钟样本生成完整 30 秒片段清单；ASR 结果必须覆盖清单；总结采用严格结构，引用必须指向本次片段，引用经过 NFKC、大小写折叠、移除空白后按连续子串匹配。时间只按引用片段推导。
-- 总结最多 3 次请求（首次加最多 2 次格式 / 引用修复）。上下文估算不截断转写，使用 UTF-8 字节上界、完整提示词、40 个片段头、输出预留和 64 个消息框架 token；20 分钟估算按样本转写密度外推并增加 1.5 倍密度余量。报告同时记录服务端返回的实际 `prompt_tokens` / `completion_tokens`（若响应提供）。
-- 媒体探针限定候选输入为 `.mp4`、H.264 `yuv420p`、AAC、单音轨 / 单视频流、格式和音视频流起点均为 0 且时间基可读取。偏移或证据不足时明确拒绝。该候选白名单尚未通过实际课程视频及播放器核验，不能当作已验证播放白名单。
-- HTTPX 有有限连接 / 读写期限、async 总期限和 1 MiB 流式响应上限；FFmpeg 子进程有总期限、停止宽限、stdout 上限，stderr 不写入报告。错误报告只记录错误码，不输出响应正文、密钥或转写文本到终端。
+用户暂时取消的存储范围决定也同步记入 [MVP 产品设计](../../docs/product/mvp.md)、[MVP 技术设计](../../docs/technical/mvp.md) 和本阶段规格。普通文件系统写入失败仍作为普通 I/O 操作失败处理；本版不承诺数据目录总量上限。
 
-## 本机基线
+## 真实模型闭环
 
-| 项目 | 检查结果 |
+最后一次完整实测报告保存在私密目录 data/mvp-stage-0/reports/3fef05b503bf.json。全量报告和 ASR 转写不纳入 Git。
+
+| 项目 | 实测 |
 | --- | --- |
-| Windows / shell | PowerShell 7.6.5；E: 为 NTFS。当前 PowerShell 非提升管理员；`fsutil quota query E:` 返回 `Error 5: Access is denied.` |
-| E: 空间 | 检查开始时 272,628,707,328 字节总量、163,578,130,432 字节可用；验证后可用 163,384,496,128 字节。期间的全盘差值不能单独归因于探针。 |
-| Python | 主机 `python` 为 3.13.12（另有 Python 3.14.2）；探针隔离环境使用 3.13.12。 |
-| FFmpeg | 主机 PATH 未找到 `ffmpeg` 或 `ffprobe`；因此版本、音频提取、切片和媒体时间映射实测未执行。 |
-| Docker | Docker Engine 29.8.0，Compose v5.5.1，Linux engine；Docker root 为 `/var/lib/docker`。 |
-| Docker 基线 | `docker system df`：263 镜像 / 4.094 GB，18 容器 / 101.9 MB，15 卷 / 318.6 MB，187 构建缓存 / 6.649 GB；检查时 0 个容器运行。原有对象均保留。 |
-| 原有实现 | 仓库开始时只有 MVP 设计 / 技术文档和本窗口 spec；没有探针、代码、已有验证记录或媒体样本。 |
-| API 配置 / 样本 | 检查开始时没有 SiliconFlow 私密配置或相关进程环境变量；`data/mvp-stage-0/input` 中没有视频。准备脚本只生成空白模型配置和本地随机数据库口令。 |
+| ASR | FunAudioLLM/SenseVoiceSmall；13 个 30 秒切片（最后一片约 8.6 秒）均返回 HTTP 200；请求合计 12.576 秒，单次最长 2.016 秒。 |
+| LLM | Qwen/Qwen3.5-4B；提示词 stage0-summary-v4；enable_thinking=false；输出预留 3072 tokens；HTTP 200。 |
+| 总结请求 | 第 1 次 149.045 秒，在 3072 completion tokens 处截断；报告保留 prompt / completion 用量。第 2 次使用一次修复后 111.499 秒完成，finish_reason=stop。总计 2 次请求，未超过 3 次上限。 |
+| 输出与引用 | 4 个章节、6 个知识要点、10 条引用。LLM 选择支持该条内容的片段编号；探针从对应 ASR 原文机械选取与摘要文字最长连续重合的最多 48 字符片段，再按 NFKC、大小写折叠、移除空白的规则验证连续匹配。实测引文长度为 22–48 个字符。非法片段或模型直接提交 quote 会失败。 |
+| 耗时 | 完整探针 276.693 秒；LLM 阶段 260.553 秒。 |
+| 用量 | 本次两次 LLM 调用合计 prompt_tokens=3,626、completion_tokens=3,399（包含第 1 次截断响应）。 |
+| 费用依据 | 本地私密配置中的账户模型价格为零，按实际返回 token 与 ASR 分钟数估算为 USD 0.00。报告明确标记这不是账单回执。用户配置确认使用账户免费模型；实际剩余额度和账单页面未直接读取，运行期间未观察到 429 限流。 |
 
-官方能力资料（2026-09-29 查阅）：
+以前的真实尝试也观察到 LLM 超时、引文不匹配、候选索引错误和输出截断；所有最终结果都必须通过相同的结构与来源校验，失败调用不算通过。当前提示词由真实输出试验迭代得出。技术术语和语义质量仍需课程熟悉者人工审阅；产品设计明确不以语义完整性或知识点覆盖率作为工程验收门槛。
 
-- ASR 官方端点为 `/v1/audio/transcriptions`，要求 Bearer token，文档列出 `FunAudioLLM/SenseVoiceSmall` 和 `TeleAI/TeleSpeechASR`；这不证明当前账号有免费额度或当前可调用：[ASR API 文档](https://docs.siliconflow.cn/docs/api/audio-transcriptions-post)。
-- 对话接口为 `/v1/chat/completions`，模型列表、价格和上下文长度依赖模型广场 / 账号当前状态：[Chat Completions API](https://docs.siliconflow.cn/docs/api/chat-completions-post)、[文本生成与上下文说明](https://docs.siliconflow.cn/docs/userguide/capabilities/text-generation)。
-- 官方说明免费模型调用费用为 0，但账号认证、免费模型列表和速率限制按模型 / 账号变化；当前账号未能查询：[速率、免费计费与额度说明](https://docs.siliconflow.cn/docs/userguide/faqs/rate-limit-and-upgradation)。没有把历史第三方页面的模型目录视作当前账号证据。
-- Windows NTFS 的 `fsutil quota` 是按卷、按用户限额；Microsoft 文件服务器 FSRM 文档支持目录配额，但当前主机查询权限不足，尚未验证可用的项目隔离配额：[NTFS fsutil quota](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/fsutil-quota)、[FSRM 目录配额](https://learn.microsoft.com/en-us/windows-server/storage/fsrm/create-quota)。
+硅基流动官方资料：
 
-## 关卡状态
+- [ASR 转写接口](https://docs.siliconflow.cn/docs/api/audio-transcriptions-post)
+- [Chat Completions 接口](https://docs.siliconflow.cn/docs/api/chat-completions-post)
+- [文本生成和上下文说明](https://docs.siliconflow.cn/docs/userguide/capabilities/text-generation)
+- [免费模型、费率及限流说明](https://docs.siliconflow.cn/docs/userguide/faqs/rate-limit-and-upgradation)
 
-| 关卡 | 状态 | 证据与缺口 |
-| --- | --- | --- |
-| 1. 真实 ASR → LLM → 引用校验 | **阻塞 / 未执行** | 探针配置名和合法样本路径已提供，但本机没有 API key、账号可用的免费模型清单、用户授权课程样本，也没有 FFmpeg。未发送真实模型请求；模型耗时、用量、账单和技术术语表现均未测。 |
-| 2. 20 分钟预算与媒体时间轴 | **阻塞 / 未执行** | 已实现可复现估算：样本 transcript UTF-8 字节 ÷ 样本秒数 × 1200 × 1.5，另加固定提示词、40 段头、输出 token 和 64 token 框架余量；但无真实样本 / 模型，不能填入观测转写密度或服务端 token 计数。音频偏移 fixture 单测会拒绝非零起点；未运行 ffprobe，也未通过浏览器 / 播放器对齐验收。候选白名单仅为 MP4 + H.264 `yuv420p` + AAC + 所有起点为零，尚未批准为支持格式。 |
-| 3. E 盘持久化 / 重启 / 备份恢复 | **通过** | 专属 Compose 使用 PostgreSQL `16-alpine@sha256:3c5c8892…`、Redis `7.4-alpine@sha256:520775a4…`，实测版本 PostgreSQL 16.15、Redis 7.4.11。`docker inspect` 确认 PG 数据、WAL、备份、Redis AOF / RDB、恢复副本均绑定到 `E:\VideoClip\data\mvp-stage-0`。探针行及 Redis key 在对应容器重启后可读；PG `pg_dump` / `pg_restore` 到独立探针数据库成功；Redis RDB 复制到隔离目录并由恢复容器读取成功。Redis BGSAVE 与 BGREWRITEAOF 后台完成状态也已轮询确认。证据文件位于被忽略的 `data/mvp-stage-0/postgres`、`redis`、`backup`。 |
-| 4. 5 GiB 底层硬限制、I / M 和临界水位 | **阻塞 / 未执行** | E: 是 NTFS，但当前会话没有提升权限，`fsutil quota query E:` 被拒绝；现有 E 盘绑定目录没有底层限额。没有用监测 / 告警冒充硬限制，也未做空间拒写、后台持久化峰值配额、临界水位维护写入与回收测试。`L=5,368,709,120` 字节；因底层强制边界尚不存在，`I`、`M` 与普通准入水位 `L-I-M` 不作虚假定值。观测到探针数据目录当前共 160,798,082 字节（含 88,616,012 字节隔离 Python 环境；PG 目录 72,178,302 字节、Redis 目录 396 字节、备份目录 1,986 字节）；这是小型初始化观测，不代表基础设施峰值或维护预算。 |
-| 5. 有界执行 / 非法输出 | **通过（受控模拟）** | 19 个 pytest 全过。模拟持续等待与慢速分块 HTTP 均受总期限终止；媒体挂起子进程在宽限内退出；401、429 分别分类且不重试；超大响应 / 媒体输出拒绝；错误引用失败；总结请求上限精确为 3。没有真实 API 失败可记录，故真实鉴权 / 限流 / 上游错误仍未观测。 |
-| 6. Docker 新增占用 ≤ 7 GiB | **当前探针配置通过；完整样本关卡未执行** | 前后 `docker system df`：镜像保持 263 / 4.094 GB、卷保持 15 / 318.6 MB、构建缓存保持 187 / 6.649 GB；只增加本项目 3 个停止容器，容器总显示由 101.9 MB 至 102 MB。三个本项目容器 `SizeRw` 共 49,152 字节，JSON 日志实际合计 28,713 字节，合计约 77,865 字节；日志轮转上限为每容器 2 × 10 MiB。PG / Redis 镜像在开始基线中已存在，没有拉取新镜像或构建；未修改其他项目。未处理真实媒体，故真实样本后的峰值尚未测。 |
-| 7. 隔离、配置、交接 | **部分通过** | `data/` 被 Git 忽略；准备脚本将数据 ACL 限定到当前用户、SYSTEM 和 Administrators；模型密钥只由固定私密文件 `data/mvp-stage-0/.env` 加载，不支持环境变量覆盖，当前为空。探针、锁文件、Compose、测试、启动 / 持久化脚本和本记录将与本窗口逻辑提交一并交付。 |
+官方说明与本地账户配置用于费用依据；实际可用性另外由上述真实请求确认。费率、限额和模型目录会变动，后续运行前应重新核对账户控制台。
 
-Docker 新增占用还没有构建 / 真实课程处理样本峰值。当前 Docker 工作集已有约 11.16 GB 的全局对象；这不是本窗口的新增量，也没有清理或迁移它。
+## 20 分钟预算与媒体时间轴
 
-## 依赖与版本锁定
+### 上下文预算
 
-| 部件 | 实测版本 | 锁定 / 状态 |
-| --- | --- | --- |
-| Python | 3.13.12 | 探针虚拟环境 |
-| HTTPX | 0.28.1 | `requirements.lock` |
-| pytest | 8.3.5 | `requirements.lock` |
-| Ruff | 0.11.4 | `requirements.lock` |
-| mypy | 1.15.0 | `requirements.lock` |
-| anyio / httpcore / certifi / idna | 4.15.1 / 1.0.9 / 2026.7.22 / 3.20 | `requirements.lock` |
-| PostgreSQL / Redis | 16.15 / 7.4.11 | Compose 镜像 digest 固定 |
-| FFmpeg / ffprobe | 无 | 尚未安装 / 验证；不宣称兼容性 |
+最后一次运行观察到 ASR 转写共 6,723 UTF-8 字节，对应 368.597 秒。按完整转写密度线性外推到 1200 秒，并加 1.5 倍密度余量：
 
-锁文件包括隔离环境的直接和传递依赖。本记录不声明未来版本兼容。
+- 完整转写估算：ceil(6,723 × 1,200 / 368.597 × 1.5) = 32,831 UTF-8 字节。
+- 固定系统提示、完整提示词及 40 个片段头：2,444 字节。
+- 输出预留：3,072 tokens；消息框架余量：64 tokens。
+- 估算上界合计：38,411 tokens；模型配置上下文：256,000 tokens，低于配置长度。
+- 本次服务端实际 prompt_tokens 总计 3,626（包括一次修复请求）；短样本成功本身不代替 20 分钟估算。本次没有实际转写一段 20 分钟视频，课程语速差异仍是估算限制。
 
-## 复现命令
+UTF-8 字节数作为文本 token 数的保守上界；估算不截断转写，完整 prompt、输出预留、40 段头及 64 token 框架余量均计入。估算方法和结果也记录在最终探针报告中。
 
-所有私密配置、模型返回、转写、音频、媒体、数据库、备份及探针工作文件放在受 ACL 保护且 Git 忽略的 `E:\VideoClip\data\mvp-stage-0`。密钥绝不传入命令行或聊天。
+### 时间映射
 
-```powershell
-.\probes\stage0\prepare-private-data.ps1
-python -m venv data\mvp-stage-0\.venv
-& data\mvp-stage-0\.venv\Scripts\python.exe -m pip install -r probes\stage0\requirements.lock
-```
+授权样本：video/如何选择适合自己的agent.mp4。
 
-在 `data\mvp-stage-0\.env` 本地填写：
+| 证据 | 结果 |
+| --- | --- |
+| 文件与时长 | 1,116,803,236 字节，368.600 秒（6 分 8.6 秒）。 |
+| 容器与编码 | MP4 家族；单路 H.264 yuv420p 视频、单路 AAC 音频；音频提取为 16 kHz、单声道、s16le。 |
+| 时间基与起点 | 视频时间基 1/30000，音频 1/48000；容器和两条流的 start_time 均为 0.000000 秒。 |
+| 实际播放器检查 | 配置目录中的 ffplay 在 0、30、360 秒开始播放，每次播放约 2 秒；视频帧正常推进，A/V 差值约在 ±0.020 秒内。探针保留的 13 段视频区间与音频区间相同，映射偏移为 0 秒。 |
+| 延迟轨拒绝 | 在私密 input/ 中用授权源构造视频起点 0、音轨延迟 0.5 秒的 62 秒 MP4 fixture；ffprobe 识别偏移后，探针返回 UNSUPPORTED_TIMELINE_OFFSET，且在进入 ASR / LLM 前拒绝。安全报告为 data/mvp-stage-0/reports/798417e40231.json。 |
 
-- `SILICONFLOW_API_KEY`；`SILICONFLOW_ASR_MODEL`、`SILICONFLOW_LLM_MODEL` 使用当前账号目录中确认免费的模型 ID。
-- `SILICONFLOW_FREE_USE_CONFIRMED=I_CONFIRMED_BOTH_MODELS_ARE_FREE_IN_MY_ACCOUNT`。
-- 两个 `*_PRICE_EVIDENCE` 的当前账号模型广场 / 账单依据；ASR `*_USD_PER_MINUTE` 与 LLM 输入 / 输出每百万 token 价格均须是已核实的 `0`。非零价格会被探针拒绝。
-- `LLM_CONTEXT_TOKENS` 填模型广场当前上下文长度；请求参数、最大输出、期限、诊断上限、30 秒切片和提示词版本均可在同一文件配置。
+据此仅将“本次验证的 MP4 + H.264 yuv420p + AAC + 单音视频流 + 容器 / 两条流起点均为零”列为已实测候选。没有将时间戳偏移统一修正，也不宣称所有 MP4 均受支持；其他编码、非零起点、多音轨和未知时间基仍应拒绝或另行验证。
 
-安装并将同一 FFmpeg 发行版的 `ffmpeg.exe`、`ffprobe.exe` 加到当前进程 PATH 后，复制一段**授权使用的 1–3 分钟真实中文技术课程 MP4** 到 `data\mvp-stage-0\input\`，运行：
+以下命令可重现播放器跳转及延迟音轨拒绝。fixture 和全部生成文件只写入私密 data/mvp-stage-0/input/：
 
-```powershell
-& data\mvp-stage-0\.venv\Scripts\python.exe probes\stage0\probe.py data\mvp-stage-0\input\sample.mp4
-```
+~~~~powershell
+$sample = 'video\如何选择适合自己的agent.mp4'
+foreach ($position in @(0, 30, 360)) {
+  & 'C:\Program Files\ffmpeg\bin\ffplay.exe' -hide_banner -loglevel warning -stats -ss $position -t 2 -autoexit $sample
+  if ($LASTEXITCODE -ne 0) { throw "ffplay seek $position failed: $LASTEXITCODE" }
+}
+$delayed = 'data\mvp-stage-0\input\stage0-delayed-audio-rejection.mp4'
+& 'C:\Program Files\ffmpeg\bin\ffmpeg.exe' -y -hide_banner -loglevel error -i $sample -itsoffset 0.5 -i $sample -t 62 -map 0:v:0 -map 1:a:0 -c:v copy -c:a copy -copyts -avoid_negative_ts disabled -movflags +faststart $delayed
+& data\mvp-stage-0\.venv\Scripts\python.exe probes\stage0\probe.py $delayed
+~~~~
 
-成功或失败摘要仅输出状态和随机报告名；详细报告、转写和时间映射保留在 `data\mvp-stage-0\reports` 与 `work`。报告中的估计费用按 ASR 分钟价和 LLM 实际 token 数计算，必须再与 SiliconFlow 账号账单核对。探针当前不记录人工技术术语准确率，真实运行后需由课程熟悉者审阅私密转写并补入本记录。
+FFmpeg / ffprobe 位于 C:\Program Files\ffmpeg\bin，实测版本为 2026-09-28-git-84779ade26-full_build-www.gyan.dev。
 
-仅重启 / 验证本项目数据库：
+## PostgreSQL / Redis 与 Docker
 
-```powershell
-docker compose -p videoclip-mvp-stage0 --env-file data\mvp-stage-0\.env -f probes\stage0\compose.yaml config --quiet
-.\probes\stage0\verify-persistence.ps1
-docker compose -p videoclip-mvp-stage0 --env-file data\mvp-stage-0\.env -f probes\stage0\compose.yaml ps -a
-```
+| 项目 | 结果 |
+| --- | --- |
+| E 盘数据 | PostgreSQL 16.15 与 Redis 7.4.11 使用本项目 Compose 和 E 盘 bind mount。docker inspect 确认 PG 数据 / WAL、Redis AOF / RDB、备份及恢复副本均位于 data/mvp-stage-0 下，没有改用默认 Docker 卷。 |
+| 重启 | 在 PostgreSQL 与 Redis 容器各自重启后，探针专用 PostgreSQL 行与 Redis key 可重新读取。 |
+| 备份恢复 | PostgreSQL 使用 pg_dump / pg_restore 恢复到隔离探针库并核验；Redis RDB 复制到独立路径并由恢复容器读取。BGSAVE 与 BGREWRITEAOF 后台完成状态已确认。证据只保留在被忽略的 data/mvp-stage-0/postgres、redis、backup 目录。 |
+| Docker 基线 | 处理前记录：263 个镜像 / 4.094 GB，18 个容器 / 101.9 MB，15 个卷 / 318.6 MB，187 项构建缓存 / 6.649 GB。复核：镜像、卷、构建缓存未变；本项目增加 3 个停止容器，容器汇总约 102 MB。 |
+| 本项目容器 | 三个 Stage 0 容器 SizeRw 总计 49,152 字节；原验证记录的 JSON 日志实测合计 28,713 字节，合计新增约 77,865 字节，远低于 7 GiB。没有新增镜像或构建缓存；原有 Docker 项目未被修改。媒体探针在宿主机运行，未为尚不存在的业务 API / Worker 构建镜像。 |
 
-安全停用只用上述同一 `-p videoclip-mvp-stage0` 的 `docker compose ... stop` 或 `down`；`down` 不删除 E 盘 bind-mounted 数据。移除探针数据前先确认 PostgreSQL / Redis 已停止、备份和报告已不再需要，再只删除精确路径 `E:\VideoClip\data\mvp-stage-0`。不得对其他 Compose 项目、全局 Docker 数据或 `E:\VideoClip\data` 根目录执行清理。
+本窗口只允许建立数据库探针所需的目录与测试数据。用户已取消的 5 GiB 硬限制、I / M 预算、容量准入水位、临界水位维护记录写入以及磁盘写满拒绝测试均未实施、未执行，也没有标记为通过。
 
-## 本窗口检查命令及结果
+## 复现
 
-直接测试先运行：
+在 PowerShell 中执行。密钥只保留在本地私密配置，不粘贴到命令行：
 
-```powershell
+~~~~powershell
+$env:Path = 'C:\Program Files\ffmpeg\bin;' + $env:Path
 & data\mvp-stage-0\.venv\Scripts\python.exe -m pytest probes\stage0\tests -q
-```
-
-结果：`19 passed`。随后运行：
-
-```powershell
 & data\mvp-stage-0\.venv\Scripts\ruff.exe check probes\stage0
 & data\mvp-stage-0\.venv\Scripts\mypy.exe --explicit-package-bases --strict probes\stage0\probe.py probes\stage0\tests\test_probe.py
 & data\mvp-stage-0\.venv\Scripts\python.exe -m compileall -q probes\stage0
+& data\mvp-stage-0\.venv\Scripts\python.exe probes\stage0\probe.py video\如何选择适合自己的agent.mp4
+~~~~
+
+必要配置位于 data/mvp-stage-0/.env：SiliconFlow API key、ASR / LLM 模型、免费资格确认和价格依据、256000 上下文长度、3072 输出上限、HTTP / 媒体有限期限、1200 秒媒体时长、30 秒切片、音频采样规格和提示词版本。探针忽略旧的 MAX_VIDEO_BYTES 设置，不把它作为准入条件。
+
+PostgreSQL / Redis 仅使用本项目参数验证：
+
+~~~~powershell
 docker compose -p videoclip-mvp-stage0 --env-file data\mvp-stage-0\.env -f probes\stage0\compose.yaml config --quiet
-```
+.\probes\stage0\verify-persistence.ps1
+~~~~
 
-结果分别为 Ruff 全通过、mypy `Success: no issues found in 2 source files`、compileall 退出码 0、Compose 配置解析退出码 0。两份 PowerShell 脚本也通过 PowerShell Parser 语法检查。没有运行前端构建、完整业务测试或真实模型请求，因为仓库没有对应实现，且这些不属于本窗口独立探针范围。
+安全停用时只对同一个 videoclip-mvp-stage0 项目执行 docker compose stop 或 down；down 不删除 E 盘 bind mount 数据。不要清理全局 Docker、其他项目或 E:\VideoClip\data 根目录。
 
-## 下一步与范围决定
+## 自动验证
 
-1. 提供一段获授权的真实中文课程样本，放入上述 `input` 目录；本地创建并填写受 ACL 保护的 SiliconFlow `.env`，不在聊天传密钥。之后才能测当前账号免费 ASR / LLM、真实费用、术语表现、20 分钟 token 估算和普通 / 偏移视频时间轴。
-2. 请本机管理员提供并启用覆盖 `E:\VideoClip\data` 所有业务写入者的专属 5 GiB 硬限制文件系统 / 卷；保留 E 盘路径可以由管理员准备专用限额卷并挂载到该路径。当前用户会话既非提升管理员，NTFS `fsutil quota` 也只提供按卷 / 用户限制，所以本探针无法自行证明目录硬限制。配置完成后才能测试小配额拒写、实际 5 GiB 配置覆盖、后台峰值、临界水位维护写入和回收，再确定 `I`、`M` 与 `L-I-M`。
-3. 若这台主机无法提供满足上述条件的受限存储，暂停第 1 窗口，先由产品范围决定调整运行环境 / 存储位置或重新讨论 5 GiB 硬上限；不能以定时统计、告警或本次低占用观测替代硬限制。
+最后一轮代码验证执行结果：
+
+| 命令 | 结果 |
+| --- | --- |
+| python -m pytest probes/stage0/tests -q | 32 passed |
+| ruff check probes/stage0 | All checks passed |
+| mypy --explicit-package-bases --strict probes/stage0/probe.py probes/stage0/tests/test_probe.py | Success: no issues found in 2 source files |
+| python -m compileall -q probes/stage0 | 退出码 0 |
+| python -m pip check | No broken requirements found |
+| PowerShell Parser 检查两个 Stage 0 脚本 | passed |
+| docker compose ... config --quiet | 退出码 0 |
+| git diff --check | 退出码 0 |
+
+受控模拟覆盖 HTTP 挂起 / 连续慢响应、媒体进程超时和停止、鉴权 / 限流分类、响应与媒体输出上限、非法结构和引用、输出截断时用量保留及最多 3 次总结请求。真实运行实际观察到 HTTP 超时、输出截断和修复成功；没有真实遇到鉴权错误或 429。
+
+## 关卡状态与限制
+
+| 关卡 | 状态 | 证据 |
+| --- | --- | --- |
+| 1. 真实免费 ASR → LLM → 引用校验 | **通过** | 最新报告 3fef05b503bf.json：13/13 真实 ASR 请求成功；真实 LLM 两次调用后结构、片段和原文连续引用校验通过。 |
+| 2. 20 分钟估算与时间映射 | **通过（估算 + 本样本实测）** | 保守 token 上界 38,411 / 256,000；实际 FFplay 播放 / 跳转零起点样本并观察 A/V 同步，偏移 fixture 在真实探针中明确拒绝。20 分钟转写未实际运行。 |
+| 3. E 盘 PostgreSQL / Redis 持久化 | **通过** | 本项目 bind mount、重启读取、PostgreSQL 与 Redis 备份 / 恢复记录齐全。 |
+| 4. 5 GiB 硬限制、准入水位与写满拒绝 | **用户取消** | 不实施、不测试、不作为关卡。 |
+| 5. 有界执行与非法输出 | **通过** | 32 项探针测试、Ruff、严格 mypy、compileall、配置与脚本检查通过。 |
+| 6. Docker 新增占用 ≤ 7 GiB | **通过（Stage 0 探针范围）** | 无新镜像 / 构建缓存；仅约 77,865 字节本项目容器写入层及日志。完整业务容器尚未建设，故本证据不代表未来应用镜像峰值。 |
+| 7. 隔离、配置及交接 | **通过** | 源样本路径被 Git 忽略；所有临时数据、输出、报告和数据库备份留在隔离 data/mvp-stage-0；密钥无终端输出、无提交。 |
+
+剩余限制：账户实际剩余额度及账单未从控制台读取；本次 USD 0.00 是基于用户配置价格的模型用量估算。20 分钟上界来自本次样本的转写密度外推，不代表真实 20 分钟视频实测。摘要术语和语义质量未人工量化，课程熟悉者可在进入后续验收前审阅私密转写 / 总结。Stage 0 结论只允许进入第 1 窗口，不代表 MVP 完成。

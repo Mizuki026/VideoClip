@@ -27,6 +27,7 @@ import httpx
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_ROOT = (REPO_ROOT / "data" / "mvp-stage-0").resolve()
+AUTHORIZED_VIDEO_ROOT = (REPO_ROOT / "video").resolve()
 DEFAULT_ENV_FILE = DATA_ROOT / ".env"
 SUPPORTED_FORMAT_TOKENS = {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"}
 MAX_SUMMARY_REQUESTS = 3
@@ -36,15 +37,78 @@ SUMMARY_SCHEMA = {
     "chapters": [
         {
             "title": "章节标题",
-            "evidence": [{"segment_id": 0, "quote": "转写中的连续原文"}],
+            "evidence": [{"segment_id": 0}],
         }
     ],
     "key_points": [
         {
             "text": "知识要点",
-            "evidence": [{"segment_id": 0, "quote": "转写中的连续原文"}],
+            "evidence": [{"segment_id": 0}],
         }
     ],
+}
+SUMMARY_RESPONSE_JSON_SCHEMA = {
+    "name": "course_summary",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "chapters": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 6,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "evidence": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "segment_id": {"type": "integer", "minimum": 0},
+                                },
+                                "required": ["segment_id"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "required": ["title", "evidence"],
+                    "additionalProperties": False,
+                },
+            },
+            "key_points": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 8,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "evidence": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "segment_id": {"type": "integer", "minimum": 0},
+                                },
+                                "required": ["segment_id"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "required": ["text", "evidence"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["chapters", "key_points"],
+        "additionalProperties": False,
+    },
 }
 
 
@@ -70,6 +134,7 @@ class Settings:
     context_tokens: int
     max_output_tokens: int
     temperature: float
+    llm_enable_thinking: bool
     prompt_version: str
     http_total_timeout: float
     http_connect_timeout: float
@@ -78,7 +143,6 @@ class Settings:
     media_stop_grace: float
     max_response_bytes: int
     max_diagnostic_bytes: int
-    max_video_bytes: int
     max_video_seconds: int
     segment_seconds: int
     audio_sample_rate: int
@@ -132,6 +196,15 @@ def _positive_int(values: dict[str, str], key: str, default: int) -> int:
     if result <= 0:
         raise ProbeError("INVALID_CONFIG", f"{key} must be positive")
     return result
+
+
+def _boolean(values: dict[str, str], key: str, default: bool) -> bool:
+    raw = values.get(key, str(default)).strip().lower()
+    if raw in ("true", "1", "yes"):
+        return True
+    if raw in ("false", "0", "no"):
+        return False
+    raise ProbeError("INVALID_CONFIG", f"{key} must be true or false")
 
 
 def _nonnegative_float(values: dict[str, str], key: str) -> float:
@@ -190,9 +263,10 @@ def settings_from(values: dict[str, str]) -> Settings:
         llm_input_usd_per_million=llm_input_rate,
         llm_output_usd_per_million=llm_output_rate,
         context_tokens=context_tokens,
-        max_output_tokens=_positive_int(values, "LLM_MAX_OUTPUT_TOKENS", 4096),
+        max_output_tokens=_positive_int(values, "LLM_MAX_OUTPUT_TOKENS", 3072),
         temperature=temperature,
-        prompt_version=values.get("PROMPT_VERSION", "stage0-summary-v1").strip(),
+        llm_enable_thinking=_boolean(values, "LLM_ENABLE_THINKING", False),
+        prompt_version=values.get("PROMPT_VERSION", "stage0-summary-v4").strip(),
         http_total_timeout=_positive_float(values, "HTTP_TOTAL_TIMEOUT_SECONDS", 240),
         http_connect_timeout=_positive_float(values, "HTTP_CONNECT_TIMEOUT_SECONDS", 15),
         http_read_timeout=_positive_float(values, "HTTP_READ_TIMEOUT_SECONDS", 45),
@@ -200,7 +274,6 @@ def settings_from(values: dict[str, str]) -> Settings:
         media_stop_grace=_positive_float(values, "MEDIA_STOP_GRACE_SECONDS", 5),
         max_response_bytes=_positive_int(values, "MAX_RESPONSE_BYTES", 1_048_576),
         max_diagnostic_bytes=_positive_int(values, "MAX_DIAGNOSTIC_BYTES", 8192),
-        max_video_bytes=_positive_int(values, "MAX_VIDEO_BYTES", 1_073_741_824),
         max_video_seconds=_positive_int(values, "MAX_VIDEO_SECONDS", 1200),
         segment_seconds=_positive_int(values, "SEGMENT_SECONDS", 30),
         audio_sample_rate=_positive_int(values, "AUDIO_SAMPLE_RATE", 16_000),
@@ -214,6 +287,49 @@ def normalize_quote(value: str) -> str:
     return "".join(normalized.split())
 
 
+def citation_options(text: str) -> list[str]:
+    """Build exact, source-derived quote choices for reliable model selection."""
+    source = text.strip()
+    if not source:
+        return []
+    if len(source) <= 48:
+        return [source]
+    options: list[str] = []
+    start = 0
+    while start < len(source):
+        excerpt = source[start : start + 48]
+        if len(excerpt) >= 12 and excerpt not in options:
+            options.append(excerpt)
+        start += 36
+    tail = source[max(0, len(source) - 48) :]
+    if len(tail) >= 12 and tail not in options:
+        options.append(tail)
+    return options
+
+
+def best_source_excerpt(summary_text: str, transcript_text: str) -> str:
+    """Select a short exact transcript span that best overlaps a summary item."""
+    target = re.sub(r"[^\w\u4e00-\u9fff]", "", normalize_quote(summary_text))
+    options = citation_options(transcript_text)
+    best_quote = ""
+    best_score = -1
+    for quote in options:
+        candidate = re.sub(r"[^\w\u4e00-\u9fff]", "", normalize_quote(quote))
+        previous = [0] * (len(target) + 1)
+        score = 0
+        for candidate_character in candidate:
+            current = [0] * (len(target) + 1)
+            for index, target_character in enumerate(target, 1):
+                if candidate_character == target_character:
+                    current[index] = previous[index - 1] + 1
+                    score = max(score, current[index])
+            previous = current
+        if score > best_score:
+            best_quote = quote
+            best_score = score
+    return best_quote
+
+
 def build_manifest(duration: float, segment_seconds: int) -> list[tuple[int, float, float]]:
     if not math.isfinite(duration) or duration <= 0 or segment_seconds <= 0:
         raise ProbeError("INVALID_DURATION", "duration and segment length must be positive")
@@ -222,6 +338,29 @@ def build_manifest(duration: float, segment_seconds: int) -> list[tuple[int, flo
         (index, index * segment_seconds, min((index + 1) * segment_seconds, duration))
         for index in range(count)
     ]
+
+
+def ensure_authorized_sample_path(sample: Path) -> Path:
+    """Accept only user-authorized samples or private probe inputs."""
+    resolved = sample.resolve()
+    allowed_roots = (AUTHORIZED_VIDEO_ROOT, (DATA_ROOT / "input").resolve())
+    for root in allowed_roots:
+        try:
+            resolved.relative_to(root)
+            return resolved
+        except ValueError:
+            continue
+    raise ProbeError(
+        "SAMPLE_OUTSIDE_AUTHORIZED_DIRECTORY",
+        "sample must be inside the repository video directory or private probe input directory",
+    )
+
+
+def validate_sample_duration(duration: float, max_seconds: int) -> None:
+    if not math.isfinite(duration) or duration <= 0:
+        raise ProbeError("INVALID_DURATION", "sample duration must be greater than zero")
+    if duration > max_seconds:
+        raise ProbeError("VIDEO_DURATION_LIMIT", "sample exceeds the configured duration limit")
 
 
 def _number(value: Any, field: str) -> float:
@@ -284,8 +423,12 @@ def validate_summary(raw: str, segments: list[Segment]) -> dict[str, Any]:
         raise ProbeError("INCOMPLETE_SEGMENT_MANIFEST", "the transcript segment manifest is empty or duplicated")
 
     def validate_items(items: Any, label: str) -> list[dict[str, Any]]:
-        if not isinstance(items, list) or not items:
-            raise ProbeError("INVALID_SUMMARY_SCHEMA", f"{label} must be a non-empty array")
+        minimum, maximum = (3, 6) if label == "chapters" else (3, 8)
+        if not isinstance(items, list) or not minimum <= len(items) <= maximum:
+            raise ProbeError(
+                "INVALID_SUMMARY_SCHEMA",
+                f"{label} must contain between {minimum} and {maximum} items",
+            )
         validated: list[dict[str, Any]] = []
         for item in items:
             if not isinstance(item, dict):
@@ -296,22 +439,20 @@ def validate_summary(raw: str, segments: list[Segment]) -> dict[str, Any]:
             text_key = "title" if label == "chapters" else "text"
             text = item[text_key]
             evidence = item["evidence"]
-            if not isinstance(text, str) or not text.strip() or not isinstance(evidence, list) or not evidence:
+            if not isinstance(text, str) or not text.strip() or not isinstance(evidence, list) or len(evidence) != 1:
                 raise ProbeError("INVALID_SUMMARY_SCHEMA", f"{label} text and evidence are required")
             valid_evidence: list[dict[str, Any]] = []
             referenced: list[Segment] = []
             for ref in evidence:
-                if not isinstance(ref, dict) or set(ref) != {"segment_id", "quote"}:
-                    raise ProbeError("INVALID_CITATION_SCHEMA", "evidence needs segment_id and quote")
+                if not isinstance(ref, dict) or set(ref) != {"segment_id"}:
+                    raise ProbeError("INVALID_CITATION_SCHEMA", "evidence needs only a segment_id")
                 segment_id = ref["segment_id"]
-                if not isinstance(segment_id, int) or segment_id not in by_id:
+                if type(segment_id) is not int or segment_id not in by_id:
                     raise ProbeError("UNKNOWN_CITATION_SEGMENT", "citation does not refer to this complete run")
-                quote = ref["quote"]
-                if not isinstance(quote, str) or not normalize_quote(quote):
-                    raise ProbeError("EMPTY_CITATION", "citation quote is empty")
-                if normalize_quote(quote) not in normalize_quote(by_id[segment_id].text):
-                    raise ProbeError("QUOTE_MISMATCH", "citation is not a continuous normalized transcript substring")
                 source = by_id[segment_id]
+                quote = best_source_excerpt(text, source.text)
+                if not normalize_quote(quote) or normalize_quote(quote) not in normalize_quote(by_id[segment_id].text):
+                    raise ProbeError("QUOTE_MISMATCH", "citation is not a continuous normalized transcript substring")
                 referenced.append(source)
                 valid_evidence.append(
                     {
@@ -376,7 +517,12 @@ def estimate_20m_context(segments: list[Segment], prompt_version: str, context_t
         + len(summary_prompt([], prompt_version).encode("utf-8"))
         + 40 * 36
     )
-    required = projected_transcript_bytes + prompt_overhead_bytes + max_output_tokens + CHAT_MESSAGE_OVERHEAD_TOKENS
+    required = (
+        projected_transcript_bytes
+        + prompt_overhead_bytes
+        + max_output_tokens
+        + CHAT_MESSAGE_OVERHEAD_TOKENS
+    )
     return {
         "target_duration_seconds": 1200,
         "observed_duration_seconds": round(observed_duration, 3),
@@ -622,9 +768,10 @@ def summary_prompt(segments: list[Segment], prompt_version: str) -> str:
     return (
         f"提示词版本：{prompt_version}\n"
         "你是中文技术课程助教。只依据完整转写整理章节和知识要点，不补充视频中未讲内容。"
-        "严格返回 JSON 对象，键只能是 chapters 与 key_points。chapters 是非空数组，每项包含 title 和 evidence；"
-        "key_points 是非空数组，每项包含 text 和 evidence。evidence 是非空数组，每项只能包含整数 segment_id 与 quote。"
-        "quote 必须是指定片段转写中的连续原文，不改写。不要输出时间；时间由程序按片段推导。\n"
+        "返回 3–6 个简洁章节和 3–8 条简洁知识要点。每项只给 1 条最直接的引用。"
+        "严格返回键为 chapters 与 key_points 的 JSON 对象；章节字段只能是 title 与 evidence，知识要点字段只能是 text 与 evidence。"
+        "章节数量为 3–6，知识要点数量为 3–8。每项 evidence 必须是单元素数组，元素只能有整数 segment_id。"
+        "每项只输出一个来自完整转写的 segment_id，选择最能支持该项的单个片段。不要输出 quote 或时间；程序会从所选片段中提取最相关的连续原文作为 quote，并按片段推导时间。\n"
         f"目标结构示例：{json.dumps(SUMMARY_SCHEMA, ensure_ascii=False)}\n完整转写：\n{transcript}"
     )
 
@@ -645,6 +792,11 @@ async def llm_request(
         ],
         "temperature": settings.temperature,
         "max_tokens": settings.max_output_tokens,
+        "enable_thinking": settings.llm_enable_thinking,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": SUMMARY_RESPONSE_JSON_SCHEMA,
+        },
         "stream": False,
     }
     try:
@@ -668,8 +820,6 @@ async def llm_request(
                     raise ProbeError("INVALID_LLM_RESPONSE", "LLM message content was not text")
                 if document.get("model") not in (None, settings.llm_model):
                     raise ProbeError("MODEL_MISMATCH", "provider response model differs from the configured model")
-                if choice.get("finish_reason") == "length":
-                    raise ProbeError("TRUNCATED_LLM_RESPONSE", "LLM response ended at the configured token limit")
                 usage = document.get("usage") or {}
                 metadata = {
                     "duration_seconds": round(time.monotonic() - start, 3),
@@ -694,21 +844,50 @@ async def llm_request(
 
 
 async def summarize(
-    client: httpx.AsyncClient, settings: Settings, segments: list[Segment]
+    client: httpx.AsyncClient,
+    settings: Settings,
+    segments: list[Segment],
+    llm_results_sink: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     prompt = summary_prompt(segments, settings.prompt_version)
     correction = ""
-    history: list[dict[str, Any]] = []
+    history = llm_results_sink if llm_results_sink is not None else []
     last_error: ProbeError | None = None
     for attempt in range(1, settings.max_summary_requests + 1):
-        raw, metadata = await llm_request(client, settings, prompt, correction)
-        metadata["attempt"] = attempt
-        history.append(metadata)
+        request_started = time.monotonic()
         try:
-            return validate_summary(raw, segments), history
+            raw, metadata = await llm_request(client, settings, prompt, correction)
         except ProbeError as exc:
+            history.append(
+                {
+                    "attempt": attempt,
+                    "status": "request_failed",
+                    "duration_seconds": round(time.monotonic() - request_started, 3),
+                    "error_code": exc.code,
+                }
+            )
+            raise
+        metadata["attempt"] = attempt
+        metadata["status"] = "response_received"
+        history.append(metadata)
+        if metadata.get("finish_reason") == "length":
+            metadata["validation_status"] = "failed"
+            metadata["validation_error_code"] = "TRUNCATED_LLM_RESPONSE"
+            metadata["validation_error"] = "LLM response ended at the configured token limit"
+            last_error = ProbeError("TRUNCATED_LLM_RESPONSE", metadata["validation_error"])
+            correction = f"{last_error.code}: {last_error}"
+            continue
+        try:
+            validated = validate_summary(raw, segments)
+        except ProbeError as exc:
+            metadata["validation_status"] = "failed"
+            metadata["validation_error_code"] = exc.code
+            metadata["validation_error"] = str(exc)
             last_error = exc
             correction = f"{exc.code}: {exc}"
+        else:
+            metadata["validation_status"] = "passed"
+            return validated, history
     assert last_error is not None
     raise ProbeError("SUMMARY_REPAIR_EXHAUSTED", f"summary invalid after {len(history)} requests ({last_error.code})")
 
@@ -745,29 +924,28 @@ def estimated_cost(settings: Settings, audio_duration: float, llm_calls: list[di
 
 
 async def run_probe(video: Path, settings: Settings) -> Path:
-    video = video.resolve()
-    try:
-        video.relative_to(DATA_ROOT / "input")
-    except ValueError as exc:
-        raise ProbeError("SAMPLE_OUTSIDE_PRIVATE_DATA", f"place the authorized sample under {DATA_ROOT / 'input'}") from exc
+    video = ensure_authorized_sample_path(video)
     if not video.is_file() or video.stat().st_size <= 0:
         raise ProbeError("SAMPLE_NOT_FOUND", "sample video does not exist or is empty")
     if video.suffix.lower() != ".mp4":
         raise ProbeError("UNSUPPORTED_CONTAINER", "the stage-0 playback allowlist accepts .mp4 files only")
-    if video.stat().st_size > settings.max_video_bytes:
-        raise ProbeError("SAMPLE_TOO_LARGE", "sample video exceeds the configured byte cap")
     run_id = uuid.uuid4().hex[:12]
     work_dir = DATA_ROOT / "work" / run_id
     report_dir = DATA_ROOT / "reports"
     work_dir.mkdir(parents=True, exist_ok=False)
     report_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
+    mapped_duration = 0.0
     report: dict[str, Any] = {
         "run_id": run_id,
         "sample_name": video.name,
         "sample_bytes": video.stat().st_size,
         "prompt_version": settings.prompt_version,
-        "configured_models": {"asr": settings.asr_model, "llm": settings.llm_model},
+        "configured_models": {
+            "asr": settings.asr_model,
+            "llm": settings.llm_model,
+            "llm_enable_thinking": settings.llm_enable_thinking,
+        },
         "price_evidence": {
             "asr": settings.asr_price_evidence,
             "asr_usd_per_minute": settings.asr_usd_per_minute,
@@ -780,16 +958,15 @@ async def run_probe(video: Path, settings: Settings) -> Path:
     }
     try:
         raw_media = ffprobe_media(video, settings)
+        report["pipeline"].append("ffprobe")
         duration = _number(raw_media.get("format", {}).get("duration"), "format.duration")
-        if duration < 60 or duration > 180:
-            raise ProbeError("SAMPLE_DURATION_OUT_OF_RANGE", "real model sample must be 1-3 minutes long")
-        if duration > settings.max_video_seconds:
-            raise ProbeError("VIDEO_DURATION_LIMIT", "sample exceeds the configured duration limit")
+        validate_sample_duration(duration, settings.max_video_seconds)
         offset, mapped_duration = map_supported_mp4(raw_media)
         extracted = extract_segments(video, work_dir, mapped_duration, settings)
         expected = build_manifest(mapped_duration, settings.segment_seconds)
         if len(extracted) != len(expected) or [item["segment_id"] for item in extracted] != [item[0] for item in expected]:
             raise ProbeError("INCOMPLETE_SEGMENT_MANIFEST", "FFmpeg output did not match the complete manifest")
+        report["pipeline"].append("ffmpeg extract + complete 30-second manifest")
         report["media"] = {
             "format_name": raw_media["format"].get("format_name"),
             "duration_seconds": round(duration, 3),
@@ -833,8 +1010,7 @@ async def run_probe(video: Path, settings: Settings) -> Path:
                         text=text.strip(),
                     )
                 )
-            report["pipeline"].append("ffprobe")
-            report["pipeline"].append("ffmpeg extract + complete 30-second manifest")
+            report["pipeline"].append("sequential real ASR for every segment")
             report["asr"] = asr_results
             report["transcript"] = [segment.__dict__ for segment in transcripts]
             prompt = summary_prompt(transcripts, settings.prompt_version)
@@ -853,11 +1029,30 @@ async def run_probe(video: Path, settings: Settings) -> Path:
             )
             if not context_budget["fits_conservative_upper_bound"]:
                 raise ProbeError("CONTEXT_BUDGET_EXCEEDED", "sample exceeds the conservative configured context budget")
-            summary, llm_results = await summarize(client, settings, transcripts)
-            report["pipeline"].append("sequential real ASR for every segment")
+            llm_started = time.monotonic()
+            llm_results: list[dict[str, Any]] = []
+            report["llm"] = llm_results
+            try:
+                summary, llm_results = await summarize(
+                    client, settings, transcripts, llm_results_sink=llm_results
+                )
+            except ProbeError as exc:
+                report["llm_attempt"] = {
+                    "status": "failed",
+                    "duration_seconds": round(time.monotonic() - llm_started, 3),
+                    "error_code": exc.code,
+                    "request_count": len(llm_results),
+                }
+                if mapped_duration > 0:
+                    report["cost_estimate"] = estimated_cost(settings, mapped_duration, llm_results)
+                raise
+            report["llm_attempt"] = {
+                "status": "passed",
+                "duration_seconds": round(time.monotonic() - llm_started, 3),
+                "request_count": len(llm_results),
+            }
             report["pipeline"].append("real LLM summary + citation/time validation")
             report["summary"] = summary
-            report["llm"] = llm_results
             report["cost_estimate"] = estimated_cost(settings, mapped_duration, llm_results)
             report["technical_term_review"] = {
                 "status": "requires human review against the authorized course sample",
@@ -876,7 +1071,11 @@ async def run_probe(video: Path, settings: Settings) -> Path:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("sample", type=Path, help="authorized sample under data/mvp-stage-0/input")
+    parser.add_argument(
+        "sample",
+        type=Path,
+        help="authorized MP4 under video/ or private data/mvp-stage-0/input; duration must be 0-20 minutes",
+    )
     args = parser.parse_args(argv)
     try:
         # Credentials and run parameters come only from the ACL-protected local config.
