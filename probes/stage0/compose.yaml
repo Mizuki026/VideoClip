@@ -1,0 +1,85 @@
+services:
+  postgres:
+    image: postgres:16-alpine@sha256:3c5c8892d184f738f4fe282d14ddaa613a38f00f4189d2d94725ebe6f2909ddb
+    pull_policy: never
+    environment:
+      POSTGRES_DB: stage0_probe
+      POSTGRES_USER: stage0_probe
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    ports:
+      - "127.0.0.1:${STAGE0_PG_PORT:-55432}:5432"
+    volumes:
+      - type: bind
+        source: ${STAGE0_DATA_DIR:?set STAGE0_DATA_DIR to the private E drive probe directory}/postgres
+        target: /var/lib/postgresql/data
+      - type: bind
+        source: ${STAGE0_DATA_DIR:?set STAGE0_DATA_DIR to the private E drive probe directory}/backup
+        target: /stage0-backup
+    mem_limit: 768m
+    pids_limit: 128
+    stop_grace_period: 30s
+    restart: "no"
+    healthcheck:
+      test: ["CMD-SHELL", "psql -U stage0_probe -d stage0_probe -Atqc 'SELECT 1' >/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "2"
+
+  redis:
+    image: redis:7.4-alpine@sha256:520775a41a63e77e06c73e35d2fd9cc15921a609516818796b4ecbb813078bc7
+    pull_policy: never
+    command: ["redis-server", "/run/secrets/redis.conf", "--appendonly", "yes", "--appendfsync", "everysec", "--save", "60", "1", "--dir", "/data"]
+    secrets:
+      - source: redis_config
+        target: redis.conf
+    ports:
+      - "127.0.0.1:${STAGE0_REDIS_PORT:-56379}:6379"
+    volumes:
+      - type: bind
+        source: ${STAGE0_DATA_DIR:?set STAGE0_DATA_DIR to the private E drive probe directory}/redis
+        target: /data
+    mem_limit: 256m
+    pids_limit: 64
+    restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "2"
+
+  redis-restore:
+    image: redis:7.4-alpine@sha256:520775a41a63e77e06c73e35d2fd9cc15921a609516818796b4ecbb813078bc7
+    pull_policy: never
+    profiles: [restore]
+    command: ["redis-server", "/run/secrets/redis.conf", "--appendonly", "no", "--save", "", "--dir", "/data"]
+    secrets:
+      - source: redis_config
+        target: redis.conf
+    ports:
+      - "127.0.0.1:${STAGE0_REDIS_RESTORE_PORT:-56380}:6379"
+    volumes:
+      - type: bind
+        source: ${STAGE0_DATA_DIR:?set STAGE0_DATA_DIR to the private E drive probe directory}/backup/redis-restore
+        target: /data
+    mem_limit: 256m
+    pids_limit: 64
+    restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "2"
+
+secrets:
+  postgres_password:
+    file: ${STAGE0_DATA_DIR:?set STAGE0_DATA_DIR to the private E drive probe directory}/secrets/postgres_password
+  redis_config:
+    file: ${STAGE0_DATA_DIR:?set STAGE0_DATA_DIR to the private E drive probe directory}/secrets/redis.conf
