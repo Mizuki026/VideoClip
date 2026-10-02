@@ -176,6 +176,10 @@ def test_submit_freezes_configuration_and_is_idempotent(
             attempt = session.get(AnalysisAttempt, first.attempt.id)
             assert video is not None and video.analysis_task_created_at is not None
             assert video.current_analysis_task_id == first.id
+            detail = client.get(f"/videos/{video_id}")
+            assert detail.status_code == 200
+            assert detail.json()["analysis_task_exists"] is True
+            assert detail.json()["analysis_task_id"] == str(first.id)
             assert task is not None and task.status == "queued"
             assert attempt is not None and attempt.claim_count == 0
             assert attempt.config_sha256 == canonical_sha256(attempt.config_snapshot)
@@ -201,6 +205,8 @@ def test_submission_and_task_reads_are_owner_scoped(
         assert created.status_code == 202
         task_id = created.json()["id"]
         assert stranger_id != owner_id
+        assert owner.get(f"/videos/{video_id}").json()["analysis_task_id"] == task_id
+        assert stranger.get(f"/videos/{video_id}").status_code == 404
         assert stranger.get(f"/videos/{video_id}/tasks/{task_id}").status_code == 404
         assert stranger.get(f"/videos/{video_id}/transcript").status_code == 404
         stranger_headers = mutate_headers(csrf(stranger))

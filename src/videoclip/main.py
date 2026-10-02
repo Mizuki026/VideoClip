@@ -212,6 +212,7 @@ def _video_detail(video: Video) -> VideoDetailResponse:
     return VideoDetailResponse(
         **_video_summary(video).model_dump(),
         analysis_task_exists=video.analysis_task_created_at is not None,
+        analysis_task_id=video.current_analysis_task_id,
     )
 
 

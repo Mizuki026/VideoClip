@@ -48,6 +48,7 @@ class VideoListResponse(BaseModel):
 
 class VideoDetailResponse(VideoSummary):
     analysis_task_exists: bool
+    analysis_task_id: UUID | None
 
 
 class UploadResponse(BaseModel):
