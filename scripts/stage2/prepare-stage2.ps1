@@ -67,7 +67,8 @@ $applicationSecret = (($applicationBytes | ForEach-Object { $_.ToString('x2') })
 
 $privateConfig = @"
 APP_ENV=development
-APP_ORIGIN=http://127.0.0.1:58002
+APP_ORIGIN=http://127.0.0.1:5174
+MVP_STAGE2_API_URL=http://127.0.0.1:58002
 APP_SECRET_KEY=$applicationSecret
 APP_DATA_ROOT=E:/VideoClip/data/mvp-stage-2/app
 COOKIE_SECURE=false

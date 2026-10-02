@@ -1,6 +1,6 @@
 # 课程视频转写与可追溯总结平台：MVP 技术方案
 
-> 状态：第 0、1、2、3、4 窗口后端已验收。第 4 窗口完成正式 LLM 总结、引用验证与持久化发布；React 页面、同源 `/api` 代理和播放器交互仍待实现。
+> 状态：第 0 至第 4 窗口后端验收通过，第 5 窗口页面闭环验收通过。第 6 窗口最终复查与展示验收尚未开始。
 > 更新日期：2026-10-02。MVP 暂不实施上传视频字节上限及业务数据目录运行期总量限制。
 > 产品依据：[MVP 产品设计](../product/mvp.md)。产品范围与验收标准以该文档为准。
 
@@ -303,11 +303,13 @@ E:\VideoClip\data\
 
 ## 9. 本地运行与环境验证
 
-目标运行结构由 Docker Compose 运行 API、Worker、PostgreSQL 和 Redis；API 与 Worker 共用包含 FFmpeg 的精简镜像，前端仅保留构建产物进入演示镜像。宿主机只向回环地址开放必要端口。Stage 1 单独启动 API 与 PostgreSQL；Stage 2 已在独立 Compose 项目启动 API、PostgreSQL、Redis 和一个 Worker。前端及实际 `/api` 反向代理尚未实现。
+目标运行结构由 Docker Compose 运行 API、Worker、PostgreSQL 和 Redis；API 与 Worker 共用包含 FFmpeg 的精简镜像。React 前端在宿主机由 Vite 提供开发与本地预览入口，`/api` 在同一 scheme、host、port 下去掉前缀并转发给 API。页面固定使用 `127.0.0.1:5174`，开发与预览均启用 `strictPort`；不使用用户另一个项目占用的 5173。Stage 1 单独启动 API 与 PostgreSQL；Stage 2 在独立 Compose 项目运行 API、PostgreSQL、Redis 和一个 Worker。
 
 Stage 1 使用独立 Compose 项目 `videoclip-mvp-stage1`：`scripts/stage1/prepare-private-data.ps1` 在 `data/mvp-stage-1/` 准备 E 盘私密配置及数据目录，`run-stage1.ps1` 构建镜像、运行 PostgreSQL 迁移并启动服务，`stop-stage1.ps1` 只停止本项目 API / PostgreSQL 且保留数据。API / PostgreSQL 分别绑定回环端口 58001 / 55442；数据库和媒体通过 E 盘 bind mount 持久化。容器限制为 API 1 GiB / PostgreSQL 768 MiB、每个 128 PID；JSON 日志每容器最多保留 2 个 10 MiB 文件。测试数据库 `videoclip_mvp_stage1_test` 与业务库隔离。
 
-Stage 2 使用独立 Compose 项目 `videoclip-mvp-stage2` 和 `data/mvp-stage-2/` 私密配置：先运行 `scripts/stage2/prepare-stage2.ps1`，再用 `run-stage2.ps1` 构建、迁移并启动 API / Worker / PostgreSQL / Redis。Stage 2 回环端口为 API 58002、PostgreSQL 55443；Redis 只在 Compose 网络内开放。其 app、PostgreSQL 和 Redis 持久化目录分别 bind mount 到 E 盘 Stage 2 路径，Stage 1 继续使用原数据库、端口、镜像标签和容器。Worker 仅一个实例、并发 1、预取 1；Redis 消息携带 task 与 attempt UUID，不配置业务结果后端或自动重试。`stop-and-confirm-worker.ps1` 只针对单个 Stage 2 Worker，立即停止并核实容器退出，按实际执行 ID 登记停止事实。
+Stage 2 使用独立 Compose 项目 `videoclip-mvp-stage2` 和 `data/mvp-stage-2/` 私密配置：先运行 `scripts/stage2/prepare-stage2.ps1`，再用 `run-stage2.ps1` 构建、迁移并启动 API / Worker / PostgreSQL / Redis。Stage 2 回环端口为 API 58002、PostgreSQL 55443；Redis 只在 Compose 网络内开放。浏览器源配置 `APP_ORIGIN=http://127.0.0.1:5174`，前端代理目标默认为 `http://127.0.0.1:58002`；`MVP_STAGE2_API_URL` 让既有 Stage 2 Python 验收脚本仍可直连 API，同时发送匹配浏览器的 `Origin`。其 app、PostgreSQL 和 Redis 持久化目录分别 bind mount 到 E 盘 Stage 2 路径，Stage 1 继续使用原数据库、端口、镜像标签和容器。Worker 仅一个实例、并发 1、预取 1；Redis 消息携带 task 与 attempt UUID，不配置业务结果后端或自动重试。`stop-and-confirm-worker.ps1` 只针对单个 Stage 2 Worker，立即停止并核实容器退出，按实际执行 ID 登记停止事实。
+
+本地前端从仓库根目录执行 `Set-Location E:\VideoClip\frontend; npm ci; npm run dev`，浏览器入口为 `http://127.0.0.1:5174`。构建后可执行 `npm run preview` 使用同一入口验证产物；API 目标可用 `VIDEOCLIP_API_TARGET` 覆盖。`npm run lint`、`npm run build`、`npm test` 和 `npm run e2e` 分别执行 lint、类型检查 / 构建、前端状态 / 组件测试及 Playwright 浏览器验收。
 
 PostgreSQL 和 Redis 的持久化路径需明确映射到 E 盘业务目录，参考 [Docker bind mount 说明](https://docs.docker.com/engine/storage/bind-mounts/)。先验证 Windows 路径挂载、数据库初始化权限、容器重启后的持久化与备份恢复；不能静默改用位于默认 Docker 存储区的数据库卷来绕过路径要求。本版不验证业务数据目录的 5 GiB 硬限制、容量准入水位或写满拒绝行为。
 
@@ -372,8 +374,9 @@ Worker 只部署一个服务实例，不用 Compose 自动扩容或重启策略�
 | 第 2 窗口异步转写验收 | **第一条异步转写链路已通过。** 任务提交 / 所有者隔离 / 投递事实 / 单 Worker / 冻结配置 / 进程停止与持久化检查点已实现；真实授权样片 13/13 个 SenseVoice 请求成功，转写完成后保持 `awaiting_summary`，API / Worker 重启后仍可读取。后端全量 60 项、Stage 0 回归 32 项通过；细节和限制见[第 2 窗口记录](../../.scratch/mvp-stage-2/validation.md)。 |
 | 第 3 窗口人工恢复与故障处理 | **后端阶段通过。** 同 task attempt lineage、投递消息绑定 attempt、人工安全恢复、只复用完全匹配的成功检查点、已提交分析的视频删除与临时清理重试已实现；真实 13 片样本验证 3 片复用、10 次补跑，重启后仍为 `awaiting_summary`。后端 68 项、Stage 0 回归 32 项通过；详见[第 3 窗口记录](../../.scratch/mvp-stage-3/validation.md)。 |
 | 第 4 窗口正式总结与引用发布 | **后端阶段通过。** 冻结 LLM 配置、有限请求与 task 级三次总上限、summary-only 恢复、确定性引用校验、唯一持久化发布及所属用户只读 API 已实现；真实授权样本经重启读回，13 段转写、5 章、5 个知识要点、10/10 原文与区间匹配。后端 82 项、Stage 0 回归 32 项通过；详见[第 4 窗口记录](../../.scratch/mvp-stage-4/validation.md)。两条旧任务的历史清单指纹无法验证，保留未修改，真实闭环改用隔离样本；供应商延迟与恢复记录见验收文档。 |
-| 后续窗口范围 | React 注册 / 列表 / 详情页面、同源 `/api` 代理、引用点击播放和浏览器时间轴 / Range 联合验收。恢复、清理和总结目前只有后端 API，没有前端入口。 |
+| 第 5 窗口页面闭环 | **阶段验收通过。** React + TypeScript 注册 / 登录、视频列表与详情，同源 Vite `/api` 代理，HttpOnly Cookie 与 CSRF、原始流上传、可恢复任务 ID、进度 / 转写 / 总结、人工恢复 / 续接 / 清理、删除进度和原生 Range 播放均已实现。Chromium 验证真实 1,116,803,236 字节样本上传、真实分析与总结、刷新后任务恢复、两处不同引用定位并持续播放、HEAD 200 / Range 206、注销 401、跨账号资源 404 及删除完成；详见[第 5 窗口记录](../../.scratch/mvp-stage-5/validation.md)。前端 lint、构建和 5 项单测通过；完整后端回归记录在验收文档。端口为 5174，Stage 2 `APP_ORIGIN` 已匹配，Stage 1 / 2 服务保持健康。 |
+| 后续窗口范围 | 第 6 窗口最终复查与展示验收。第 5 窗口不包含发布部署、额外展示包装或超出现有产品范围的新功能。 |
 
-第 4 窗口完成后，合法总结发布后 task 才进入 `succeeded`；后端阶段通过不代表浏览器页面闭环或 MVP 整体完成。下一窗口实现页面与 `/api` 代理，并在浏览器验证引用点击和播放定位。业务数据目录 5 GiB 硬限额、容量准入水位与写满拒绝测试仍不在当前范围；如要恢复，先另行确认产品决策和验收方案。
+第 5 窗口已证明页面可从真实后端状态完成页面闭环；本次未改写两条历史 `TRANSCRIPT_SOURCE_MISMATCH` 任务、任务生命周期或引用算法。MVP 的第 6 窗口最终复查与展示验收待单独开展。业务数据目录 5 GiB 硬限额、容量准入水位与写满拒绝测试仍不在当前范围；如要恢复，先另行确认产品决策和验收方案。
 
 MVP 完成后再迭代分片上传、自动恢复与限流等待、删除原视频但保留笔记，以及更完整的故障执行记录。

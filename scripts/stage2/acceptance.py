@@ -85,12 +85,13 @@ def main() -> None:
     if not ENV_FILE.is_file():
         raise SystemExit("Run scripts/stage2/prepare-stage2.ps1 before acceptance.")
     config = dotenv_values(ENV_FILE)
-    origin = str(config.get("APP_ORIGIN") or "http://127.0.0.1:58002")
+    origin = str(config.get("APP_ORIGIN") or "http://127.0.0.1:5174")
+    api_url = str(config.get("MVP_STAGE2_API_URL") or "http://127.0.0.1:58002")
     username = "stage2-" + uuid.uuid4().hex[:12]
     password = secrets.token_urlsafe(32)
     digest = hashlib.sha256()
     timeout = httpx.Timeout(1800.0, connect=15.0)
-    with httpx.Client(base_url=origin, timeout=timeout, follow_redirects=False) as client:
+    with httpx.Client(base_url=api_url, timeout=timeout, follow_redirects=False) as client:
         csrf = check(client.get("/auth/csrf"), 200, "anonymous CSRF token").json()["csrf_token"]
         headers = {"Origin": origin, "X-CSRF-Token": csrf}
         check(

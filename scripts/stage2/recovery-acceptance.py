@@ -214,11 +214,11 @@ def stop_execution(execution_id: str) -> None:
         )
 
 
-def wait_for_api(origin: str, timeout_seconds: int = 180) -> None:
+def wait_for_api(api_url: str, timeout_seconds: int = 180) -> None:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         try:
-            response = httpx.get(f"{origin}/health", timeout=3)
+            response = httpx.get(f"{api_url}/health", timeout=3)
             if response.status_code == 200 and response.json().get("status") == "ok":
                 return
         except (httpx.HTTPError, ValueError):
@@ -229,13 +229,14 @@ def wait_for_api(origin: str, timeout_seconds: int = 180) -> None:
 
 def cleanup_test_video(
     config: dict[str, Any],
+    api_url: str,
     origin: str,
     username: str,
     password: str,
     video_id: str,
     task_id: str | None,
 ) -> None:
-    with httpx.Client(base_url=origin, timeout=60.0, follow_redirects=False) as client:
+    with httpx.Client(base_url=api_url, timeout=60.0, follow_redirects=False) as client:
         login_headers = csrf_headers(client, origin)
         require(
             client.post(
@@ -378,7 +379,8 @@ def main() -> None:
     if not ENV_FILE.is_file() or arguments.duration_seconds < 61:
         raise SystemExit("Stage 2 must be prepared and the fixture must span at least two ASR segments.")
     config = dotenv_values(ENV_FILE)
-    origin = str(config.get("APP_ORIGIN") or "http://127.0.0.1:58002")
+    origin = str(config.get("APP_ORIGIN") or "http://127.0.0.1:5174")
+    api_url = str(config.get("MVP_STAGE2_API_URL") or "http://127.0.0.1:58002")
     baseline_tasks = preflight(config)
     fixture = make_fixture(source, arguments.duration_seconds)
     username = "stage3-" + uuid.uuid4().hex[:12]
@@ -390,7 +392,7 @@ def main() -> None:
     result: dict[str, Any] = {"result": "failed"}
     try:
         timeout = httpx.Timeout(1800.0, connect=15.0)
-        with httpx.Client(base_url=origin, timeout=timeout, follow_redirects=False) as client:
+        with httpx.Client(base_url=api_url, timeout=timeout, follow_redirects=False) as client:
             headers = csrf_headers(client, origin)
             require(
                 client.post(
@@ -544,7 +546,7 @@ def main() -> None:
 
             compose(config, "restart", "api", "worker")
             child_worker_started = True
-            wait_for_api(origin)
+            wait_for_api(api_url)
             persisted = require(
                 client.get(f"/videos/{video_id}/tasks/{task_id}"), 200, "post-restart task read"
             ).json()
@@ -582,7 +584,7 @@ def main() -> None:
     finally:
         try:
             if video_id is not None:
-                cleanup_test_video(config, origin, username, password, video_id, task_id)
+                cleanup_test_video(config, api_url, origin, username, password, video_id, task_id)
             if registered:
                 cleanup_test_account(config, username)
         finally:
