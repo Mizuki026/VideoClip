@@ -106,6 +106,22 @@ def status_counts(config: dict[str, Any]) -> str:
     )
 
 
+def checkpoint_fingerprints(config: dict[str, Any], attempt_id: str) -> dict[int, tuple[str, str]]:
+    parsed_attempt_id = uuid.UUID(attempt_id)
+    rows = database_value(
+        config,
+        "SELECT COALESCE(string_agg(segment_number::text || ':' || audio_sha256 || ':' "
+        "|| request_fingerprint, chr(10) ORDER BY segment_number), '') "
+        "FROM transcript_segments "
+        f"WHERE attempt_id = '{parsed_attempt_id}' AND status = 'succeeded'",
+    )
+    fingerprints: dict[int, tuple[str, str]] = {}
+    for row in rows.splitlines():
+        segment, audio_sha256, request_fingerprint = row.split(":", 2)
+        fingerprints[int(segment)] = (audio_sha256, request_fingerprint)
+    return fingerprints
+
+
 def preflight(config: dict[str, Any]) -> str:
     if (
         database_value(config, "SELECT count(*) FROM analysis_executions WHERE stop_confirmed_at IS NULL")
@@ -445,6 +461,7 @@ def main() -> None:
             before = require(
                 client.get(f"/videos/{video_id}/transcript"), 200, "partial transcript read"
             ).json()
+            prior_fingerprints = checkpoint_fingerprints(config, original_attempt_id)
             prior_success = {
                 item["segment_number"]: {
                     "audio_start_seconds": item["audio_start_seconds"],
@@ -459,6 +476,8 @@ def main() -> None:
             }
             if len(prior_success) != failed["completed_segments"] or not prior_success:
                 raise RuntimeError("Partial transcript rows and committed checkpoint count do not agree")
+            if len(prior_fingerprints) != len(prior_success) or failed["manifest_fingerprint"] is None:
+                raise RuntimeError("Partial checkpoint fingerprint metadata is incomplete")
 
             recovered = require(
                 client.post(
@@ -492,8 +511,17 @@ def main() -> None:
                 or completed["completed_segments"] != completed["expected_segments"]
                 or completed["reused_segments"] != len(prior_success)
                 or completed["asr_request_count"] != completed["expected_segments"] - len(prior_success)
+                or completed["manifest_fingerprint"] != failed["manifest_fingerprint"]
+                or completed["source_fingerprint"] != failed["source_fingerprint"]
+                or completed["config_sha256"] != failed["config_sha256"]
             ):
                 raise RuntimeError("Recovered attempt counts or terminal state are inconsistent")
+            recovered_fingerprints = checkpoint_fingerprints(config, child_attempt_id)
+            if any(
+                recovered_fingerprints.get(segment_number) != fingerprints
+                for segment_number, fingerprints in prior_fingerprints.items()
+            ):
+                raise RuntimeError("A reused checkpoint changed its audio or ASR request fingerprint")
             after = require(
                 client.get(f"/videos/{video_id}/transcript"), 200, "recovered transcript read"
             ).json()
@@ -543,6 +571,7 @@ def main() -> None:
                 "original_asr_request_count": failed["asr_request_count"],
                 "recovered_attempt_id": child_attempt_id,
                 "reused_segments": completed["reused_segments"],
+                "reused_fingerprints": "unchanged",
                 "recovery_asr_request_count": completed["asr_request_count"],
                 "expected_segments": completed["expected_segments"],
                 "final_status": completed["status"],
