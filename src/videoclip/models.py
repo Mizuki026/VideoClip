@@ -194,11 +194,20 @@ class AnalysisAttempt(Base):
             "cleanup_state IN ('pending', 'cleaned', 'failed')",
             name="ck_analysis_attempts_cleanup_state",
         ),
+        Index(
+            "uq_analysis_attempts_parent",
+            "parent_attempt_id",
+            unique=True,
+            postgresql_where=text("parent_attempt_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     task_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("analysis_tasks.id", ondelete="RESTRICT"), nullable=False
+    )
+    parent_attempt_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("analysis_attempts.id", ondelete="RESTRICT")
     )
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
@@ -212,6 +221,7 @@ class AnalysisAttempt(Base):
     first_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     stop_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failure_code: Mapped[str | None] = mapped_column(String(64))
+    cleanup_error_code: Mapped[str | None] = mapped_column(String(64))
     cleanup_state: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -257,6 +267,9 @@ class TranscriptSegment(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     attempt_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("analysis_attempts.id", ondelete="RESTRICT"), nullable=False
+    )
+    source_attempt_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("analysis_attempts.id", ondelete="RESTRICT")
     )
     segment_number: Mapped[int] = mapped_column(Integer, nullable=False)
     audio_start_seconds: Mapped[float] = mapped_column(Float, nullable=False)

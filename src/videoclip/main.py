@@ -21,6 +21,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from videoclip.analysis import (
     mark_publish_started,
+    recover_analysis_attempt,
     set_delivery_status,
     submit_analysis_task,
     task_response,
@@ -28,16 +29,20 @@ from videoclip.analysis import (
 )
 from videoclip.celery_app import celery_app
 from videoclip.db import check_database, create_database_engine, create_session_factory
-from videoclip.models import SessionRecord, User, Video
+from videoclip.models import AnalysisAttempt, AnalysisExecution, SessionRecord, User, Video
 from videoclip.recovery import recover_interrupted_work
 from videoclip.schemas import (
     AnalysisTaskResponse,
+    CleanupRequest,
+    CleanupResponse,
     CsrfResponse,
     LoginRequest,
+    RecoveryRequest,
     RegisterRequest,
     TranscriptResponse,
     UploadResponse,
     UserResponse,
+    VideoDeletionProgress,
     VideoDetailResponse,
     VideoListResponse,
     VideoSummary,
@@ -52,7 +57,13 @@ from videoclip.security import (
     verify_csrf_token,
     verify_password,
 )
-from videoclip.services import db_transaction, delete_video, receive_video_upload, register_account
+from videoclip.services import (
+    db_transaction,
+    delete_video,
+    receive_video_upload,
+    register_account,
+    retry_attempt_cleanup,
+)
 from videoclip.settings import Settings, get_settings
 from videoclip.storage import MediaStore
 
@@ -230,7 +241,7 @@ def create_app(
     settings: Settings | None = None,
     session_factory: sessionmaker[Session] | None = None,
     storage: MediaStore | None = None,
-    task_publisher: Callable[[str], object] | None = None,
+    task_publisher: Callable[[str, str], object] | None = None,
     *,
     run_recovery: bool = True,
 ) -> FastAPI:
@@ -243,10 +254,38 @@ def create_app(
         resolved_factory = session_factory
     resolved_store = storage or MediaStore(resolved_settings.app_data_root)
 
-    def publish_task(task_id: uuid.UUID) -> object:
+    def publish_task(task_id: uuid.UUID, attempt_id: uuid.UUID) -> object:
         if task_publisher is not None:
-            return task_publisher(str(task_id))
-        return celery_app.send_task("videoclip.transcribe_analysis", args=[str(task_id)], retry=False)
+            return task_publisher(str(task_id), str(attempt_id))
+        return celery_app.send_task(
+            "videoclip.transcribe_analysis", args=[str(task_id), str(attempt_id)], retry=False
+        )
+
+    def publish_new_attempt(task_id: uuid.UUID, attempt_id: uuid.UUID) -> None:
+        try:
+            mark_publish_started(resolved_factory, attempt_id)
+        except SQLAlchemyError:
+            logger.warning("analysis_delivery_start_unrecorded task_id=%s", task_id.hex)
+            return
+        try:
+            publish_task(task_id, attempt_id)
+        except Exception as exc:
+            delivery_state: Literal["failed", "unknown"] = (
+                "failed" if isinstance(exc, EncodeError) else "unknown"
+            )
+            delivery_error = (
+                "BROKER_PAYLOAD_REJECTED" if delivery_state == "failed" else "BROKER_CONFIRMATION_UNKNOWN"
+            )
+            try:
+                set_delivery_status(resolved_factory, attempt_id, delivery_state, delivery_error)
+            except SQLAlchemyError:
+                logger.warning("analysis_delivery_error_unrecorded task_id=%s", task_id.hex)
+            logger.warning("analysis_publish_unconfirmed task_id=%s error=%s", task_id.hex, delivery_error)
+        else:
+            try:
+                set_delivery_status(resolved_factory, attempt_id, "sent", None)
+            except SQLAlchemyError:
+                logger.warning("analysis_delivery_confirmation_unrecorded task_id=%s", task_id.hex)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -430,6 +469,45 @@ def create_app(
                 raise HTTPException(status_code=404, detail="video not found")
             return _video_detail(video)
 
+    @app.get("/videos/{video_id}/deletion", response_model=VideoDeletionProgress)
+    def get_video_deletion(video_id: uuid.UUID, request: Request) -> VideoDeletionProgress:
+        user, _ = _current_auth(request, resolved_factory) or _raise_auth()
+        with resolved_factory() as session:
+            video = session.scalar(select(Video).where(Video.id == video_id, Video.owner_id == user.id))
+            if video is None:
+                raise HTTPException(status_code=404, detail="video not found")
+            pending_attempt_ids: list[uuid.UUID] = []
+            stop_required = False
+            if video.current_analysis_task_id is not None:
+                attempts = list(
+                    session.scalars(
+                        select(AnalysisAttempt).where(
+                            AnalysisAttempt.task_id == video.current_analysis_task_id
+                        )
+                    )
+                )
+                for attempt in attempts:
+                    execution = session.scalar(
+                        select(AnalysisExecution).where(AnalysisExecution.attempt_id == attempt.id)
+                    )
+                    stopped = (attempt.claim_count == 0 and execution is None) or (
+                        attempt.claim_count == 1
+                        and attempt.stop_confirmed_at is not None
+                        and execution is not None
+                        and execution.stop_confirmed_at is not None
+                    )
+                    if not stopped:
+                        stop_required = True
+                    if not stopped or attempt.cleanup_state != "cleaned":
+                        pending_attempt_ids.append(attempt.id)
+            return VideoDeletionProgress(
+                video_id=video.id,
+                state=video.status,
+                error_code=video.deletion_error,
+                pending_attempt_ids=pending_attempt_ids,
+                stop_confirmation_required=stop_required,
+            )
+
     @app.post(
         "/videos/{video_id}/tasks",
         status_code=status.HTTP_202_ACCEPTED,
@@ -442,45 +520,55 @@ def create_app(
         user, _ = current
         submitted = submit_analysis_task(resolved_factory, user.id, video_id, resolved_settings)
         if submitted.created:
-            try:
-                mark_publish_started(resolved_factory, submitted.attempt_id)
-            except SQLAlchemyError:
-                logger.warning("analysis_delivery_start_unrecorded task_id=%s", submitted.task_id.hex)
-            else:
-                try:
-                    publish_task(submitted.task_id)
-                except Exception as exc:
-                    delivery_state: Literal["failed", "unknown"] = (
-                        "failed" if isinstance(exc, EncodeError) else "unknown"
-                    )
-                    delivery_error = (
-                        "BROKER_PAYLOAD_REJECTED"
-                        if delivery_state == "failed"
-                        else "BROKER_CONFIRMATION_UNKNOWN"
-                    )
-                    try:
-                        set_delivery_status(
-                            resolved_factory,
-                            submitted.attempt_id,
-                            delivery_state,
-                            delivery_error,
-                        )
-                    except SQLAlchemyError:
-                        logger.warning("analysis_delivery_error_unrecorded task_id=%s", submitted.task_id.hex)
-                    logger.warning(
-                        "analysis_publish_unconfirmed task_id=%s error=%s",
-                        submitted.task_id.hex,
-                        delivery_error,
-                    )
-                else:
-                    try:
-                        set_delivery_status(resolved_factory, submitted.attempt_id, "sent", None)
-                    except SQLAlchemyError:
-                        logger.warning(
-                            "analysis_delivery_confirmation_unrecorded task_id=%s", submitted.task_id.hex
-                        )
+            publish_new_attempt(submitted.task_id, submitted.attempt_id)
         response = task_response(resolved_factory, user.id, video_id, submitted.task_id)
         return response
+
+    @app.post(
+        "/videos/{video_id}/tasks/{task_id}/recover",
+        status_code=status.HTTP_202_ACCEPTED,
+        response_model=AnalysisTaskResponse,
+    )
+    def recover_analysis(
+        video_id: uuid.UUID,
+        task_id: uuid.UUID,
+        payload: RecoveryRequest,
+        request: Request,
+    ) -> AnalysisTaskResponse:
+        current = _current_auth(request, resolved_factory)
+        _require_csrf(request, resolved_settings, resolved_factory, current)
+        assert current is not None
+        user, _ = current
+        recovered = recover_analysis_attempt(resolved_factory, user.id, video_id, task_id, payload.attempt_id)
+        if recovered.created:
+            publish_new_attempt(recovered.task_id, recovered.attempt_id)
+        return task_response(
+            resolved_factory,
+            user.id,
+            video_id,
+            recovered.task_id,
+            recovered.attempt_id,
+        )
+
+    @app.post("/videos/{video_id}/cleanup", response_model=CleanupResponse)
+    def cleanup_attempt(
+        video_id: uuid.UUID,
+        payload: CleanupRequest,
+        request: Request,
+    ) -> CleanupResponse:
+        current = _current_auth(request, resolved_factory)
+        _require_csrf(request, resolved_settings, resolved_factory, current)
+        assert current is not None
+        user, _ = current
+        state, error_code = retry_attempt_cleanup(
+            resolved_factory, resolved_store, user.id, video_id, payload.attempt_id
+        )
+        return CleanupResponse(
+            video_id=video_id,
+            attempt_id=payload.attempt_id,
+            cleanup_state=state,
+            cleanup_error_code=error_code,
+        )
 
     @app.get(
         "/videos/{video_id}/tasks/{task_id}",

@@ -9,7 +9,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from videoclip.models import CleanupIntent, UploadHandoff, Video
-from videoclip.services import _intent_for_upload, db_transaction, delete_video
+from videoclip.services import (
+    _intent_for_upload,
+    db_transaction,
+    delete_video,
+    recover_confirmed_attempt_cleanup,
+)
 from videoclip.settings import Settings
 from videoclip.storage import MediaStore
 
@@ -187,3 +192,4 @@ def recover_interrupted_work(factory: sessionmaker[Session], settings: Settings,
             delete_video(factory, store, owner_id, video_id)
         except Exception:
             logger.warning("video_recovery_cleanup_pending video_id=%s", video_id.hex)
+    recover_confirmed_attempt_cleanup(factory, store)

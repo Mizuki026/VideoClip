@@ -37,15 +37,15 @@ try {
     }
 
     $workerIds = @(& docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile ps --all -q worker)
-    if ($LASTEXITCODE -ne 0 -or $workerIds.Count -gt 1) {
-        throw 'Cannot establish a single Stage 2 Worker container; no database stop confirmation was written.'
+    if ($LASTEXITCODE -ne 0 -or $workerIds.Count -ne 1) {
+        throw 'Cannot establish exactly one Stage 2 Worker container; no database stop confirmation was written.'
     }
     if ($workerIds.Count -eq 1) {
         $workerId = $workerIds[0].Trim()
         $running = (& docker inspect --format '{{.State.Running}}' $workerId).Trim()
         if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the Stage 2 Worker container.' }
         if ($running -eq 'true') {
-            & docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile stop worker
+            & docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile stop --timeout 0 worker
             if ($LASTEXITCODE -ne 0) { throw 'Worker stop did not complete; database state was left unchanged.' }
         }
         $running = (& docker inspect --format '{{.State.Running}}' $workerId).Trim()

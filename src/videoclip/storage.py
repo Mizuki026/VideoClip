@@ -114,6 +114,48 @@ class MediaStore:
     def remove_media(self, storage_name: str) -> None:
         self._unlink_if_exists(self.target_path(storage_name))
 
+    def remove_attempt_directory(self, task_id: UUID, work_directory_name: str) -> None:
+        if not _valid_storage_name(task_id.hex) or not _valid_storage_name(work_directory_name):
+            raise StorageFailure(errno.EINVAL, "invalid generated attempt path")
+        task_directory = self.analysis / task_id.hex
+        path = task_directory / work_directory_name
+        analysis_root = self.analysis.resolve()
+        if (
+            path.parent != task_directory
+            or self.analysis.is_symlink()
+            or task_directory.is_symlink()
+            or path.is_symlink()
+            or not path.resolve(strict=False).is_relative_to(analysis_root)
+        ):
+            raise StorageFailure(errno.EINVAL, "invalid generated attempt path")
+        if not path.exists():
+            return
+        for root, directories, files in os.walk(path, topdown=False, followlinks=False):
+            root_path = Path(root)
+            for name in files:
+                candidate = root_path / name
+                if candidate.is_symlink():
+                    candidate.unlink(missing_ok=True)
+                else:
+                    candidate.unlink(missing_ok=True)
+            for name in directories:
+                candidate = root_path / name
+                if candidate.is_symlink():
+                    candidate.unlink(missing_ok=True)
+                else:
+                    try:
+                        candidate.rmdir()
+                    except FileNotFoundError:
+                        pass
+            try:
+                root_path.rmdir()
+            except FileNotFoundError:
+                pass
+        try:
+            task_directory.rmdir()
+        except (FileNotFoundError, OSError):
+            pass
+
     def remove_lease(self, upload_id: UUID) -> None:
         self._unlink_if_exists(self.lease_path(upload_id))
 

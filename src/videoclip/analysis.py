@@ -19,6 +19,7 @@ from videoclip.models import (
     TranscriptSegment,
     Video,
 )
+from videoclip.recovery_rules import evaluate_recovery
 from videoclip.schemas import (
     AnalysisAttemptResponse,
     AnalysisTaskResponse,
@@ -35,6 +36,13 @@ ASR_REQUEST_FINGERPRINT_VERSION = "asr-request-v1"
 
 @dataclass(frozen=True)
 class SubmittedTask:
+    task_id: uuid.UUID
+    attempt_id: uuid.UUID
+    created: bool
+
+
+@dataclass(frozen=True)
+class RecoverySubmission:
     task_id: uuid.UUID
     attempt_id: uuid.UUID
     created: bool
@@ -177,6 +185,146 @@ def submit_analysis_task(
         return SubmittedTask(task_id=task.id, attempt_id=attempt.id, created=True)
 
 
+def recover_analysis_attempt(
+    factory: sessionmaker[Session],
+    owner_id: uuid.UUID,
+    video_id: uuid.UUID,
+    task_id: uuid.UUID,
+    parent_attempt_id: uuid.UUID,
+) -> RecoverySubmission:
+    now = datetime.now(UTC)
+    with db_transaction(factory) as session:
+        video = session.scalar(
+            select(Video).where(Video.id == video_id, Video.owner_id == owner_id).with_for_update()
+        )
+        if video is None:
+            raise HTTPException(status_code=404, detail="analysis task not found")
+        task = session.scalar(
+            select(AnalysisTask)
+            .where(
+                AnalysisTask.id == task_id,
+                AnalysisTask.video_id == video.id,
+                AnalysisTask.owner_id == owner_id,
+            )
+            .with_for_update()
+        )
+        parent = session.scalar(
+            select(AnalysisAttempt)
+            .where(AnalysisAttempt.id == parent_attempt_id, AnalysisAttempt.task_id == task_id)
+            .with_for_update()
+        )
+        if task is None or parent is None:
+            raise HTTPException(status_code=404, detail="analysis task not found")
+        if video.status != "ready":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "VIDEO_DELETION_IN_PROGRESS", "recovery_eligible": False},
+            )
+
+        child = session.scalar(select(AnalysisAttempt).where(AnalysisAttempt.parent_attempt_id == parent.id))
+        if child is not None:
+            if session.get(TaskDelivery, child.id) is None:
+                raise HTTPException(status_code=503, detail="attempt delivery state needs maintenance")
+            return RecoverySubmission(
+                task_id=task.id,
+                attempt_id=child.id,
+                created=False,
+            )
+
+        if task.current_attempt_id != parent.id:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "ATTEMPT_NOT_CURRENT", "recovery_eligible": False},
+            )
+        delivery = session.get(TaskDelivery, parent.id)
+        if delivery is None:
+            raise HTTPException(status_code=503, detail="attempt delivery state needs maintenance")
+        execution = session.scalar(select(AnalysisExecution).where(AnalysisExecution.attempt_id == parent.id))
+        decision = evaluate_recovery(
+            video_status=video.status,
+            task_status=task.status,
+            attempt_status=parent.status,
+            delivery_status=delivery.status,
+            claim_count=parent.claim_count,
+            delivery_updated_at=delivery.updated_at,
+            attempt_stop_confirmed=parent.stop_confirmed_at is not None,
+            execution_stop_confirmed=(execution is not None and execution.stop_confirmed_at is not None),
+            is_current_attempt=True,
+            now=now,
+        )
+        if not decision.eligible:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": decision.error_code or "ATTEMPT_NOT_RECOVERABLE",
+                    "recovery_eligible": False,
+                    "recovery_available_at": decision.available_at.isoformat()
+                    if decision.available_at is not None
+                    else None,
+                },
+            )
+        snapshot = parent.config_snapshot
+        source = snapshot.get("source") if isinstance(snapshot, dict) else None
+        try:
+            config_is_compatible = (
+                snapshot.get("version") == TASK_CONFIGURATION_VERSION
+                and canonical_sha256(snapshot) == parent.config_sha256
+                and isinstance(source, dict)
+                and source.get("fingerprint") == parent.source_fingerprint
+                and source.get("fingerprint")
+                == build_source_fingerprint(video, int(source["audio_stream_index"]))
+                and source.get("storage_name") == video.storage_name
+                and source.get("byte_count") == video.byte_count
+                and source.get("sha256") == video.content_sha256
+                and source.get("duration_seconds") == video.duration_seconds
+            )
+        except (KeyError, TypeError, ValueError):
+            config_is_compatible = False
+        if not config_is_compatible:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "SOURCE_CONFIGURATION_INCOMPATIBLE", "recovery_eligible": False},
+            )
+
+        if parent.claim_count == 0:
+            parent.failure_code = "ATTEMPT_SUPERSEDED"
+        else:
+            parent.failure_code = parent.failure_code or "ATTEMPT_RECOVERED"
+        parent.status = "failed"
+        parent.finished_at = parent.finished_at or now
+        next_number = (
+            int(
+                session.scalar(
+                    select(func.coalesce(func.max(AnalysisAttempt.attempt_number), 0)).where(
+                        AnalysisAttempt.task_id == task.id
+                    )
+                )
+            )
+            + 1
+        )
+        child = AnalysisAttempt(
+            task_id=task.id,
+            parent_attempt_id=parent.id,
+            attempt_number=next_number,
+            status="queued",
+            config_snapshot=snapshot,
+            config_sha256=parent.config_sha256,
+            source_fingerprint=parent.source_fingerprint,
+            work_directory_name=uuid.uuid4().hex,
+            claim_count=0,
+            cleanup_state="pending",
+        )
+        session.add(child)
+        session.flush()
+        task.current_attempt_id = child.id
+        task.status = "queued"
+        task.stage = "queued"
+        task.failure_code = None
+        session.add(TaskDelivery(attempt_id=child.id, status="pending"))
+        session.flush()
+        return RecoverySubmission(task_id=task.id, attempt_id=child.id, created=True)
+
+
 def set_delivery_status(
     factory: sessionmaker[Session],
     attempt_id: uuid.UUID,
@@ -202,7 +350,11 @@ def mark_publish_started(factory: sessionmaker[Session], attempt_id: uuid.UUID) 
 
 
 def task_response(
-    factory: sessionmaker[Session], owner_id: uuid.UUID, video_id: uuid.UUID, task_id: uuid.UUID
+    factory: sessionmaker[Session],
+    owner_id: uuid.UUID,
+    video_id: uuid.UUID,
+    task_id: uuid.UUID,
+    attempt_id: uuid.UUID | None = None,
 ) -> AnalysisTaskResponse:
     with factory() as session:
         task = session.scalar(
@@ -214,11 +366,23 @@ def task_response(
         )
         if task is None:
             raise HTTPException(status_code=404, detail="analysis task not found")
-        attempt = session.get(AnalysisAttempt, task.current_attempt_id)
-        delivery = session.get(TaskDelivery, task.current_attempt_id)
+        video = session.get(Video, video_id)
+        if video is None or video.status != "ready":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "VIDEO_DELETION_IN_PROGRESS", "recovery_eligible": False},
+            )
+        current_attempt_id = task.current_attempt_id
+        if current_attempt_id is None:
+            raise HTTPException(status_code=503, detail="analysis task state needs maintenance")
+        selected_attempt_id = attempt_id or current_attempt_id
+        attempt = session.get(AnalysisAttempt, selected_attempt_id)
+        if attempt is not None and attempt.task_id != task.id:
+            attempt = None
+        delivery = session.get(TaskDelivery, selected_attempt_id)
         if attempt is None or delivery is None:
             raise HTTPException(status_code=503, detail="analysis task state needs maintenance")
-        expected, completed, request_count, elapsed_seconds = session.execute(
+        expected, completed, request_count, elapsed_seconds, reused_count = session.execute(
             select(
                 func.count(TranscriptSegment.id),
                 func.count(TranscriptSegment.id).filter(TranscriptSegment.status == "succeeded"),
@@ -226,6 +390,7 @@ def task_response(
                 func.coalesce(
                     func.sum(TranscriptSegment.request_metadata["elapsed_seconds"].as_float()), 0.0
                 ),
+                func.count(TranscriptSegment.id).filter(TranscriptSegment.source_attempt_id.is_not(None)),
             ).where(TranscriptSegment.attempt_id == attempt.id)
         ).one()
         call_rows = list(
@@ -234,6 +399,7 @@ def task_response(
                 .where(
                     TranscriptSegment.attempt_id == attempt.id,
                     TranscriptSegment.request_metadata.is_not(None),
+                    TranscriptSegment.request_count > 0,
                 )
                 .order_by(TranscriptSegment.segment_number)
             )
@@ -245,12 +411,27 @@ def task_response(
             )
             .limit(1)
         )
+        is_current = task.current_attempt_id == attempt.id
+        eligibility = evaluate_recovery(
+            video_status=video.status,
+            task_status=task.status,
+            attempt_status=attempt.status,
+            delivery_status=delivery.status,
+            claim_count=attempt.claim_count,
+            delivery_updated_at=delivery.updated_at,
+            attempt_stop_confirmed=attempt.stop_confirmed_at is not None,
+            execution_stop_confirmed=(execution is not None and execution.stop_confirmed_at is not None),
+            is_current_attempt=is_current,
+            now=datetime.now(UTC),
+        )
         return AnalysisTaskResponse(
             id=task.id,
             video_id=task.video_id,
+            current_attempt_id=current_attempt_id,
             status=task.status,
             stage=task.stage,
             delivery_status=delivery.status,
+            delivery_updated_at=delivery.updated_at,
             delivery_error_code=delivery.error_code,
             completed_segments=int(completed),
             expected_segments=int(expected),
@@ -261,6 +442,7 @@ def task_response(
             manifest_fingerprint=attempt.manifest_fingerprint,
             asr_request_count=int(request_count),
             asr_elapsed_seconds=float(elapsed_seconds),
+            reused_segments=int(reused_count),
             asr_calls=[
                 {
                     "segment_number": row.segment_number,
@@ -288,15 +470,21 @@ def task_response(
             ),
             execution_stop_confirmed=(None if execution is None else execution.stop_confirmed_at is not None),
             failure_code=task.failure_code,
+            recovery_eligible=eligibility.eligible,
+            recovery_error_code=eligibility.error_code,
+            recovery_available_at=eligibility.available_at,
+            is_current_attempt=is_current,
             created_at=task.created_at,
             attempt=AnalysisAttemptResponse(
                 id=attempt.id,
                 attempt_number=attempt.attempt_number,
+                parent_attempt_id=attempt.parent_attempt_id,
                 status=attempt.status,
                 execution_id=attempt.execution_id,
                 first_claimed_at=attempt.first_claimed_at,
                 stop_confirmed_at=attempt.stop_confirmed_at,
                 cleanup_state=attempt.cleanup_state,
+                cleanup_error_code=attempt.cleanup_error_code,
                 failure_code=attempt.failure_code,
             ),
         )
@@ -306,6 +494,14 @@ def transcript_response(
     factory: sessionmaker[Session], owner_id: uuid.UUID, video_id: uuid.UUID
 ) -> TranscriptResponse:
     with factory() as session:
+        video = session.scalar(select(Video).where(Video.id == video_id, Video.owner_id == owner_id))
+        if video is None:
+            raise HTTPException(status_code=404, detail="transcript not found")
+        if video.status != "ready":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "VIDEO_DELETION_IN_PROGRESS", "recovery_eligible": False},
+            )
         task = session.scalar(
             select(AnalysisTask).where(
                 AnalysisTask.video_id == video_id,
@@ -335,6 +531,7 @@ def transcript_response(
             items=[
                 TranscriptSegmentResponse(
                     segment_number=item.segment_number,
+                    source_attempt_id=item.source_attempt_id,
                     audio_start_seconds=item.audio_start_seconds,
                     audio_end_seconds=item.audio_end_seconds,
                     actual_audio_seconds=item.actual_audio_seconds,

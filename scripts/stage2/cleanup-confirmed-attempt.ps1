@@ -82,7 +82,7 @@ WHERE a.id = '$attemptValue'
 
     $markCleaned = @"
 UPDATE analysis_attempts
-SET cleanup_state = 'cleaned'
+SET cleanup_state = 'cleaned', cleanup_error_code = NULL
 WHERE id = '$attemptValue'
   AND status = 'failed'
   AND stop_confirmed_at IS NOT NULL

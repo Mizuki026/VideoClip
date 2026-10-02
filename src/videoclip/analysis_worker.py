@@ -31,6 +31,7 @@ from videoclip.models import (
     TranscriptSegment,
     Video,
 )
+from videoclip.recovery_rules import checkpoint_matches
 from videoclip.services import db_transaction
 from videoclip.settings import Settings, get_settings
 from videoclip.storage import MediaStore
@@ -56,6 +57,7 @@ class StopUnconfirmed(AnalysisFailure):
 class ClaimedAttempt:
     task_id: uuid.UUID
     attempt_id: uuid.UUID
+    parent_attempt_id: uuid.UUID | None
     execution_id: uuid.UUID
     video_id: uuid.UUID
     storage_name: str
@@ -235,17 +237,21 @@ def _lock_execution_rows(
 def _claim_attempt(
     lease: ExecutionLease,
     task_id: uuid.UUID,
+    attempt_id: uuid.UUID,
     worker_id: str,
 ) -> ClaimedAttempt | None:
     maker = sessionmaker(bind=lease.connection, autoflush=False, expire_on_commit=False)
     with db_transaction(maker) as session:
+        candidate = session.get(AnalysisTask, task_id)
+        if candidate is None:
+            return None
+        video = session.scalar(select(Video).where(Video.id == candidate.video_id).with_for_update())
         task = session.scalar(select(AnalysisTask).where(AnalysisTask.id == task_id).with_for_update())
-        if task is None or task.current_attempt_id is None:
+        if task is None or task.current_attempt_id != attempt_id:
             return None
         attempt = session.scalar(
-            select(AnalysisAttempt).where(AnalysisAttempt.id == task.current_attempt_id).with_for_update()
+            select(AnalysisAttempt).where(AnalysisAttempt.id == attempt_id).with_for_update()
         )
-        video = session.scalar(select(Video).where(Video.id == task.video_id).with_for_update())
         if (
             attempt is None
             or video is None
@@ -283,6 +289,7 @@ def _claim_attempt(
         return ClaimedAttempt(
             task_id=task.id,
             attempt_id=attempt.id,
+            parent_attempt_id=attempt.parent_attempt_id,
             execution_id=execution_id,
             video_id=video.id,
             storage_name=video.storage_name,
@@ -513,7 +520,7 @@ def _save_manifest(
     entries: list[ManifestEntry],
     pcm_path: Path,
     config: dict[str, Any],
-) -> str:
+) -> tuple[str, set[int]]:
     asr_config = config["asr"]
     pcm_file = pcm_path.open("rb")
     db_rows: list[TranscriptSegment] = []
@@ -574,11 +581,14 @@ def _save_manifest(
     manifest_fingerprint = canonical_sha256(
         {
             "version": config["slicing"]["manifest_version"],
+            "timeline_mapping_version": config["slicing"]["timeline_mapping_version"],
+            "audio": config["audio"],
             "source_fingerprint": claim.snapshot["source"]["fingerprint"],
             "segments": fingerprint_rows,
         }
     )
     lease.assert_alive()
+    reused_segments: set[int] = set()
     with db_transaction(maker) as session:
         _, attempt, _, _ = _lock_execution_rows(session, claim)
         prior_count = session.scalar(
@@ -586,9 +596,46 @@ def _save_manifest(
         )
         if prior_count is not None or attempt.manifest_fingerprint is not None:
             raise AnalysisFailure("TRANSCRIPT_MANIFEST_ALREADY_EXISTS")
+        if attempt.parent_attempt_id is not None:
+            parent = session.get(AnalysisAttempt, attempt.parent_attempt_id)
+            if parent is None or parent.task_id != attempt.task_id:
+                raise AnalysisFailure("PARENT_ATTEMPT_UNAVAILABLE")
+            previous_rows = {
+                item.segment_number: item
+                for item in session.scalars(
+                    select(TranscriptSegment).where(TranscriptSegment.attempt_id == parent.id)
+                )
+            }
+            if parent.manifest_fingerprint == manifest_fingerprint:
+                for row, expected in zip(db_rows, fingerprint_rows, strict=True):
+                    prior = previous_rows.get(row.segment_number)
+                    if prior is None:
+                        continue
+                    previous = {
+                        "segment_number": prior.segment_number,
+                        "audio_start_seconds": prior.audio_start_seconds,
+                        "audio_end_seconds": prior.audio_end_seconds,
+                        "actual_audio_seconds": prior.actual_audio_seconds,
+                        "video_start_seconds": prior.video_start_seconds,
+                        "video_end_seconds": prior.video_end_seconds,
+                        "audio_sha256": prior.audio_sha256,
+                        "request_fingerprint": prior.request_fingerprint,
+                        "status": prior.status,
+                        "text": prior.text,
+                    }
+                    if checkpoint_matches(
+                        previous,
+                        expected,
+                        previous_manifest_fingerprint=parent.manifest_fingerprint,
+                        expected_manifest_fingerprint=manifest_fingerprint,
+                    ):
+                        row.status = "succeeded"
+                        row.text = prior.text
+                        row.source_attempt_id = parent.id
+                        reused_segments.add(row.segment_number)
         session.add_all(db_rows)
         attempt.manifest_fingerprint = manifest_fingerprint
-    return manifest_fingerprint
+    return manifest_fingerprint, reused_segments
 
 
 def _hash_path(path: Path) -> str:
@@ -675,9 +722,9 @@ def _fail_task(maker: sessionmaker[Session], lease: ExecutionLease, claim: Claim
         if task.status != "awaiting_summary":
             task.status = "failed"
             task.stage = "failed"
-            task.failure_code = code[:64]
+            task.failure_code = task.failure_code or code[:64]
             attempt.status = "failed"
-            attempt.failure_code = code[:64]
+            attempt.failure_code = attempt.failure_code or code[:64]
 
 
 def _confirm_stopped(
@@ -700,6 +747,7 @@ def _confirm_stopped(
             attempt.status = "failed"
             attempt.failure_code = attempt.failure_code or "WORKER_STOPPED_UNFINISHED"
         attempt.cleanup_state = cleanup_state
+        attempt.cleanup_error_code = "ATTEMPT_TEMP_CLEANUP_FAILED" if cleanup_state == "failed" else None
         attempt.stop_confirmed_at = now
         attempt.finished_at = now
         execution.stop_confirmed_at = now
@@ -720,6 +768,13 @@ def _work_directory(store: MediaStore, claim: ClaimedAttempt) -> Path:
     return path
 
 
+def _deletion_cleanup_is_pending(maker: sessionmaker[Session], claim: ClaimedAttempt) -> bool:
+    with maker() as session:
+        status_value = session.scalar(select(Video.status).where(Video.id == claim.video_id))
+        session.commit()
+    return status_value != "ready"
+
+
 def _cleanup_work_directory(
     store: MediaStore,
     claim: ClaimedAttempt,
@@ -733,12 +788,12 @@ def _cleanup_work_directory(
         for root, dirs, files in os.walk(path, topdown=False, followlinks=False):
             root_path = Path(root)
             for filename in files:
-                _progress_check(maker, lease, claim)
+                _validate_execution(maker, lease, claim, allow_invalid_video=True)
                 candidate = root_path / filename
                 if candidate.is_symlink() or candidate.resolve().is_relative_to(store.analysis.resolve()):
                     candidate.unlink()
             for directory in dirs:
-                _progress_check(maker, lease, claim)
+                _validate_execution(maker, lease, claim, allow_invalid_video=True)
                 candidate = root_path / directory
                 if candidate.is_symlink():
                     candidate.unlink()
@@ -811,6 +866,8 @@ def _transcribe(
     config = claim.snapshot
     if canonical_sha256(config) != _attempt_config_hash(maker, claim):
         raise AnalysisFailure("CONFIG_SNAPSHOT_INVALID")
+    if config.get("version") != "analysis-config-v1":
+        raise AnalysisFailure("CONFIG_VERSION_UNSUPPORTED")
     source_config = config["source"]
     source_path = store.target_path(claim.storage_name)
     _hash_source(
@@ -868,7 +925,7 @@ def _transcribe(
         channels=int(config["audio"]["channels"]),
         segment_seconds=int(config["slicing"]["segment_seconds"]),
     )
-    _save_manifest(maker, lease, claim, entries, pcm_path, config)
+    _, reused_segments = _save_manifest(maker, lease, claim, entries, pcm_path, config)
     wav_paths = _create_wav_segments(
         pcm_path,
         entries,
@@ -882,6 +939,8 @@ def _transcribe(
     asr_config = config["asr"]
     limits = config["limits"]
     for entry, wav_path in zip(entries, wav_paths, strict=True):
+        if entry.segment_number in reused_segments:
+            continue
         if time.monotonic() >= attempt_deadline:
             raise AnalysisFailure("ATTEMPT_TIMEOUT")
         _start_segment_request(maker, lease, claim, entry.segment_number)
@@ -960,11 +1019,14 @@ def _get_or_make_worker_components(
     soft_time_limit=10_830,
     time_limit=10_860,
 )
-def transcribe_analysis(task_id_value: str) -> dict[str, str]:
+def transcribe_analysis(task_id_value: str, attempt_id_value: str | None = None) -> dict[str, str]:
+    if attempt_id_value is None:
+        return {"status": "ignored_legacy_task_message"}
     try:
         task_id = uuid.UUID(task_id_value)
+        attempt_id = uuid.UUID(attempt_id_value)
     except ValueError:
-        return {"status": "ignored_invalid_task_id"}
+        return {"status": "ignored_invalid_message_id"}
     settings = get_settings()
     engine, store = _get_or_make_worker_components(settings)
     lease: ExecutionLease | None = None
@@ -977,7 +1039,7 @@ def transcribe_analysis(task_id_value: str) -> dict[str, str]:
             return {"status": "global_execution_busy"}
         worker_id = f"{socket.gethostname()}:{os.getpid()}"
         try:
-            claim = _claim_attempt(lease, task_id, worker_id)
+            claim = _claim_attempt(lease, task_id, attempt_id, worker_id)
         except IntegrityError:
             return {"status": "global_execution_busy"}
         if claim is None:
@@ -1003,7 +1065,19 @@ def transcribe_analysis(task_id_value: str) -> dict[str, str]:
             terminal_reason = failure_code
             logger.error("analysis_worker_failed task_id=%s attempt_id=%s", task_id.hex, claim.attempt_id.hex)
 
-        cleanup_state = _cleanup_work_directory(store, claim, maker, lease)
+        try:
+            cleanup_state = (
+                "pending"
+                if _deletion_cleanup_is_pending(maker, claim)
+                else _cleanup_work_directory(store, claim, maker, lease)
+            )
+        except SQLAlchemyError:
+            logger.error(
+                "analysis_cleanup_status_unavailable task_id=%s attempt_id=%s",
+                task_id.hex,
+                claim.attempt_id.hex,
+            )
+            return {"status": "stop_unconfirmed"}
         try:
             if failure_code is not None:
                 _fail_task(maker, lease, claim, failure_code)

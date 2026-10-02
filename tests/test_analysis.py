@@ -6,7 +6,9 @@ import sys
 import threading
 import time
 import uuid
+import wave
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,18 +24,23 @@ from sqlalchemy.orm import Session, sessionmaker
 from videoclip.analysis import (
     build_configuration_snapshot,
     canonical_sha256,
+    recover_analysis_attempt,
     submit_analysis_task,
 )
 from videoclip.analysis_worker import (
+    ASR_REQUEST_FINGERPRINT_VERSION,
     AnalysisFailure,
     ExecutionLease,
     _claim_attempt,
+    _deletion_cleanup_is_pending,
     _persist_transcript,
     _read_asr_result,
     _run_process,
+    _save_manifest,
     _set_stage,
     _start_segment_request,
     build_manifest,
+    transcribe_analysis,
 )
 from videoclip.asr_client import AsrCallError, transcribe
 from videoclip.celery_app import celery_app
@@ -42,10 +49,12 @@ from videoclip.models import (
     AnalysisAttempt,
     AnalysisExecution,
     AnalysisTask,
+    TaskDelivery,
     TranscriptSegment,
     UploadHandoff,
     Video,
 )
+from videoclip.recovery_rules import checkpoint_matches, evaluate_recovery
 from videoclip.schemas import AnalysisTaskResponse
 from videoclip.services import delete_video
 from videoclip.settings import Settings
@@ -116,13 +125,13 @@ def _register(client: TestClient, username: str) -> uuid.UUID:
 def test_submit_freezes_configuration_and_is_idempotent(
     test_settings: Settings, session_factory: sessionmaker[Session]
 ) -> None:
-    published: list[str] = []
+    published: list[tuple[str, str]] = []
     app = create_app(
         test_settings,
         session_factory,
         MediaStore(test_settings.app_data_root),
         run_recovery=False,
-        task_publisher=lambda task_id: published.append(task_id),
+        task_publisher=lambda task_id, attempt_id: published.append((task_id, attempt_id)),
     )
     with TestClient(app) as client:
         owner_id = _register(client, "analysis-owner")
@@ -141,7 +150,7 @@ def test_submit_freezes_configuration_and_is_idempotent(
         assert first.asr_model == test_settings.asr_model
         assert first.asr_request_count == 0
         assert first.expected_segments == 0
-        assert len(published) == 1 and published[0] == str(first.id)
+        assert len(published) == 1 and published[0] == (str(first.id), str(first.attempt.id))
 
         repeated = client.post(f"/videos/{video_id}/tasks", headers=headers)
         assert repeated.status_code == 202
@@ -171,13 +180,13 @@ def test_submit_freezes_configuration_and_is_idempotent(
             assert "api_key" not in attempt.config_snapshot["asr"]
 
         removed = client.delete(f"/videos/{video_id}", headers=headers)
-        assert removed.status_code == 409
+        assert removed.status_code == 204
 
 
 def test_submission_and_task_reads_are_owner_scoped(
     test_settings: Settings, session_factory: sessionmaker[Session]
 ) -> None:
-    app = create_app(test_settings, session_factory, run_recovery=False, task_publisher=lambda _: None)
+    app = create_app(test_settings, session_factory, run_recovery=False, task_publisher=lambda *_: None)
     with TestClient(app) as owner, TestClient(app) as stranger:
         owner_id = _register(owner, "analysis-owner-two")
         stranger_id = _register(stranger, "analysis-stranger")
@@ -199,7 +208,7 @@ def test_broker_error_is_unknown_and_does_not_republish_on_duplicate(
 ) -> None:
     calls = 0
 
-    def broker_failure(_: str) -> None:
+    def broker_failure(_: str, __: str) -> None:
         nonlocal calls
         calls += 1
         raise OSError("broker confirmation unavailable")
@@ -228,7 +237,7 @@ def test_proven_local_payload_failure_is_failed_without_task_failure(
 ) -> None:
     calls = 0
 
-    def serialization_failure(_: str) -> None:
+    def serialization_failure(_: str, __: str) -> None:
         nonlocal calls
         calls += 1
         raise EncodeError("injected local serialization failure")
@@ -258,13 +267,18 @@ def test_database_commit_before_publish_exit_leaves_pending_delivery(
 ) -> None:
     import videoclip.main as main
 
-    published: list[str] = []
+    published: list[tuple[str, str]] = []
 
     def fail_before_publish(*_args: Any, **_kwargs: Any) -> None:
         raise SQLAlchemyError("injected publish-start persistence failure")
 
     monkeypatch.setattr(main, "mark_publish_started", fail_before_publish)
-    app = create_app(test_settings, session_factory, run_recovery=False, task_publisher=published.append)
+    app = create_app(
+        test_settings,
+        session_factory,
+        run_recovery=False,
+        task_publisher=lambda task_id, attempt_id: published.append((task_id, attempt_id)),
+    )
     with TestClient(app) as client:
         owner_id = _register(client, "analysis-pending-delivery")
         video_id = _video(session_factory, app.state.store, owner_id)
@@ -287,7 +301,7 @@ def test_successful_publish_with_lost_confirmation_stays_pending(
 ) -> None:
     import videoclip.main as main
 
-    published: list[str] = []
+    published: list[tuple[str, str]] = []
     original_set_status = main.set_delivery_status
 
     def lose_sent_confirmation(
@@ -298,7 +312,12 @@ def test_successful_publish_with_lost_confirmation_stays_pending(
         original_set_status(factory, attempt_id, state, code)  # pragma: no cover
 
     monkeypatch.setattr(main, "set_delivery_status", lose_sent_confirmation)
-    app = create_app(test_settings, session_factory, run_recovery=False, task_publisher=published.append)
+    app = create_app(
+        test_settings,
+        session_factory,
+        run_recovery=False,
+        task_publisher=lambda task_id, attempt_id: published.append((task_id, attempt_id)),
+    )
     with TestClient(app) as client:
         owner_id = _register(client, "analysis-lost-confirmation")
         video_id = _video(session_factory, app.state.store, owner_id)
@@ -321,10 +340,15 @@ def test_broker_error_cannot_overwrite_claimed_execution(
 ) -> None:
     store = MediaStore(test_settings.app_data_root)
 
-    def claim_then_fail(task_id_value: str) -> None:
+    def claim_then_fail(task_id_value: str, attempt_id_value: str) -> None:
         lease = ExecutionLease.acquire(test_engine)
         assert lease is not None
-        assert _claim_attempt(lease, uuid.UUID(task_id_value), "publisher-race-worker") is not None
+        assert (
+            _claim_attempt(
+                lease, uuid.UUID(task_id_value), uuid.UUID(attempt_id_value), "publisher-race-worker"
+            )
+            is not None
+        )
         lease.release()
         raise OSError("broker acknowledgement was lost")
 
@@ -358,7 +382,7 @@ def test_database_lock_loss_stops_local_process_and_blocks_another_claim(
     submitted = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
     lease = ExecutionLease.acquire(test_engine)
     assert lease is not None
-    claim = _claim_attempt(lease, submitted.task_id, "test-worker-lock-loss")
+    claim = _claim_attempt(lease, submitted.task_id, submitted.attempt_id, "test-worker-lock-loss")
     assert claim is not None
     maker = sessionmaker(bind=lease.connection, autoflush=False, expire_on_commit=False)
     spawned: list[subprocess.Popen[bytes]] = []
@@ -403,7 +427,10 @@ def test_database_lock_loss_stops_local_process_and_blocks_another_claim(
 
     next_lease = ExecutionLease.acquire(test_engine)
     assert next_lease is not None
-    assert _claim_attempt(next_lease, submitted.task_id, "test-worker-after-lock-loss") is None
+    assert (
+        _claim_attempt(next_lease, submitted.task_id, submitted.attempt_id, "test-worker-after-lock-loss")
+        is None
+    )
     next_lease.release()
     with session_factory() as session:
         task = session.get(AnalysisTask, submitted.task_id)
@@ -428,7 +455,7 @@ def test_invalidated_video_cannot_advance_the_claimed_task(
     submitted = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
     lease = ExecutionLease.acquire(test_engine)
     assert lease is not None
-    claim = _claim_attempt(lease, submitted.task_id, "test-worker-invalidated-video")
+    claim = _claim_attempt(lease, submitted.task_id, submitted.attempt_id, "test-worker-invalidated-video")
     assert claim is not None
     maker = sessionmaker(bind=lease.connection, autoflush=False, expire_on_commit=False)
     with session_factory.begin() as session:
@@ -472,13 +499,13 @@ def test_attempt_can_be_claimed_only_once_even_after_lock_release(
     submitted = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
     first_lease = ExecutionLease.acquire(test_engine)
     assert first_lease is not None
-    first_claim = _claim_attempt(first_lease, submitted.task_id, "test-worker-one")
+    first_claim = _claim_attempt(first_lease, submitted.task_id, submitted.attempt_id, "test-worker-one")
     assert first_claim is not None
     first_lease.release()
 
     second_lease = ExecutionLease.acquire(test_engine)
     assert second_lease is not None
-    duplicate_claim = _claim_attempt(second_lease, submitted.task_id, "test-worker-two")
+    duplicate_claim = _claim_attempt(second_lease, submitted.task_id, submitted.attempt_id, "test-worker-two")
     assert duplicate_claim is None
     second_lease.release()
     with session_factory() as session:
@@ -506,12 +533,17 @@ def test_global_execution_slot_blocks_a_competing_video(
     submitted_b = submit_analysis_task(session_factory, owner_id, video_b, test_settings)
     first_lease = ExecutionLease.acquire(test_engine)
     assert first_lease is not None
-    assert _claim_attempt(first_lease, submitted_a.task_id, "test-worker-one") is not None
+    assert (
+        _claim_attempt(first_lease, submitted_a.task_id, submitted_a.attempt_id, "test-worker-one")
+        is not None
+    )
     first_lease.release()
 
     second_lease = ExecutionLease.acquire(test_engine)
     assert second_lease is not None
-    assert _claim_attempt(second_lease, submitted_b.task_id, "test-worker-two") is None
+    assert (
+        _claim_attempt(second_lease, submitted_b.task_id, submitted_b.attempt_id, "test-worker-two") is None
+    )
     second_lease.release()
     with session_factory() as session:
         task = session.get(AnalysisTask, submitted_b.task_id)
@@ -536,7 +568,7 @@ def test_request_started_before_checkpoint_failure_prevents_reclaim(
     submitted = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
     lease = ExecutionLease.acquire(test_engine)
     assert lease is not None
-    claim = _claim_attempt(lease, submitted.task_id, "test-worker-checkpoint")
+    claim = _claim_attempt(lease, submitted.task_id, submitted.attempt_id, "test-worker-checkpoint")
     assert claim is not None
     with session_factory.begin() as session:
         session.add(
@@ -593,7 +625,7 @@ def test_request_started_before_checkpoint_failure_prevents_reclaim(
         assert segment.status == "expected" and segment.text is None
     next_lease = ExecutionLease.acquire(test_engine)
     assert next_lease is not None
-    assert _claim_attempt(next_lease, submitted.task_id, "test-worker-replay") is None
+    assert _claim_attempt(next_lease, submitted.task_id, submitted.attempt_id, "test-worker-replay") is None
     next_lease.release()
 
 
@@ -625,11 +657,12 @@ def test_stale_execution_id_cannot_write_a_transcript_request(
         )
     lease = ExecutionLease.acquire(test_engine)
     assert lease is not None
-    claim = _claim_attempt(lease, submitted.task_id, "test-worker-stale")
+    claim = _claim_attempt(lease, submitted.task_id, submitted.attempt_id, "test-worker-stale")
     assert claim is not None
     stale = claim.__class__(
         task_id=claim.task_id,
         attempt_id=claim.attempt_id,
+        parent_attempt_id=claim.parent_attempt_id,
         execution_id=uuid.uuid4(),
         video_id=claim.video_id,
         storage_name=claim.storage_name,
@@ -732,7 +765,7 @@ def test_submit_and_delete_race_has_one_winner(
                 else "delete_pending"
             )
         except HTTPException as exc:
-            assert exc.status_code == 409
+            assert exc.status_code in {404, 409}
             return "delete_rejected"
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -751,7 +784,8 @@ def test_submit_and_delete_race_has_one_winner(
             assert video.current_analysis_task_id is not None
             assert task_count == 1
             assert store.target_path(video.storage_name).exists()
-    assert {"submitted", "delete_rejected"} == set(results) or "deleted" in results
+    assert "deleted" in results
+    assert "submitted" in results or "submit_rejected" in results
 
 
 def test_manifest_uses_actual_last_segment_duration() -> None:
@@ -861,6 +895,592 @@ def test_asr_adapter_enforces_total_deadline_for_a_slow_response(
             parameters={},
             transport=httpx.MockTransport(slow_response),
         )
+
+
+def test_recovery_rules_separate_delivery_age_from_stop_confirmation() -> None:
+    now = datetime.now(UTC)
+    common = {
+        "video_status": "ready",
+        "task_status": "queued",
+        "attempt_status": "queued",
+        "claim_count": 0,
+        "delivery_updated_at": now,
+        "attempt_stop_confirmed": False,
+        "execution_stop_confirmed": False,
+        "is_current_attempt": True,
+        "now": now,
+    }
+    for delivery_status in ("pending", "unknown", "failed"):
+        assert evaluate_recovery(delivery_status=delivery_status, **common).eligible
+
+    recent_sent = evaluate_recovery(delivery_status="sent", **common)
+    assert not recent_sent.eligible and recent_sent.error_code == "DELIVERY_NOT_STALE"
+    assert recent_sent.available_at == now + timedelta(minutes=5)
+    stale_sent = evaluate_recovery(
+        delivery_status="sent",
+        **{**common, "delivery_updated_at": now - timedelta(minutes=6)},
+    )
+    assert stale_sent.eligible
+
+    claimed = evaluate_recovery(
+        **{
+            **common,
+            "task_status": "failed",
+            "attempt_status": "failed",
+            "delivery_status": "sent",
+            "claim_count": 1,
+        }
+    )
+    assert not claimed.eligible and claimed.error_code == "STOP_CONFIRMATION_REQUIRED"
+    stopped = evaluate_recovery(
+        **{
+            **common,
+            "task_status": "failed",
+            "attempt_status": "failed",
+            "delivery_status": "sent",
+            "claim_count": 1,
+            "attempt_stop_confirmed": True,
+            "execution_stop_confirmed": True,
+        }
+    )
+    assert stopped.eligible
+    complete = evaluate_recovery(
+        **{
+            **common,
+            "task_status": "awaiting_summary",
+            "attempt_status": "awaiting_summary",
+            "delivery_status": "sent",
+            "claim_count": 1,
+            "attempt_stop_confirmed": True,
+            "execution_stop_confirmed": True,
+        }
+    )
+    assert not complete.eligible and complete.error_code == "TRANSCRIPT_COMPLETE_AWAITING_SUMMARY"
+    deleting = evaluate_recovery(**{**common, "video_status": "deleting", "delivery_status": "pending"})
+    assert not deleting.eligible and deleting.error_code == "VIDEO_DELETION_IN_PROGRESS"
+
+
+def test_manual_recovery_is_idempotent_and_old_attempt_messages_are_rejected(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+) -> None:
+    published: list[tuple[str, str]] = []
+    app = create_app(
+        test_settings,
+        session_factory,
+        run_recovery=False,
+        task_publisher=lambda task_id, attempt_id: published.append((task_id, attempt_id)),
+    )
+    with TestClient(app) as client, TestClient(app) as stranger:
+        owner_id = _register(client, "analysis-manual-recovery")
+        _register(stranger, "analysis-recovery-stranger")
+        video_id = _video(session_factory, app.state.store, owner_id)
+        from tests.helpers import csrf, mutate_headers
+
+        headers = mutate_headers(csrf(client))
+        stranger_headers = mutate_headers(csrf(stranger))
+        original = client.post(f"/videos/{video_id}/tasks", headers=headers)
+        assert original.status_code == 202
+        task_id = uuid.UUID(original.json()["id"])
+        parent_id = uuid.UUID(original.json()["attempt"]["id"])
+        with session_factory.begin() as session:
+            delivery = session.get(TaskDelivery, parent_id)
+            assert delivery is not None
+            delivery.updated_at = datetime.now(UTC) - timedelta(minutes=6)
+
+        url = f"/videos/{video_id}/tasks/{task_id}/recover"
+        request = {"attempt_id": str(parent_id)}
+        missing_csrf = client.post(url, json=request)
+        assert missing_csrf.status_code == 403
+        hidden = stranger.post(url, json=request, headers=stranger_headers)
+        assert hidden.status_code == 404
+        recovered = client.post(url, json=request, headers=headers)
+        assert recovered.status_code == 202, recovered.text
+        child_id = uuid.UUID(recovered.json()["attempt"]["id"])
+        assert recovered.json()["attempt"]["parent_attempt_id"] == str(parent_id)
+        assert recovered.json()["attempt"]["attempt_number"] == 2
+        assert recovered.json()["status"] == "queued"
+        assert len(published) == 2
+        assert published[1] == (str(task_id), str(child_id))
+
+        replayed = client.post(url, json=request, headers=headers)
+        assert replayed.status_code == 202
+        assert replayed.json()["attempt"]["id"] == str(child_id)
+        assert len(published) == 2
+        with session_factory() as session:
+            attempts = list(
+                session.scalars(
+                    select(AnalysisAttempt)
+                    .where(AnalysisAttempt.task_id == task_id)
+                    .order_by(AnalysisAttempt.attempt_number)
+                )
+            )
+            assert len(attempts) == 2
+            assert attempts[0].status == "failed"
+            assert attempts[0].failure_code == "ATTEMPT_SUPERSEDED"
+            assert attempts[1].parent_attempt_id == attempts[0].id
+            assert attempts[1].config_sha256 == attempts[0].config_sha256
+            assert attempts[1].work_directory_name != attempts[0].work_directory_name
+
+    lease = ExecutionLease.acquire(test_engine)
+    assert lease is not None
+    assert _claim_attempt(lease, task_id, parent_id, "test-old-message") is None
+    assert _claim_attempt(lease, task_id, child_id, "test-current-message") is not None
+    lease.release()
+    assert transcribe_analysis(str(task_id)) == {"status": "ignored_legacy_task_message"}
+
+
+def test_recovery_rejects_source_metadata_that_no_longer_matches_the_frozen_snapshot(
+    test_settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    with TestClient(create_app(test_settings, session_factory, run_recovery=False)) as client:
+        owner_id = _register(client, "analysis-source-changed")
+        video_id = _video(session_factory, client.app.state.store, owner_id)
+    submitted = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
+    with session_factory.begin() as session:
+        video = session.get(Video, video_id)
+        assert video is not None
+        video.content_sha256 = "f" * 64
+    with pytest.raises(HTTPException) as error:
+        recover_analysis_attempt(session_factory, owner_id, video_id, submitted.task_id, submitted.attempt_id)
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "SOURCE_CONFIGURATION_INCOMPATIBLE"
+    with session_factory() as session:
+        task = session.get(AnalysisTask, submitted.task_id)
+        attempt = session.get(AnalysisAttempt, submitted.attempt_id)
+        assert task is not None and task.current_attempt_id == submitted.attempt_id
+        assert attempt is not None and attempt.status == "queued"
+
+
+def test_recovery_and_video_deletion_serialize_on_the_video_row(
+    test_settings: Settings,
+    session_factory: sessionmaker[Session],
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    with TestClient(create_app(test_settings, session_factory, store, run_recovery=False)) as client:
+        owner_id = _register(client, "analysis-recovery-delete-race")
+        video_id = _video(session_factory, store, owner_id)
+    submitted = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
+    start = threading.Barrier(2)
+
+    def recover() -> str:
+        start.wait()
+        try:
+            recover_analysis_attempt(
+                session_factory,
+                owner_id,
+                video_id,
+                submitted.task_id,
+                submitted.attempt_id,
+            )
+            return "recovered"
+        except HTTPException as exc:
+            assert exc.status_code in {404, 409}
+            return "recovery_rejected"
+
+    def delete() -> str:
+        start.wait()
+        return "deleted" if delete_video(session_factory, store, owner_id, video_id) == 204 else "pending"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        recover_future = pool.submit(recover)
+        delete_future = pool.submit(delete)
+        result_recover = recover_future.result(timeout=20)
+        result_delete = delete_future.result(timeout=20)
+
+    assert result_recover in {"recovered", "recovery_rejected"}
+    assert result_delete == "deleted"
+    with session_factory() as session:
+        assert session.get(Video, video_id) is None
+        assert session.get(AnalysisTask, submitted.task_id) is None
+        assert (
+            session.scalar(
+                select(func.count(AnalysisAttempt.id)).where(AnalysisAttempt.task_id == submitted.task_id)
+            )
+            == 0
+        )
+
+
+def test_stop_unconfirmed_blocks_recovery_and_deletion_until_confirmed(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    app = create_app(
+        test_settings, session_factory, store, run_recovery=False, task_publisher=lambda *_: None
+    )
+    with TestClient(app) as client:
+        owner_id = _register(client, "analysis-delete-active")
+        video_id = _video(session_factory, store, owner_id)
+        from tests.helpers import csrf, mutate_headers
+
+        headers = mutate_headers(csrf(client))
+        created = client.post(f"/videos/{video_id}/tasks", headers=headers)
+        task_id = uuid.UUID(created.json()["id"])
+        attempt_id = uuid.UUID(created.json()["attempt"]["id"])
+        with session_factory() as session:
+            video = session.get(Video, video_id)
+            attempt = session.get(AnalysisAttempt, attempt_id)
+            assert video is not None and attempt is not None
+            target = store.target_path(video.storage_name)
+            work = store.analysis / task_id.hex / attempt.work_directory_name
+            work.mkdir(parents=True)
+            sentinel = work / "audio.s16le"
+            sentinel.write_bytes(b"active work")
+
+        lease = ExecutionLease.acquire(test_engine)
+        assert lease is not None
+        active_claim = _claim_attempt(lease, task_id, attempt_id, "test-active-worker")
+        assert active_claim is not None
+        recovery = client.post(
+            f"/videos/{video_id}/tasks/{task_id}/recover",
+            json={"attempt_id": str(attempt_id)},
+            headers=headers,
+        )
+        assert recovery.status_code == 409
+        assert recovery.json()["detail"]["code"] == "STOP_CONFIRMATION_REQUIRED"
+
+        pending_delete = client.delete(f"/videos/{video_id}", headers=headers)
+        assert pending_delete.status_code == 202
+        lease_maker = sessionmaker(bind=lease.connection, autoflush=False, expire_on_commit=False)
+        assert _deletion_cleanup_is_pending(lease_maker, active_claim) is True
+        assert target.exists() and sentinel.exists()
+        assert client.get(f"/videos/{video_id}/transcript").status_code == 409
+        assert client.get(f"/videos/{video_id}/content").status_code == 404
+        assert client.get(f"/videos/{video_id}/tasks/{task_id}").status_code == 409
+        progress = client.get(f"/videos/{video_id}/deletion")
+        assert progress.status_code == 200
+        assert progress.json()["stop_confirmation_required"] is True
+
+        lease.release()
+        assert delete_video(session_factory, store, owner_id, video_id) == 202
+        assert target.exists() and sentinel.exists()
+
+        stopped_at = datetime.now(UTC)
+        with session_factory.begin() as session:
+            task = session.get(AnalysisTask, task_id)
+            attempt = session.get(AnalysisAttempt, attempt_id)
+            execution = session.scalar(
+                select(AnalysisExecution).where(AnalysisExecution.attempt_id == attempt_id)
+            )
+            assert task is not None and attempt is not None and execution is not None
+            task.status = "failed"
+            attempt.status = "failed"
+            attempt.stop_confirmed_at = stopped_at
+            execution.stop_confirmed_at = stopped_at
+            execution.stop_confirmation_source = "test_operator_evidence"
+
+        original_remove = store.remove_attempt_directory
+
+        def fail_temp_cleanup(*_args: Any, **_kwargs: Any) -> None:
+            raise OSError("injected temp cleanup failure")
+
+        monkeypatch.setattr(store, "remove_attempt_directory", fail_temp_cleanup)
+        failed_cleanup = client.delete(f"/videos/{video_id}", headers=headers)
+        assert failed_cleanup.status_code == 202
+        details = client.get(f"/videos/{video_id}").json()
+        assert details["status"] == "cleanup_failed"
+        assert details["deletion_error"] == "ATTEMPT_TEMP_CLEANUP_FAILED"
+        assert target.exists() and sentinel.exists()
+
+        monkeypatch.setattr(store, "remove_attempt_directory", original_remove)
+        completed = client.delete(f"/videos/{video_id}", headers=headers)
+        assert completed.status_code == 204
+        assert not target.exists() and not sentinel.exists()
+        with session_factory() as session:
+            assert session.get(AnalysisTask, task_id) is None
+            assert session.get(AnalysisAttempt, attempt_id) is None
+            assert session.get(Video, video_id) is None
+
+
+def test_stopped_attempt_cleanup_preserves_transcript_and_video(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    published: list[tuple[str, str]] = []
+    app = create_app(
+        test_settings,
+        session_factory,
+        store,
+        run_recovery=False,
+        task_publisher=lambda task_id, attempt_id: published.append((task_id, attempt_id)),
+    )
+    with TestClient(app) as client:
+        owner_id = _register(client, "analysis-cleanup-retry")
+        video_id = _video(session_factory, store, owner_id)
+        task = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
+        lease = ExecutionLease.acquire(test_engine)
+        assert lease is not None
+        claim = _claim_attempt(lease, task.task_id, task.attempt_id, "test-finished-worker")
+        assert claim is not None
+        stopped_at = datetime.now(UTC)
+        with session_factory.begin() as session:
+            task_row = session.get(AnalysisTask, task.task_id)
+            attempt = session.get(AnalysisAttempt, task.attempt_id)
+            execution = session.scalar(
+                select(AnalysisExecution).where(AnalysisExecution.attempt_id == task.attempt_id)
+            )
+            assert task_row is not None and attempt is not None and execution is not None
+            task_row.status = "awaiting_summary"
+            task_row.stage = "awaiting_summary"
+            attempt.status = "awaiting_summary"
+            attempt.stop_confirmed_at = stopped_at
+            execution.stop_confirmed_at = stopped_at
+            session.add(
+                TranscriptSegment(
+                    attempt_id=task.attempt_id,
+                    segment_number=0,
+                    audio_start_seconds=0,
+                    audio_end_seconds=30,
+                    actual_audio_seconds=30,
+                    video_start_seconds=0,
+                    video_end_seconds=30,
+                    audio_sha256="a" * 64,
+                    request_fingerprint="b" * 64,
+                    status="succeeded",
+                    text="persisted source transcript",
+                    request_count=1,
+                    request_metadata={"http_status": 200},
+                )
+            )
+        lease.release()
+        with session_factory() as session:
+            attempt = session.get(AnalysisAttempt, task.attempt_id)
+            video = session.get(Video, video_id)
+            assert attempt is not None and video is not None
+            work = store.analysis / task.task_id.hex / attempt.work_directory_name
+            work.mkdir(parents=True)
+            (work / "leftover.wav").write_bytes(b"leftover")
+            original = store.target_path(video.storage_name)
+
+        from tests.helpers import csrf, mutate_headers
+
+        response = client.post(
+            f"/videos/{video_id}/cleanup",
+            json={"attempt_id": str(task.attempt_id)},
+            headers=mutate_headers(csrf(client)),
+        )
+        assert response.status_code == 200
+        assert response.json()["cleanup_state"] == "cleaned"
+        assert not work.exists() and original.exists()
+        transcript = client.get(f"/videos/{video_id}/transcript")
+        assert transcript.status_code == 200
+        assert transcript.json()["complete"] is True
+        assert transcript.json()["items"][0]["text"] == "persisted source transcript"
+        task_status = client.get(f"/videos/{video_id}/tasks/{task.task_id}")
+        assert task_status.status_code == 200
+        assert task_status.json()["recovery_eligible"] is False
+        assert task_status.json()["recovery_error_code"] == "TRANSCRIPT_COMPLETE_AWAITING_SUMMARY"
+        assert published == []
+
+
+def test_checkpoint_matching_requires_the_entire_immutable_segment_identity() -> None:
+    expected = {
+        "segment_number": 2,
+        "audio_start_seconds": 60.0,
+        "audio_end_seconds": 62.0,
+        "actual_audio_seconds": 2.0,
+        "video_start_seconds": 60.0,
+        "video_end_seconds": 62.0,
+        "audio_sha256": "a" * 64,
+        "request_fingerprint": "b" * 64,
+    }
+    previous = {**expected, "status": "succeeded", "text": "committed transcript"}
+    assert checkpoint_matches(
+        previous,
+        expected,
+        previous_manifest_fingerprint="c" * 64,
+        expected_manifest_fingerprint="c" * 64,
+    )
+    assert not checkpoint_matches(
+        previous,
+        expected,
+        previous_manifest_fingerprint="d" * 64,
+        expected_manifest_fingerprint="c" * 64,
+    )
+    for key in expected:
+        changed = {**expected, key: "changed"}
+        assert not checkpoint_matches(
+            previous,
+            changed,
+            previous_manifest_fingerprint="c" * 64,
+            expected_manifest_fingerprint="c" * 64,
+        )
+    assert not checkpoint_matches(
+        {**previous, "status": "expected", "text": None},
+        expected,
+        previous_manifest_fingerprint="c" * 64,
+        expected_manifest_fingerprint="c" * 64,
+    )
+
+
+def test_recovery_copies_only_matching_committed_checkpoints(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    with TestClient(create_app(test_settings, session_factory, store, run_recovery=False)) as client:
+        owner_id = _register(client, "analysis-checkpoint-reuse")
+        video_id = _video(session_factory, store, owner_id)
+    submitted = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
+    first_lease = ExecutionLease.acquire(test_engine)
+    assert first_lease is not None
+    first_claim = _claim_attempt(first_lease, submitted.task_id, submitted.attempt_id, "test-first-attempt")
+    assert first_claim is not None
+    config = first_claim.snapshot
+    sample_rate = int(config["audio"]["sample_rate"])
+    channels = int(config["audio"]["channels"])
+    pcm = tmp_path / "full-audio.s16le"
+    pcm.write_bytes(b"\x01\x00" * int(61.25 * sample_rate))
+    entries = build_manifest(
+        pcm_bytes=pcm.stat().st_size,
+        duration_seconds=float(config["source"]["duration_seconds"]),
+        sample_rate=sample_rate,
+        channels=channels,
+        segment_seconds=int(config["slicing"]["segment_seconds"]),
+    )
+    fingerprint_rows: list[dict[str, Any]] = []
+    for entry in entries:
+        wav_path = tmp_path / f"seed-{entry.segment_number:04d}.wav"
+        with pcm.open("rb") as pcm_file:
+            pcm_file.seek(entry.pcm_start_byte)
+            audio_bytes = pcm_file.read(entry.pcm_end_byte - entry.pcm_start_byte)
+        with wave.open(str(wav_path), "wb") as wav:
+            wav.setnchannels(channels)
+            wav.setsampwidth(2)
+            wav.setframerate(sample_rate)
+            wav.writeframes(audio_bytes)
+        audio_sha256 = hashlib.sha256(wav_path.read_bytes()).hexdigest()
+        request_fingerprint = canonical_sha256(
+            {
+                "version": ASR_REQUEST_FINGERPRINT_VERSION,
+                "source_fingerprint": config["source"]["fingerprint"],
+                "segment_number": entry.segment_number,
+                "wav_sha256": audio_sha256,
+                "wav_bytes": wav_path.stat().st_size,
+                "model": config["asr"]["model"],
+                "base_url": config["asr"]["base_url"],
+                "parameters": config["asr"]["parameters"],
+            }
+        )
+        fingerprint_rows.append(
+            {
+                "segment_number": entry.segment_number,
+                "audio_start_seconds": entry.audio_start_seconds,
+                "audio_end_seconds": entry.audio_end_seconds,
+                "actual_audio_seconds": entry.actual_audio_seconds,
+                "video_start_seconds": entry.video_start_seconds,
+                "video_end_seconds": entry.video_end_seconds,
+                "audio_sha256": audio_sha256,
+                "request_fingerprint": request_fingerprint,
+            }
+        )
+    manifest_fingerprint = canonical_sha256(
+        {
+            "version": config["slicing"]["manifest_version"],
+            "timeline_mapping_version": config["slicing"]["timeline_mapping_version"],
+            "audio": config["audio"],
+            "source_fingerprint": config["source"]["fingerprint"],
+            "segments": fingerprint_rows,
+        }
+    )
+    stopped_at = datetime.now(UTC)
+    with session_factory.begin() as session:
+        parent = session.get(AnalysisAttempt, submitted.attempt_id)
+        task = session.get(AnalysisTask, submitted.task_id)
+        execution = session.scalar(
+            select(AnalysisExecution).where(AnalysisExecution.attempt_id == submitted.attempt_id)
+        )
+        assert parent is not None and task is not None and execution is not None
+        parent.status = "failed"
+        parent.failure_code = "ASR_REQUEST_FAILED"
+        parent.stop_confirmed_at = stopped_at
+        parent.manifest_fingerprint = manifest_fingerprint
+        task.status = "failed"
+        task.stage = "failed"
+        task.failure_code = "ASR_REQUEST_FAILED"
+        execution.stop_confirmed_at = stopped_at
+        execution.stop_confirmation_source = "test_operator_evidence"
+        for index, row in enumerate(fingerprint_rows[:2]):
+            session.add(
+                TranscriptSegment(
+                    attempt_id=parent.id,
+                    segment_number=index,
+                    audio_start_seconds=row["audio_start_seconds"],
+                    audio_end_seconds=row["audio_end_seconds"],
+                    actual_audio_seconds=row["actual_audio_seconds"],
+                    video_start_seconds=row["video_start_seconds"],
+                    video_end_seconds=row["video_end_seconds"],
+                    audio_sha256=row["audio_sha256"],
+                    request_fingerprint=(row["request_fingerprint"] if index == 0 else "f" * 64),
+                    status="succeeded",
+                    text=f"persisted segment {index}",
+                    request_count=1,
+                    request_metadata={"http_status": 200},
+                )
+            )
+        row = fingerprint_rows[2]
+        session.add(
+            TranscriptSegment(
+                attempt_id=parent.id,
+                segment_number=2,
+                audio_start_seconds=row["audio_start_seconds"],
+                audio_end_seconds=row["audio_end_seconds"],
+                actual_audio_seconds=row["actual_audio_seconds"],
+                video_start_seconds=row["video_start_seconds"],
+                video_end_seconds=row["video_end_seconds"],
+                audio_sha256=row["audio_sha256"],
+                request_fingerprint=row["request_fingerprint"],
+                status="expected",
+                request_count=1,
+            )
+        )
+    first_lease.release()
+
+    recovered = recover_analysis_attempt(
+        session_factory, owner_id, video_id, submitted.task_id, submitted.attempt_id
+    )
+    second_lease = ExecutionLease.acquire(test_engine)
+    assert second_lease is not None
+    child_claim = _claim_attempt(
+        second_lease, submitted.task_id, recovered.attempt_id, "test-recovery-attempt"
+    )
+    assert child_claim is not None
+    maker = sessionmaker(bind=second_lease.connection, autoflush=False, expire_on_commit=False)
+    _, reused = _save_manifest(maker, second_lease, child_claim, entries, pcm, config)
+    assert reused == {0}
+    with session_factory() as session:
+        parent_segment = session.scalar(
+            select(TranscriptSegment).where(
+                TranscriptSegment.attempt_id == submitted.attempt_id,
+                TranscriptSegment.segment_number == 0,
+            )
+        )
+        child_segments = list(
+            session.scalars(
+                select(TranscriptSegment)
+                .where(TranscriptSegment.attempt_id == recovered.attempt_id)
+                .order_by(TranscriptSegment.segment_number)
+            )
+        )
+        assert parent_segment is not None and parent_segment.text == "persisted segment 0"
+        assert len(child_segments) == 3
+        assert child_segments[0].status == "succeeded"
+        assert child_segments[0].text == parent_segment.text
+        assert child_segments[0].source_attempt_id == submitted.attempt_id
+        assert child_segments[0].request_count == 0
+        assert child_segments[1].status == "expected" and child_segments[1].text is None
+        assert child_segments[2].status == "expected" and child_segments[2].text is None
+        assert child_segments[0].audio_sha256 == fingerprint_rows[0]["audio_sha256"]
+        assert child_segments[0].request_fingerprint == fingerprint_rows[0]["request_fingerprint"]
+    second_lease.release()
 
 
 def test_celery_delivery_and_acknowledgement_settings_are_explicit() -> None:

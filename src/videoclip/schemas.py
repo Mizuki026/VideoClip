@@ -57,20 +57,24 @@ class UploadResponse(BaseModel):
 class AnalysisAttemptResponse(BaseModel):
     id: UUID
     attempt_number: int
+    parent_attempt_id: UUID | None
     status: str
     execution_id: UUID | None
     first_claimed_at: datetime | None
     stop_confirmed_at: datetime | None
     cleanup_state: str
+    cleanup_error_code: str | None
     failure_code: str | None
 
 
 class AnalysisTaskResponse(BaseModel):
     id: UUID
     video_id: UUID
+    current_attempt_id: UUID
     status: str
     stage: str
     delivery_status: str
+    delivery_updated_at: datetime
     delivery_error_code: str | None
     completed_segments: int
     expected_segments: int
@@ -82,16 +86,49 @@ class AnalysisTaskResponse(BaseModel):
     asr_request_count: int
     asr_elapsed_seconds: float
     asr_calls: list[dict[str, Any]]
+    reused_segments: int
     summary_status: str
     execution_state: str
     execution_stop_confirmed: bool | None
     failure_code: str | None
+    recovery_eligible: bool
+    recovery_error_code: str | None
+    recovery_available_at: datetime | None
+    is_current_attempt: bool
     created_at: datetime
     attempt: AnalysisAttemptResponse
 
 
+class RecoveryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    attempt_id: UUID
+
+
+class CleanupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    attempt_id: UUID
+
+
+class CleanupResponse(BaseModel):
+    video_id: UUID
+    attempt_id: UUID
+    cleanup_state: str
+    cleanup_error_code: str | None
+
+
+class VideoDeletionProgress(BaseModel):
+    video_id: UUID
+    state: str
+    error_code: str | None
+    pending_attempt_ids: list[UUID]
+    stop_confirmation_required: bool
+
+
 class TranscriptSegmentResponse(BaseModel):
     segment_number: int
+    source_attempt_id: UUID | None
     audio_start_seconds: float
     audio_end_seconds: float
     actual_audio_seconds: float
