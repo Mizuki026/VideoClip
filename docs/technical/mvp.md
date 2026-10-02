@@ -63,7 +63,7 @@ flowchart LR
 - API 处理请求、鉴权和任务提交，不在请求生命周期内执行整段转写或总结。
 - Worker 从队列接收尝试对应的任务编号，调用任务生命周期模块领取执行权，从数据库读取冻结配置并提交阶段、检查点和结果。
 - PostgreSQL 保存完整业务状态；Redis 消息只传递任务编号，不存放视频或转写全文。
-- 开发时由 Vite 代理 `/api`；本地演示时由 API 提供前端构建产物，保持同源访问。
+- 开发时由 Vite 代理 `/api`；本地演示时由 API 提供前端构建产物，保持同源访问。当前后端延续第 1 窗口 `/auth`、`/videos` 路由；同源代理须剥除 `/api` 前缀后转发，例如 `/api/videos/{id}/tasks` 转为 `/videos/{id}/tasks`，不在 API 内重命名或复制路由。
 - 视频通过鉴权后的文件接口读取，不将业务目录直接作为公开静态目录。
 
 ### 3.1 模块职责与依赖方向
@@ -301,9 +301,11 @@ E:\VideoClip\data\
 
 ## 9. 本地运行与环境验证
 
-目标运行结构由 Docker Compose 运行 API、Worker、PostgreSQL 和 Redis；API 与 Worker 共用包含 FFmpeg 的精简镜像，前端仅保留构建产物进入演示镜像。宿主机只向回环地址开放必要端口。当前 Stage 1 只启动 API 与 PostgreSQL，尚未实现或启动 Redis、Worker 和前端。
+目标运行结构由 Docker Compose 运行 API、Worker、PostgreSQL 和 Redis；API 与 Worker 共用包含 FFmpeg 的精简镜像，前端仅保留构建产物进入演示镜像。宿主机只向回环地址开放必要端口。Stage 1 单独启动 API 与 PostgreSQL；Stage 2 已在独立 Compose 项目启动 API、PostgreSQL、Redis 和一个 Worker。前端及实际 `/api` 反向代理尚未实现。
 
 Stage 1 使用独立 Compose 项目 `videoclip-mvp-stage1`：`scripts/stage1/prepare-private-data.ps1` 在 `data/mvp-stage-1/` 准备 E 盘私密配置及数据目录，`run-stage1.ps1` 构建镜像、运行 PostgreSQL 迁移并启动服务，`stop-stage1.ps1` 只停止本项目 API / PostgreSQL 且保留数据。API / PostgreSQL 分别绑定回环端口 58001 / 55442；数据库和媒体通过 E 盘 bind mount 持久化。容器限制为 API 1 GiB / PostgreSQL 768 MiB、每个 128 PID；JSON 日志每容器最多保留 2 个 10 MiB 文件。测试数据库 `videoclip_mvp_stage1_test` 与业务库隔离。
+
+Stage 2 使用独立 Compose 项目 `videoclip-mvp-stage2` 和 `data/mvp-stage-2/` 私密配置：先运行 `scripts/stage2/prepare-stage2.ps1`，再用 `run-stage2.ps1` 构建、迁移并启动 API / Worker / PostgreSQL / Redis。Stage 2 回环端口为 API 58002、PostgreSQL 55443；Redis 只在 Compose 网络内开放。其 app、PostgreSQL 和 Redis 持久化目录分别 bind mount 到 E 盘 Stage 2 路径，Stage 1 继续使用原数据库、端口、镜像标签和容器。Worker 仅一个实例、并发 1、预取 1；Redis 消息仅含任务 UUID，不配置业务结果后端或自动重试。`stop-and-confirm-worker.ps1` 只针对 Stage 2 Worker，并要求将容器退出与指定执行记录对应后才登记停止事实。
 
 PostgreSQL 和 Redis 的持久化路径需明确映射到 E 盘业务目录，参考 [Docker bind mount 说明](https://docs.docker.com/engine/storage/bind-mounts/)。先验证 Windows 路径挂载、数据库初始化权限、容器重启后的持久化与备份恢复；不能静默改用位于默认 Docker 存储区的数据库卷来绕过路径要求。本版不验证业务数据目录的 5 GiB 硬限制、容量准入水位或写满拒绝行为。
 
@@ -363,8 +365,9 @@ Worker 只部署一个服务实例，不用 Compose 自动扩容或重启策略�
 | 存储容量范围 | 用户已明确暂时取消上传视频 1 GiB 限制和业务数据目录 5 GiB 运行期硬限制、容量准入水位及写满拒绝测试。文档与探针不以这些限制拒绝写入；普通文件系统 I/O 错误仍按操作失败处理。 |
 | 第 0 窗口关卡 | **剩余范围内验收通过，可进入第 1 窗口。** 已取消的 5 GiB 容量限制关卡不计为通过项或阻塞项；实际账单 / 剩余免费额度未直接读取，模型计费依据和限制见验证记录。 |
 | 第 1 窗口后端验收 | **账户、上传与视频管理已完成。** 37 项后端集成测试通过，使用隔离 PostgreSQL；另有 Stage 0 的 32 项 pytest 回归通过。真实 HTTP 原始体上传 1,116,803,236 字节样片，SHA-256、API 重启后持久性、HEAD / Range、删除和不可访问检查均通过。详见[第 1 窗口记录](../../.scratch/mvp-stage-1/validation.md)。 |
-| 后续窗口范围 | 分析任务 / Worker、ASR/LLM、转写与总结及 React 页面仍未实现；本窗口没有创建这些功能的半成品。下一步进入第 2 阶段“可恢复分析”设计与实现。 |
+| 第 2 窗口异步转写验收 | **第一条异步转写链路已通过。** 任务提交 / 所有者隔离 / 投递事实 / 单 Worker / 冻结配置 / 进程停止与持久化检查点已实现；真实授权样片 13/13 个 SenseVoice 请求成功，转写完成后保持 `awaiting_summary`，API / Worker 重启后仍可读取。后端全量 60 项、Stage 0 回归 32 项通过；细节和限制见[第 2 窗口记录](../../.scratch/mvp-stage-2/validation.md)。 |
+| 后续窗口范围 | 人工恢复与成功检查点复用仍待第 3 窗口；正式 LLM 总结 / 引用发布待第 4 窗口；React 页面及同源 `/api` 代理尚未实现。本窗口没有提前创建这些用户流程。 |
 
-第 1 窗口完成；后续只按已确认的技术阶段计划进入第 2 阶段。业务数据目录 5 GiB 硬限额、容量准入水位与写满拒绝测试仍不在当前范围；如要恢复，先另行确认产品决策与验收方案。
+第 2 窗口完成“第一条异步转写链路”，只覆盖技术方案“可恢复分析”的前半段；不表示完整任务恢复或 MVP 分析功能完成。后续按窗口规格继续实现人工恢复、检查点复用和正式总结。业务数据目录 5 GiB 硬限额、容量准入水位与写满拒绝测试仍不在当前范围；如要恢复，先另行确认产品决策与验收方案。
 
 MVP 完成后再迭代分片上传、自动恢复与限流等待、删除原视频但保留笔记，以及更完整的故障执行记录。
