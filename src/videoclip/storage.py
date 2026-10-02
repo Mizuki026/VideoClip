@@ -43,9 +43,10 @@ class MediaStore:
         self.incoming = self.root / "incoming"
         self.media = self.root / "media"
         self.leases = self.root / "leases"
+        self.analysis = self.root / "analysis"
 
     def prepare(self) -> None:
-        for directory in (self.incoming, self.media, self.leases):
+        for directory in (self.incoming, self.media, self.leases, self.analysis):
             directory.mkdir(parents=True, exist_ok=True)
 
     def part_path(self, upload_id: UUID) -> Path:

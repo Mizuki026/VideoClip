@@ -42,6 +42,38 @@ class Settings(BaseSettings):
     ffprobe_stop_grace_seconds: int = Field(default=5, ge=1, le=30, alias="FFPROBE_STOP_GRACE_SECONDS")
     cleanup_timeout_seconds: int = Field(default=30, ge=1, le=300, alias="CLEANUP_TIMEOUT_SECONDS")
     ffprobe_path: str = Field(default="ffprobe", alias="FFPROBE_PATH")
+    ffmpeg_path: str = Field(default="ffmpeg", alias="FFMPEG_PATH")
+    asr_base_url: str = Field(default="https://api.siliconflow.cn/v1", alias="SILICONFLOW_BASE_URL")
+    asr_model: str = Field(default="FunAudioLLM/SenseVoiceSmall", alias="SILICONFLOW_ASR_MODEL")
+    asr_secret_reference: str = Field(default="environment:SILICONFLOW_API_KEY", alias="ASR_SECRET_REFERENCE")
+    asr_request_parameters: dict[str, str] = Field(default_factory=dict, alias="ASR_REQUEST_PARAMETERS")
+    llm_model: str = Field(default="Qwen/Qwen3.5-4B", alias="SILICONFLOW_LLM_MODEL")
+    summary_prompt_version: str = Field(default="stage0-summary-v4", alias="PROMPT_VERSION")
+    summary_schema_version: str = Field(default="summary-v1", alias="SUMMARY_SCHEMA_VERSION")
+    llm_context_tokens: int = Field(default=256_000, ge=1, alias="LLM_CONTEXT_TOKENS")
+    llm_max_output_tokens: int = Field(default=3072, ge=1, alias="LLM_MAX_OUTPUT_TOKENS")
+    audio_sample_rate: int = Field(default=16_000, ge=1, alias="AUDIO_SAMPLE_RATE")
+    audio_channels: int = Field(default=1, ge=1, le=1, alias="AUDIO_CHANNELS")
+    audio_sample_format: str = Field(default="s16le", alias="AUDIO_SAMPLE_FORMAT")
+    segment_seconds: int = Field(default=30, ge=1, le=120, alias="SEGMENT_SECONDS")
+    timeline_mapping_version: str = Field(default="zero-offset-v1", alias="TIMELINE_MAPPING_VERSION")
+    slice_manifest_version: str = Field(default="pcm-s16le-slices-v1", alias="SLICE_MANIFEST_VERSION")
+    asr_http_total_timeout_seconds: float = Field(
+        default=240, gt=0, le=600, alias="HTTP_TOTAL_TIMEOUT_SECONDS"
+    )
+    asr_http_connect_timeout_seconds: float = Field(
+        default=15, gt=0, le=120, alias="HTTP_CONNECT_TIMEOUT_SECONDS"
+    )
+    asr_http_read_timeout_seconds: float = Field(default=45, gt=0, le=180, alias="HTTP_READ_TIMEOUT_SECONDS")
+    media_total_timeout_seconds: int = Field(default=300, ge=1, le=1800, alias="MEDIA_TOTAL_TIMEOUT_SECONDS")
+    process_stop_grace_seconds: int = Field(default=5, ge=1, le=30, alias="MEDIA_STOP_GRACE_SECONDS")
+    attempt_total_timeout_seconds: int = Field(
+        default=10_800, ge=60, le=10_800, alias="ATTEMPT_TOTAL_TIMEOUT_SECONDS"
+    )
+    max_asr_response_bytes: int = Field(default=1_048_576, ge=1, le=4_194_304, alias="MAX_RESPONSE_BYTES")
+    max_media_diagnostic_bytes: int = Field(default=8192, ge=512, le=65_536, alias="MAX_DIAGNOSTIC_BYTES")
+    celery_broker_url: str = Field(default="redis://127.0.0.1:6379/0", alias="CELERY_BROKER_URL")
+    worker_id: str = Field(default="videoclip-worker", alias="WORKER_ID")
     db_host: str = Field(default="127.0.0.1", alias="DB_HOST")
     db_port: int = Field(default=55442, ge=1, le=65535, alias="DB_PORT")
     db_name: str = Field(default="videoclip_mvp_stage1", alias="DB_NAME")
@@ -66,6 +98,11 @@ class Settings(BaseSettings):
             raise ValueError("APP_ORIGIN must be an exact http(s) origin without a trailing slash")
         if self.app_env == "production" and self.cookie_secure is False:
             raise ValueError("COOKIE_SECURE cannot be false in production")
+        asr_endpoint = urlsplit(self.asr_base_url)
+        if asr_endpoint.scheme != "https" or not asr_endpoint.netloc or self.asr_base_url.endswith("/"):
+            raise ValueError("SILICONFLOW_BASE_URL must be an HTTPS base URL without a trailing slash")
+        if self.audio_sample_format != "s16le":
+            raise ValueError("AUDIO_SAMPLE_FORMAT must be s16le")
         return self
 
     @property

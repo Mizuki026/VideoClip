@@ -5,8 +5,8 @@ services:
     image: postgres:16-alpine@sha256:3c5c8892d184f738f4fe282d14ddaa613a38f00f4189d2d94725ebe6f2909ddb
     pull_policy: never
     environment:
-      POSTGRES_DB: videoclip_mvp_stage1
-      POSTGRES_USER: videoclip_stage1
+      POSTGRES_DB: ${POSTGRES_DB:-videoclip_mvp_stage1}
+      POSTGRES_USER: ${POSTGRES_USER:-videoclip_stage1}
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
     secrets:
       - postgres_password
@@ -21,7 +21,11 @@ services:
     stop_grace_period: 30s
     restart: "no"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U videoclip_stage1 -d videoclip_mvp_stage1"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-videoclip_stage1} -d ${POSTGRES_DB:-videoclip_mvp_stage1}",
+        ]
       interval: 2s
       timeout: 2s
       retries: 30
@@ -36,7 +40,7 @@ services:
     build:
       context: .
       dockerfile: backend.Dockerfile
-    image: videoclip-mvp-stage1-api:local
+    image: ${MVP_IMAGE_NAME:-videoclip-mvp-stage1-api:local}
     pull_policy: never
     depends_on:
       postgres:
@@ -47,11 +51,12 @@ services:
     environment:
       DB_HOST: postgres
       DB_PORT: 5432
-      DB_NAME: videoclip_mvp_stage1
-      DB_USER: videoclip_stage1
+      DB_NAME: ${POSTGRES_DB:-videoclip_mvp_stage1}
+      DB_USER: ${POSTGRES_USER:-videoclip_stage1}
       DB_PASSWORD_FILE: /run/secrets/postgres_password
       APP_DATA_ROOT: /appdata
       FFPROBE_PATH: /usr/bin/ffprobe
+      FFMPEG_PATH: /usr/bin/ffmpeg
     secrets:
       - postgres_password
     ports:
@@ -70,6 +75,71 @@ services:
       timeout: 3s
       retries: 12
       start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "2"
+
+  redis:
+    image: redis:7.4-alpine@sha256:520775a41a63e77e06c73e35d2fd9cc15921a609516818796b4ecbb813078bc7
+    pull_policy: never
+    command:
+      ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--save", "60", "1", "--dir", "/data"]
+    volumes:
+      - type: bind
+        source: ${MVP_STAGE1_DATA_DIR:?set MVP_STAGE1_DATA_DIR to the private E drive business directory}/redis
+        target: /data
+    mem_limit: 256m
+    pids_limit: 64
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "2"
+
+  worker:
+    build:
+      context: .
+      dockerfile: backend.Dockerfile
+    image: ${MVP_IMAGE_NAME:-videoclip-mvp-stage1-api:local}
+    pull_policy: never
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - path: ${MVP_STAGE1_ENV_FILE:?set MVP_STAGE1_ENV_FILE to the private stage .env}
+        required: true
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB:-videoclip_mvp_stage1}
+      DB_USER: ${POSTGRES_USER:-videoclip_stage1}
+      DB_PASSWORD_FILE: /run/secrets/postgres_password
+      APP_DATA_ROOT: /appdata
+      FFMPEG_PATH: /usr/bin/ffmpeg
+      FFPROBE_PATH: /usr/bin/ffprobe
+      CELERY_BROKER_URL: redis://redis:6379/0
+    secrets:
+      - postgres_password
+    command:
+      ["celery", "-A", "videoclip.celery_app:celery_app", "worker", "--loglevel=INFO", "--concurrency=1", "--prefetch-multiplier=1", "--hostname=stage2@%h"]
+    volumes:
+      - type: bind
+        source: ${MVP_STAGE1_DATA_DIR:?set MVP_STAGE1_DATA_DIR to the private E drive business directory}/app
+        target: /appdata
+    mem_limit: 1g
+    pids_limit: 128
+    restart: "no"
+    stop_grace_period: 10860s
     logging:
       driver: json-file
       options:

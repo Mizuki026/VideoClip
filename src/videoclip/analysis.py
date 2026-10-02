@@ -1,0 +1,348 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any, Literal
+
+from fastapi import HTTPException
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, sessionmaker
+
+from videoclip.models import (
+    AnalysisAttempt,
+    AnalysisExecution,
+    AnalysisTask,
+    TaskDelivery,
+    TranscriptSegment,
+    Video,
+)
+from videoclip.schemas import (
+    AnalysisAttemptResponse,
+    AnalysisTaskResponse,
+    TranscriptResponse,
+    TranscriptSegmentResponse,
+)
+from videoclip.services import db_transaction
+from videoclip.settings import Settings
+
+TASK_CONFIGURATION_VERSION = "analysis-config-v1"
+SOURCE_FINGERPRINT_VERSION = "source-v1"
+ASR_REQUEST_FINGERPRINT_VERSION = "asr-request-v1"
+
+
+@dataclass(frozen=True)
+class SubmittedTask:
+    task_id: uuid.UUID
+    attempt_id: uuid.UUID
+    created: bool
+
+
+def canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def build_source_fingerprint(video: Video, audio_stream_index: int) -> str:
+    return canonical_sha256(
+        {
+            "version": SOURCE_FINGERPRINT_VERSION,
+            "video_id": str(video.id),
+            "storage_name": video.storage_name,
+            "byte_count": video.byte_count,
+            "sha256": video.content_sha256,
+            "duration_seconds": video.duration_seconds,
+            "audio_stream_index": audio_stream_index,
+            "media_info": video.media_info,
+        }
+    )
+
+
+def build_configuration_snapshot(video: Video, settings: Settings) -> dict[str, Any]:
+    streams = video.media_info.get("streams", [])
+    audio_stream = next(
+        (item for item in streams if isinstance(item, dict) and item.get("type") == "audio"), None
+    )
+    if audio_stream is None or not isinstance(audio_stream.get("index"), int):
+        raise HTTPException(status_code=409, detail="video has no verified audio stream")
+    audio_stream_index = int(audio_stream["index"])
+    return {
+        "version": TASK_CONFIGURATION_VERSION,
+        "source": {
+            "storage_name": video.storage_name,
+            "byte_count": video.byte_count,
+            "sha256": video.content_sha256,
+            "duration_seconds": video.duration_seconds,
+            "audio_stream_index": audio_stream_index,
+            "fingerprint": build_source_fingerprint(video, audio_stream_index),
+        },
+        "audio": {
+            "sample_rate": settings.audio_sample_rate,
+            "channels": settings.audio_channels,
+            "sample_format": settings.audio_sample_format,
+        },
+        "slicing": {
+            "manifest_version": settings.slice_manifest_version,
+            "timeline_mapping_version": settings.timeline_mapping_version,
+            "segment_seconds": settings.segment_seconds,
+            "video_start_offset_seconds": 0.0,
+        },
+        "asr": {
+            "provider": "siliconflow",
+            "base_url": settings.asr_base_url,
+            "model": settings.asr_model,
+            "parameters": dict(settings.asr_request_parameters),
+            "secret_reference": settings.asr_secret_reference,
+        },
+        "summary": {
+            "provider": "siliconflow",
+            "model": settings.llm_model,
+            "prompt_version": settings.summary_prompt_version,
+            "schema_version": settings.summary_schema_version,
+            "context_tokens": settings.llm_context_tokens,
+            "max_output_tokens": settings.llm_max_output_tokens,
+        },
+        "limits": {
+            "attempt_total_seconds": settings.attempt_total_timeout_seconds,
+            "media_total_seconds": settings.media_total_timeout_seconds,
+            "process_stop_grace_seconds": settings.process_stop_grace_seconds,
+            "http_total_seconds": settings.asr_http_total_timeout_seconds,
+            "http_connect_seconds": settings.asr_http_connect_timeout_seconds,
+            "http_read_seconds": settings.asr_http_read_timeout_seconds,
+            "response_max_bytes": settings.max_asr_response_bytes,
+            "diagnostic_max_bytes": settings.max_media_diagnostic_bytes,
+        },
+    }
+
+
+def submit_analysis_task(
+    factory: sessionmaker[Session], owner_id: uuid.UUID, video_id: uuid.UUID, settings: Settings
+) -> SubmittedTask:
+    with db_transaction(factory) as session:
+        video = session.scalar(
+            select(Video).where(Video.id == video_id, Video.owner_id == owner_id).with_for_update()
+        )
+        if video is None:
+            raise HTTPException(status_code=404, detail="video not found")
+        if video.status != "ready":
+            raise HTTPException(status_code=409, detail="video is not available for analysis")
+
+        if video.current_analysis_task_id is not None:
+            task = session.get(AnalysisTask, video.current_analysis_task_id)
+            if task is None:
+                raise HTTPException(status_code=503, detail="analysis task association needs maintenance")
+            if task.status in {"queued", "running", "awaiting_summary"}:
+                attempt = session.get(AnalysisAttempt, task.current_attempt_id)
+                if attempt is None:
+                    raise HTTPException(status_code=503, detail="analysis attempt needs maintenance")
+                return SubmittedTask(task_id=task.id, attempt_id=attempt.id, created=False)
+            raise HTTPException(
+                status_code=409, detail="analysis task already exists; manual recovery is not available"
+            )
+
+        unconfirmed = session.scalar(
+            select(AnalysisExecution.id).where(AnalysisExecution.stop_confirmed_at.is_(None)).limit(1)
+        )
+        if unconfirmed is not None:
+            raise HTTPException(
+                status_code=409, detail="an earlier worker execution has not been confirmed stopped"
+            )
+
+        snapshot = build_configuration_snapshot(video, settings)
+        config_hash = canonical_sha256(snapshot)
+        source_hash = snapshot["source"]["fingerprint"]
+        task = AnalysisTask(video_id=video.id, owner_id=owner_id, status="queued", stage="queued")
+        session.add(task)
+        session.flush()
+        attempt = AnalysisAttempt(
+            task_id=task.id,
+            attempt_number=1,
+            status="queued",
+            config_snapshot=snapshot,
+            config_sha256=config_hash,
+            source_fingerprint=source_hash,
+            work_directory_name=uuid.uuid4().hex,
+            claim_count=0,
+            cleanup_state="pending",
+        )
+        session.add(attempt)
+        session.flush()
+        task.current_attempt_id = attempt.id
+        video.current_analysis_task_id = task.id
+        video.analysis_task_created_at = datetime.now(UTC)
+        session.add(TaskDelivery(attempt_id=attempt.id, status="pending"))
+        session.flush()
+        return SubmittedTask(task_id=task.id, attempt_id=attempt.id, created=True)
+
+
+def set_delivery_status(
+    factory: sessionmaker[Session],
+    attempt_id: uuid.UUID,
+    status: Literal["sent", "unknown", "failed"],
+    code: str | None,
+) -> None:
+    with db_transaction(factory) as session:
+        delivery = session.get(TaskDelivery, attempt_id, with_for_update=True)
+        if delivery is None or delivery.status != "pending":
+            return
+        now = datetime.now(UTC)
+        delivery.status = status
+        delivery.error_code = code
+        delivery.confirmed_at = now if status == "sent" else None
+        delivery.updated_at = now
+
+
+def mark_publish_started(factory: sessionmaker[Session], attempt_id: uuid.UUID) -> None:
+    with db_transaction(factory) as session:
+        delivery = session.get(TaskDelivery, attempt_id, with_for_update=True)
+        if delivery is not None and delivery.status == "pending" and delivery.publish_started_at is None:
+            delivery.publish_started_at = datetime.now(UTC)
+
+
+def task_response(
+    factory: sessionmaker[Session], owner_id: uuid.UUID, video_id: uuid.UUID, task_id: uuid.UUID
+) -> AnalysisTaskResponse:
+    with factory() as session:
+        task = session.scalar(
+            select(AnalysisTask).where(
+                AnalysisTask.id == task_id,
+                AnalysisTask.video_id == video_id,
+                AnalysisTask.owner_id == owner_id,
+            )
+        )
+        if task is None:
+            raise HTTPException(status_code=404, detail="analysis task not found")
+        attempt = session.get(AnalysisAttempt, task.current_attempt_id)
+        delivery = session.get(TaskDelivery, task.current_attempt_id)
+        if attempt is None or delivery is None:
+            raise HTTPException(status_code=503, detail="analysis task state needs maintenance")
+        expected, completed, request_count, elapsed_seconds = session.execute(
+            select(
+                func.count(TranscriptSegment.id),
+                func.count(TranscriptSegment.id).filter(TranscriptSegment.status == "succeeded"),
+                func.coalesce(func.sum(TranscriptSegment.request_count), 0),
+                func.coalesce(
+                    func.sum(TranscriptSegment.request_metadata["elapsed_seconds"].as_float()), 0.0
+                ),
+            ).where(TranscriptSegment.attempt_id == attempt.id)
+        ).one()
+        call_rows = list(
+            session.scalars(
+                select(TranscriptSegment)
+                .where(
+                    TranscriptSegment.attempt_id == attempt.id,
+                    TranscriptSegment.request_metadata.is_not(None),
+                )
+                .order_by(TranscriptSegment.segment_number)
+            )
+        )
+        execution = session.scalar(
+            select(AnalysisExecution)
+            .where(
+                AnalysisExecution.attempt_id == attempt.id,
+            )
+            .limit(1)
+        )
+        return AnalysisTaskResponse(
+            id=task.id,
+            video_id=task.video_id,
+            status=task.status,
+            stage=task.stage,
+            delivery_status=delivery.status,
+            delivery_error_code=delivery.error_code,
+            completed_segments=int(completed),
+            expected_segments=int(expected),
+            transcript_complete=(int(expected) > 0 and int(completed) == int(expected)),
+            asr_model=str(attempt.config_snapshot["asr"]["model"]),
+            config_sha256=attempt.config_sha256,
+            source_fingerprint=attempt.source_fingerprint,
+            manifest_fingerprint=attempt.manifest_fingerprint,
+            asr_request_count=int(request_count),
+            asr_elapsed_seconds=float(elapsed_seconds),
+            asr_calls=[
+                {
+                    "segment_number": row.segment_number,
+                    **{
+                        key: row.request_metadata[key]
+                        for key in (
+                            "model",
+                            "http_status",
+                            "trace_id",
+                            "response_bytes",
+                            "text_characters",
+                            "elapsed_seconds",
+                        )
+                        if key in row.request_metadata
+                    },
+                }
+                for row in call_rows
+                if row.request_metadata is not None
+            ],
+            summary_status="waiting" if task.status == "awaiting_summary" else "not_started",
+            execution_state=(
+                "not_started"
+                if execution is None
+                else ("stopped" if execution.stop_confirmed_at is not None else "stop_unconfirmed")
+            ),
+            execution_stop_confirmed=(None if execution is None else execution.stop_confirmed_at is not None),
+            failure_code=task.failure_code,
+            created_at=task.created_at,
+            attempt=AnalysisAttemptResponse(
+                id=attempt.id,
+                attempt_number=attempt.attempt_number,
+                status=attempt.status,
+                execution_id=attempt.execution_id,
+                first_claimed_at=attempt.first_claimed_at,
+                stop_confirmed_at=attempt.stop_confirmed_at,
+                cleanup_state=attempt.cleanup_state,
+                failure_code=attempt.failure_code,
+            ),
+        )
+
+
+def transcript_response(
+    factory: sessionmaker[Session], owner_id: uuid.UUID, video_id: uuid.UUID
+) -> TranscriptResponse:
+    with factory() as session:
+        task = session.scalar(
+            select(AnalysisTask).where(
+                AnalysisTask.video_id == video_id,
+                AnalysisTask.owner_id == owner_id,
+            )
+        )
+        if task is None or task.current_attempt_id is None:
+            raise HTTPException(status_code=404, detail="transcript not found")
+        attempt = session.get(AnalysisAttempt, task.current_attempt_id)
+        if attempt is None:
+            raise HTTPException(status_code=404, detail="transcript not found")
+        segments = list(
+            session.scalars(
+                select(TranscriptSegment)
+                .where(TranscriptSegment.attempt_id == attempt.id)
+                .order_by(TranscriptSegment.segment_number)
+            )
+        )
+        return TranscriptResponse(
+            task_id=task.id,
+            complete=(
+                task.status == "awaiting_summary"
+                and bool(segments)
+                and all(item.status == "succeeded" for item in segments)
+            ),
+            summary_status="waiting" if task.status == "awaiting_summary" else "not_started",
+            items=[
+                TranscriptSegmentResponse(
+                    segment_number=item.segment_number,
+                    audio_start_seconds=item.audio_start_seconds,
+                    audio_end_seconds=item.audio_end_seconds,
+                    actual_audio_seconds=item.actual_audio_seconds,
+                    video_start_seconds=item.video_start_seconds,
+                    video_end_seconds=item.video_end_seconds,
+                    text=item.text,
+                    status=item.status,
+                )
+                for item in segments
+            ],
+        )

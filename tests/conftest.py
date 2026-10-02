@@ -51,7 +51,9 @@ def empty_database(session_factory: sessionmaker[Session]) -> None:
     with session_factory.begin() as session:
         session.execute(
             text(
-                "TRUNCATE TABLE cleanup_intents, videos, upload_handoffs, sessions, users "
+                "TRUNCATE TABLE analysis_executions, transcript_segments, task_deliveries, "
+                "analysis_attempts, analysis_tasks, cleanup_intents, videos, upload_handoffs, "
+                "sessions, users "
                 "RESTART IDENTITY CASCADE"
             )
         )

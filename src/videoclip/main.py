@@ -5,24 +5,37 @@ import hashlib
 import hmac
 import logging
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from kombu.exceptions import EncodeError  # type: ignore[import-untyped]
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from videoclip.analysis import (
+    mark_publish_started,
+    set_delivery_status,
+    submit_analysis_task,
+    task_response,
+    transcript_response,
+)
+from videoclip.celery_app import celery_app
 from videoclip.db import check_database, create_database_engine, create_session_factory
 from videoclip.models import SessionRecord, User, Video
 from videoclip.recovery import recover_interrupted_work
 from videoclip.schemas import (
+    AnalysisTaskResponse,
     CsrfResponse,
     LoginRequest,
     RegisterRequest,
+    TranscriptResponse,
     UploadResponse,
     UserResponse,
     VideoDetailResponse,
@@ -217,6 +230,7 @@ def create_app(
     settings: Settings | None = None,
     session_factory: sessionmaker[Session] | None = None,
     storage: MediaStore | None = None,
+    task_publisher: Callable[[str], object] | None = None,
     *,
     run_recovery: bool = True,
 ) -> FastAPI:
@@ -228,6 +242,11 @@ def create_app(
     else:
         resolved_factory = session_factory
     resolved_store = storage or MediaStore(resolved_settings.app_data_root)
+
+    def publish_task(task_id: uuid.UUID) -> object:
+        if task_publisher is not None:
+            return task_publisher(str(task_id))
+        return celery_app.send_task("videoclip.transcribe_analysis", args=[str(task_id)], retry=False)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -410,6 +429,71 @@ def create_app(
             if video is None:
                 raise HTTPException(status_code=404, detail="video not found")
             return _video_detail(video)
+
+    @app.post(
+        "/videos/{video_id}/tasks",
+        status_code=status.HTTP_202_ACCEPTED,
+        response_model=AnalysisTaskResponse,
+    )
+    def create_analysis(video_id: uuid.UUID, request: Request) -> AnalysisTaskResponse:
+        current = _current_auth(request, resolved_factory)
+        _require_csrf(request, resolved_settings, resolved_factory, current)
+        assert current is not None
+        user, _ = current
+        submitted = submit_analysis_task(resolved_factory, user.id, video_id, resolved_settings)
+        if submitted.created:
+            try:
+                mark_publish_started(resolved_factory, submitted.attempt_id)
+            except SQLAlchemyError:
+                logger.warning("analysis_delivery_start_unrecorded task_id=%s", submitted.task_id.hex)
+            else:
+                try:
+                    publish_task(submitted.task_id)
+                except Exception as exc:
+                    delivery_state: Literal["failed", "unknown"] = (
+                        "failed" if isinstance(exc, EncodeError) else "unknown"
+                    )
+                    delivery_error = (
+                        "BROKER_PAYLOAD_REJECTED"
+                        if delivery_state == "failed"
+                        else "BROKER_CONFIRMATION_UNKNOWN"
+                    )
+                    try:
+                        set_delivery_status(
+                            resolved_factory,
+                            submitted.attempt_id,
+                            delivery_state,
+                            delivery_error,
+                        )
+                    except SQLAlchemyError:
+                        logger.warning("analysis_delivery_error_unrecorded task_id=%s", submitted.task_id.hex)
+                    logger.warning(
+                        "analysis_publish_unconfirmed task_id=%s error=%s",
+                        submitted.task_id.hex,
+                        delivery_error,
+                    )
+                else:
+                    try:
+                        set_delivery_status(resolved_factory, submitted.attempt_id, "sent", None)
+                    except SQLAlchemyError:
+                        logger.warning(
+                            "analysis_delivery_confirmation_unrecorded task_id=%s", submitted.task_id.hex
+                        )
+        response = task_response(resolved_factory, user.id, video_id, submitted.task_id)
+        return response
+
+    @app.get(
+        "/videos/{video_id}/tasks/{task_id}",
+        response_model=AnalysisTaskResponse,
+    )
+    def get_analysis(video_id: uuid.UUID, task_id: uuid.UUID, request: Request) -> AnalysisTaskResponse:
+        user, _ = _current_auth(request, resolved_factory) or _raise_auth()
+        return task_response(resolved_factory, user.id, video_id, task_id)
+
+    @app.get("/videos/{video_id}/transcript", response_model=TranscriptResponse)
+    def get_transcript(video_id: uuid.UUID, request: Request) -> TranscriptResponse:
+        user, _ = _current_auth(request, resolved_factory) or _raise_auth()
+        return transcript_response(resolved_factory, user.id, video_id)
 
     @app.api_route("/videos/{video_id}/content", methods=["GET", "HEAD"])
     def video_content(
