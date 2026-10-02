@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "videoclip-mvp"
+version = "0.1.0"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "alembic==1.16.1",
+  "argon2-cffi==25.1.0",
+  "fastapi==0.115.12",
+  "psycopg[binary]==3.2.9",
+  "pydantic-settings==2.9.1",
+  "sqlalchemy==2.0.41",
+  "uvicorn==0.34.3",
+]
+
+[project.optional-dependencies]
+dev = ["httpx==0.28.1", "mypy==1.15.0", "pytest==8.3.5", "ruff==0.11.4"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 110
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"probes/stage0/**/*.py" = ["B", "E501", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+mypy_path = "src"
+packages = ["videoclip"]

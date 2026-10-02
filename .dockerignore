@@ -1,0 +1,7 @@
+.git
+.scratch
+data
+video
+tests
+*.pyc
+__pycache__
