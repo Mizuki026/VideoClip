@@ -1145,6 +1145,9 @@ def test_stop_unconfirmed_blocks_recovery_and_deletion_until_confirmed(
 
         pending_delete = client.delete(f"/videos/{video_id}", headers=headers)
         assert pending_delete.status_code == 202
+        detail = client.get(f"/videos/{video_id}")
+        assert detail.status_code == 409
+        assert detail.json()["detail"]["code"] == "VIDEO_DELETION_IN_PROGRESS"
         lease_maker = sessionmaker(bind=lease.connection, autoflush=False, expire_on_commit=False)
         assert _deletion_cleanup_is_pending(lease_maker, active_claim) is True
         assert target.exists() and sentinel.exists()
@@ -1181,9 +1184,10 @@ def test_stop_unconfirmed_blocks_recovery_and_deletion_until_confirmed(
         monkeypatch.setattr(store, "remove_attempt_directory", fail_temp_cleanup)
         failed_cleanup = client.delete(f"/videos/{video_id}", headers=headers)
         assert failed_cleanup.status_code == 202
-        details = client.get(f"/videos/{video_id}").json()
-        assert details["status"] == "cleanup_failed"
-        assert details["deletion_error"] == "ATTEMPT_TEMP_CLEANUP_FAILED"
+        details = client.get(f"/videos/{video_id}/deletion")
+        assert details.status_code == 200
+        assert details.json()["state"] == "cleanup_failed"
+        assert details.json()["error_code"] == "ATTEMPT_TEMP_CLEANUP_FAILED"
         assert target.exists() and sentinel.exists()
 
         monkeypatch.setattr(store, "remove_attempt_directory", original_remove)

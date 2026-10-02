@@ -467,6 +467,11 @@ def create_app(
             video = session.scalar(select(Video).where(Video.id == video_id, Video.owner_id == user.id))
             if video is None:
                 raise HTTPException(status_code=404, detail="video not found")
+            if video.status != "ready":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "VIDEO_DELETION_IN_PROGRESS", "progress_endpoint": "deletion"},
+                )
             return _video_detail(video)
 
     @app.get("/videos/{video_id}/deletion", response_model=VideoDeletionProgress)

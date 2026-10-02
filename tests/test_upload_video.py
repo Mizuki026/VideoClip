@@ -194,9 +194,10 @@ def test_deletion_gate_and_retryable_storage_failure(
         monkeypatch.setattr(store, "remove_media", fail_remove)
         failed = client.delete(f"/videos/{video_id}", headers=mutate_headers(csrf(client)))
         assert failed.status_code == 202
-        details = client.get(f"/videos/{video_id}").json()
-        assert details["status"] == "cleanup_failed"
-        assert details["deletion_error"] == "STORAGE_OPERATION_FAILED"
+        details = client.get(f"/videos/{video_id}/deletion")
+        assert details.status_code == 200
+        assert details.json()["state"] == "cleanup_failed"
+        assert details.json()["error_code"] == "STORAGE_OPERATION_FAILED"
         assert client.get(f"/videos/{video_id}/content").status_code == 404
         with session_factory() as session:
             assert session.scalar(select(CleanupIntent).where(CleanupIntent.kind == "video")) is not None
