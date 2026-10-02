@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 import sys
 import threading
@@ -21,6 +22,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
+import videoclip.analysis_worker as analysis_worker
 from videoclip.analysis import (
     build_configuration_snapshot,
     canonical_sha256,
@@ -48,7 +50,9 @@ from videoclip.main import create_app
 from videoclip.models import (
     AnalysisAttempt,
     AnalysisExecution,
+    AnalysisSummary,
     AnalysisTask,
+    SummaryRequest,
     TaskDelivery,
     TranscriptSegment,
     UploadHandoff,
@@ -1495,3 +1499,444 @@ def test_celery_delivery_and_acknowledgement_settings_are_explicit() -> None:
     assert celery_app.conf.task_publish_retry is False
     assert celery_app.conf.worker_concurrency == 1
     assert celery_app.conf.worker_prefetch_multiplier == 1
+
+
+def _seed_stopped_complete_transcript(
+    factory: sessionmaker[Session], owner_id: uuid.UUID, video_id: uuid.UUID, settings: Settings
+) -> tuple[uuid.UUID, uuid.UUID]:
+    submitted = submit_analysis_task(factory, owner_id, video_id, settings)
+    with factory() as session:
+        attempt = session.get(AnalysisAttempt, submitted.attempt_id)
+        video = session.get(Video, video_id)
+        assert attempt is not None and video is not None
+        snapshot = attempt.config_snapshot
+        duration = video.duration_seconds
+        session.commit()
+
+    fingerprint_rows: list[dict[str, Any]] = []
+    transcript_rows: list[TranscriptSegment] = []
+    segment_seconds = int(snapshot["slicing"]["segment_seconds"])
+    segment_count = int((duration + segment_seconds - 1) // segment_seconds)
+    for number in range(segment_count):
+        start = float(number * segment_seconds)
+        end = float(min((number + 1) * segment_seconds, duration))
+        audio_sha256 = hashlib.sha256(f"audio-{number}".encode()).hexdigest()
+        request_fingerprint = hashlib.sha256(f"request-{number}".encode()).hexdigest()
+        row = {
+            "segment_number": number,
+            "audio_start_seconds": start,
+            "audio_end_seconds": end,
+            "actual_audio_seconds": end - start,
+            "video_start_seconds": start,
+            "video_end_seconds": end,
+            "audio_sha256": audio_sha256,
+            "request_fingerprint": request_fingerprint,
+        }
+        fingerprint_rows.append(row)
+        transcript_rows.append(
+            TranscriptSegment(
+                attempt_id=submitted.attempt_id,
+                segment_number=number,
+                audio_start_seconds=start,
+                audio_end_seconds=end,
+                actual_audio_seconds=end - start,
+                video_start_seconds=start,
+                video_end_seconds=end,
+                audio_sha256=audio_sha256,
+                request_fingerprint=request_fingerprint,
+                status="succeeded",
+                text=(
+                    f"课程片段 {number}：FastAPI 通过依赖注入完成参数校验，"
+                    "并使用 PostgreSQL 事务保存任务状态。"
+                ),
+                request_count=1,
+                request_metadata={"http_status": 200, "elapsed_seconds": 0.1, "text_characters": 44},
+            )
+        )
+    manifest_fingerprint = canonical_sha256(
+        {
+            "version": snapshot["slicing"]["manifest_version"],
+            "timeline_mapping_version": snapshot["slicing"]["timeline_mapping_version"],
+            "audio": snapshot["audio"],
+            "source_fingerprint": snapshot["source"]["fingerprint"],
+            "segments": fingerprint_rows,
+        }
+    )
+    stopped_at = datetime.now(UTC)
+    execution_id = uuid.uuid4()
+    with factory.begin() as session:
+        task = session.get(AnalysisTask, submitted.task_id)
+        attempt = session.get(AnalysisAttempt, submitted.attempt_id)
+        assert task is not None and attempt is not None
+        task.status = "awaiting_summary"
+        task.stage = "awaiting_summary"
+        task.summary_status = "waiting"
+        attempt.status = "awaiting_summary"
+        attempt.claim_count = 1
+        attempt.execution_id = execution_id
+        attempt.first_claimed_at = stopped_at
+        attempt.stop_confirmed_at = stopped_at
+        attempt.manifest_fingerprint = manifest_fingerprint
+        session.add(
+            AnalysisExecution(
+                id=execution_id,
+                task_id=task.id,
+                attempt_id=attempt.id,
+                worker_id="test-confirmed-stopped",
+                backend_pid=1,
+                stop_confirmed_at=stopped_at,
+                stop_confirmation_source="test_operator_evidence",
+            )
+        )
+        session.add_all(transcript_rows)
+    return submitted.task_id, submitted.attempt_id
+
+
+def _summary_model_output() -> str:
+    return json.dumps(
+        {
+            "chapters": [
+                {"title": f"章节 {index}：FastAPI 依赖注入", "evidence": [{"segment_id": 0}]}
+                for index in range(3)
+            ],
+            "key_points": [
+                {"text": f"知识要点 {index}：PostgreSQL 事务", "evidence": [{"segment_id": 0}]}
+                for index in range(3)
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+
+def _mock_llm_process(monkeypatch: pytest.MonkeyPatch, replies: list[tuple[str, str]]) -> None:
+    calls = 0
+
+    def run(command: list[str], **_: Any) -> None:
+        nonlocal calls
+        output_path = Path(command[command.index("--output") + 1])
+        content, finish_reason = replies[min(calls, len(replies) - 1)]
+        calls += 1
+        output_path.write_text(
+            json.dumps(
+                {
+                    "content": content,
+                    "metadata": {
+                        "elapsed_seconds": 0.25,
+                        "response_bytes": len(content.encode("utf-8")),
+                        "finish_reason": finish_reason,
+                        "trace_id": "test-trace",
+                        "usage": {"prompt_tokens": 123, "completion_tokens": 45, "total_tokens": 168},
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(analysis_worker, "_run_process", run)
+
+
+def test_stopped_summary_continuation_publishes_once_without_asr(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    published: list[tuple[str, str]] = []
+    app = create_app(
+        test_settings,
+        session_factory,
+        store,
+        run_recovery=False,
+        task_publisher=lambda task_id, attempt_id: published.append((task_id, attempt_id)),
+    )
+    with TestClient(app) as client:
+        owner_id = _register(client, "analysis-summary-continuation")
+        video_id = _video(session_factory, store, owner_id)
+        task_id, parent_id = _seed_stopped_complete_transcript(
+            session_factory, owner_id, video_id, test_settings
+        )
+        from tests.helpers import csrf, mutate_headers
+
+        headers = mutate_headers(csrf(client))
+        endpoint = f"/videos/{video_id}/tasks/{task_id}/summarize"
+        first = client.post(endpoint, json={"attempt_id": str(parent_id)}, headers=headers)
+        assert first.status_code == 202, first.text
+        child_id = uuid.UUID(first.json()["attempt"]["id"])
+        assert first.json()["attempt"]["execution_mode"] == "summary_only"
+        repeated = client.post(endpoint, json={"attempt_id": str(parent_id)}, headers=headers)
+        assert repeated.status_code == 202
+        assert repeated.json()["attempt"]["id"] == str(child_id)
+        assert len(published) == 1
+
+        monkeypatch.setattr(analysis_worker, "get_settings", lambda: test_settings)
+        monkeypatch.setattr(analysis_worker, "_get_or_make_worker_components", lambda _: (test_engine, store))
+        monkeypatch.setattr(
+            analysis_worker,
+            "_transcribe",
+            lambda *_args, **_kwargs: pytest.fail("summary-only attempts must not call ASR"),
+        )
+        _mock_llm_process(monkeypatch, [(_summary_model_output(), "stop")])
+        assert transcribe_analysis(str(task_id), str(child_id)) == {"status": "succeeded"}
+
+        summary = client.get(f"/videos/{video_id}/summary")
+        assert summary.status_code == 200
+        payload = summary.json()["payload"]
+        assert len(payload["chapters"]) == 3
+        assert len(payload["key_points"]) == 3
+        for item in payload["chapters"] + payload["key_points"]:
+            evidence = item["evidence"][0]
+            assert evidence["segment_id"] == 0
+            assert evidence["quote"] in (
+                "课程片段 0：FastAPI 通过依赖注入完成参数校验，并使用 PostgreSQL 事务保存任务状态。"
+            )
+            assert 0 <= evidence["start_seconds"] < evidence["end_seconds"] <= 61.25
+        transcript = client.get(f"/videos/{video_id}/transcript")
+        assert transcript.status_code == 200
+        assert transcript.json()["complete"] is True
+        assert all(item["source_attempt_id"] == str(parent_id) for item in transcript.json()["items"])
+
+        with session_factory() as session:
+            task = session.get(AnalysisTask, task_id)
+            attempt = session.get(AnalysisAttempt, child_id)
+            summary_row = session.scalar(select(AnalysisSummary).where(AnalysisSummary.task_id == task_id))
+            requests = list(
+                session.scalars(select(SummaryRequest).where(SummaryRequest.attempt_id == child_id))
+            )
+            assert task is not None and task.status == "succeeded" and task.summary_status == "succeeded"
+            assert (
+                attempt is not None and attempt.status == "succeeded" and attempt.cleanup_state == "cleaned"
+            )
+            assert summary_row is not None and len(requests) == 1 and requests[0].status == "succeeded"
+            assert requests[0].finish_reason == "stop" and requests[0].usage == {
+                "prompt_tokens": 123,
+                "completion_tokens": 45,
+                "total_tokens": 168,
+            }
+
+        with TestClient(create_app(test_settings, session_factory, store, run_recovery=False)) as stranger:
+            stranger_id = _register(stranger, "analysis-summary-stranger")
+            assert stranger_id != owner_id
+            assert stranger.get(f"/videos/{video_id}/summary").status_code == 404
+
+
+def test_truncated_summary_is_bounded_and_manual_recovery_reuses_transcript(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    app = create_app(test_settings, session_factory, store, run_recovery=False)
+    with TestClient(app) as client:
+        owner_id = _register(client, "analysis-summary-recovery")
+        video_id = _video(session_factory, store, owner_id)
+        task_id, parent_id = _seed_stopped_complete_transcript(
+            session_factory, owner_id, video_id, test_settings
+        )
+        from tests.helpers import csrf, mutate_headers
+
+        headers = mutate_headers(csrf(client))
+        continued = client.post(
+            f"/videos/{video_id}/tasks/{task_id}/summarize",
+            json={"attempt_id": str(parent_id)},
+            headers=headers,
+        )
+        assert continued.status_code == 202, continued.text
+        first_summary_attempt_id = uuid.UUID(continued.json()["attempt"]["id"])
+        monkeypatch.setattr(analysis_worker, "get_settings", lambda: test_settings)
+        monkeypatch.setattr(analysis_worker, "_get_or_make_worker_components", lambda _: (test_engine, store))
+        monkeypatch.setattr(
+            analysis_worker,
+            "_transcribe",
+            lambda *_args, **_kwargs: pytest.fail("summary recovery must not call ASR"),
+        )
+        _mock_llm_process(monkeypatch, [("{", "length")])
+        assert transcribe_analysis(str(task_id), str(first_summary_attempt_id)) == {"status": "failed"}
+        assert client.get(f"/videos/{video_id}/summary").status_code == 409
+
+        with session_factory() as session:
+            first_requests = list(
+                session.scalars(
+                    select(SummaryRequest).where(SummaryRequest.attempt_id == first_summary_attempt_id)
+                )
+            )
+            assert len(first_requests) == 3
+            assert all(item.status == "failed" and item.finish_reason == "length" for item in first_requests)
+            assert (
+                session.scalar(select(AnalysisSummary.id).where(AnalysisSummary.task_id == task_id)) is None
+            )
+
+        recovered = client.post(
+            f"/videos/{video_id}/tasks/{task_id}/recover",
+            json={"attempt_id": str(first_summary_attempt_id)},
+            headers=headers,
+        )
+        assert recovered.status_code == 202, recovered.text
+        retry_id = uuid.UUID(recovered.json()["attempt"]["id"])
+        assert recovered.json()["attempt"]["execution_mode"] == "summary_only"
+        assert recovered.json()["reused_segments"] == 3
+        monkeypatch.setattr(
+            analysis_worker,
+            "_run_process",
+            lambda *_args, **_kwargs: pytest.fail(
+                "task-wide request limit must block a fourth provider call"
+            ),
+        )
+        assert transcribe_analysis(str(task_id), str(retry_id)) == {"status": "failed"}
+        assert client.get(f"/videos/{video_id}/summary").status_code == 409
+        with session_factory() as session:
+            requests = list(session.scalars(select(SummaryRequest).where(SummaryRequest.task_id == task_id)))
+            attempts = list(
+                session.scalars(select(AnalysisAttempt).where(AnalysisAttempt.task_id == task_id))
+            )
+            assert len(requests) == 3
+            assert len(attempts) == 3
+            assert attempts[0].status == "awaiting_summary"
+            assert attempts[1].status == "failed"
+            assert attempts[2].status == "failed"
+            assert all(attempt.execution_mode == "summary_only" for attempt in attempts[1:])
+            assert session.get(AnalysisTask, task_id).failure_code == "SUMMARY_REPAIR_EXHAUSTED"
+            assert (
+                session.scalar(select(AnalysisSummary.id).where(AnalysisSummary.task_id == task_id)) is None
+            )
+
+
+def test_publish_database_failure_is_not_visible_and_recovery_reuses_transcript(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    app = create_app(test_settings, session_factory, store, run_recovery=False)
+    with TestClient(app) as client:
+        owner_id = _register(client, "analysis-summary-publish-failure")
+        video_id = _video(session_factory, store, owner_id)
+        task_id, parent_id = _seed_stopped_complete_transcript(
+            session_factory, owner_id, video_id, test_settings
+        )
+        from tests.helpers import csrf, mutate_headers
+
+        headers = mutate_headers(csrf(client))
+        continuation = client.post(
+            f"/videos/{video_id}/tasks/{task_id}/summarize",
+            json={"attempt_id": str(parent_id)},
+            headers=headers,
+        )
+        first_id = uuid.UUID(continuation.json()["attempt"]["id"])
+        monkeypatch.setattr(analysis_worker, "get_settings", lambda: test_settings)
+        monkeypatch.setattr(analysis_worker, "_get_or_make_worker_components", lambda _: (test_engine, store))
+        monkeypatch.setattr(
+            analysis_worker,
+            "_transcribe",
+            lambda *_args, **_kwargs: pytest.fail("summary recovery must not call ASR"),
+        )
+        original_publish = analysis_worker._publish_summary
+
+        def fail_publish(*_args: Any, **_kwargs: Any) -> None:
+            raise SQLAlchemyError("injected publish failure")
+
+        monkeypatch.setattr(analysis_worker, "_publish_summary", fail_publish)
+        _mock_llm_process(monkeypatch, [(_summary_model_output(), "stop")])
+        assert transcribe_analysis(str(task_id), str(first_id)) == {"status": "failed"}
+        assert client.get(f"/videos/{video_id}/summary").status_code == 409
+        with session_factory() as session:
+            assert (
+                session.scalar(select(AnalysisSummary.id).where(AnalysisSummary.task_id == task_id)) is None
+            )
+            request = session.scalar(select(SummaryRequest).where(SummaryRequest.attempt_id == first_id))
+            assert request is not None
+            assert request.status == "failed" and request.error_code == "SUMMARY_PUBLISH_FAILED"
+
+        recovered = client.post(
+            f"/videos/{video_id}/tasks/{task_id}/recover",
+            json={"attempt_id": str(first_id)},
+            headers=headers,
+        )
+        assert recovered.status_code == 202, recovered.text
+        retry_id = uuid.UUID(recovered.json()["attempt"]["id"])
+        assert recovered.json()["reused_segments"] == 3
+        monkeypatch.setattr(analysis_worker, "_publish_summary", original_publish)
+        _mock_llm_process(monkeypatch, [(_summary_model_output(), "stop")])
+        assert transcribe_analysis(str(task_id), str(retry_id)) == {"status": "succeeded"}
+        assert client.get(f"/videos/{video_id}/summary").status_code == 200
+
+
+def test_delete_winning_summary_race_blocks_publication_and_later_requests(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    app = create_app(test_settings, session_factory, store, run_recovery=False)
+    with TestClient(app) as client:
+        owner_id = _register(client, "analysis-summary-delete-race")
+        video_id = _video(session_factory, store, owner_id)
+        task_id, parent_id = _seed_stopped_complete_transcript(
+            session_factory, owner_id, video_id, test_settings
+        )
+        from tests.helpers import csrf, mutate_headers
+
+        headers = mutate_headers(csrf(client))
+        continuation = client.post(
+            f"/videos/{video_id}/tasks/{task_id}/summarize",
+            json={"attempt_id": str(parent_id)},
+            headers=headers,
+        )
+        child_id = uuid.UUID(continuation.json()["attempt"]["id"])
+        started = threading.Event()
+        release = threading.Event()
+        monkeypatch.setattr(analysis_worker, "get_settings", lambda: test_settings)
+        monkeypatch.setattr(analysis_worker, "_get_or_make_worker_components", lambda _: (test_engine, store))
+        monkeypatch.setattr(
+            analysis_worker,
+            "_transcribe",
+            lambda *_args, **_kwargs: pytest.fail("summary-only attempts must not call ASR"),
+        )
+
+        def blocked_provider_call(command: list[str], **_: Any) -> None:
+            output_path = Path(command[command.index("--output") + 1])
+            started.set()
+            if not release.wait(timeout=10):
+                raise TimeoutError("test did not release the fake provider call")
+            content = _summary_model_output()
+            output_path.write_text(
+                json.dumps(
+                    {
+                        "content": content,
+                        "metadata": {
+                            "elapsed_seconds": 0.25,
+                            "response_bytes": len(content.encode("utf-8")),
+                            "finish_reason": "stop",
+                            "trace_id": "test-trace",
+                            "usage": {},
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+        monkeypatch.setattr(analysis_worker, "_run_process", blocked_provider_call)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            worker = pool.submit(transcribe_analysis, str(task_id), str(child_id))
+            assert started.wait(timeout=10)
+            assert delete_video(session_factory, store, owner_id, video_id) == 202
+            release.set()
+            assert worker.result(timeout=15) == {"status": "failed"}
+
+        assert client.get(f"/videos/{video_id}/summary").status_code == 409
+        with session_factory() as session:
+            assert (
+                session.scalar(select(AnalysisSummary.id).where(AnalysisSummary.task_id == task_id)) is None
+            )
+            request = session.scalar(select(SummaryRequest).where(SummaryRequest.attempt_id == child_id))
+            attempt = session.get(AnalysisAttempt, child_id)
+            assert request is not None and request.status == "failed"
+            assert attempt is not None and attempt.stop_confirmed_at is not None
+            assert attempt.execution_mode == "summary_only"
+        assert delete_video(session_factory, store, owner_id, video_id) == 204
+        assert child_id != parent_id

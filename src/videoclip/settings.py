@@ -52,6 +52,25 @@ class Settings(BaseSettings):
     summary_schema_version: str = Field(default="summary-v1", alias="SUMMARY_SCHEMA_VERSION")
     llm_context_tokens: int = Field(default=256_000, ge=1, alias="LLM_CONTEXT_TOKENS")
     llm_max_output_tokens: int = Field(default=3072, ge=1, alias="LLM_MAX_OUTPUT_TOKENS")
+    llm_temperature: float = Field(default=0.2, ge=0, le=2, alias="LLM_TEMPERATURE")
+    llm_enable_thinking: bool = Field(default=False, alias="LLM_ENABLE_THINKING")
+    llm_http_total_timeout_seconds: float = Field(
+        default=300, gt=0, le=600, alias="LLM_HTTP_TOTAL_TIMEOUT_SECONDS"
+    )
+    llm_http_connect_timeout_seconds: float = Field(
+        default=15, gt=0, le=120, alias="LLM_HTTP_CONNECT_TIMEOUT_SECONDS"
+    )
+    llm_http_read_timeout_seconds: float = Field(
+        default=240, gt=0, le=300, alias="LLM_HTTP_READ_TIMEOUT_SECONDS"
+    )
+    llm_http_write_timeout_seconds: float = Field(
+        default=45, gt=0, le=180, alias="LLM_HTTP_WRITE_TIMEOUT_SECONDS"
+    )
+    llm_http_pool_timeout_seconds: float = Field(
+        default=15, gt=0, le=120, alias="LLM_HTTP_POOL_TIMEOUT_SECONDS"
+    )
+    max_llm_response_bytes: int = Field(default=1_048_576, ge=1, le=4_194_304, alias="MAX_LLM_RESPONSE_BYTES")
+    max_llm_diagnostic_bytes: int = Field(default=8192, ge=512, le=65_536, alias="MAX_LLM_DIAGNOSTIC_BYTES")
     audio_sample_rate: int = Field(default=16_000, ge=1, alias="AUDIO_SAMPLE_RATE")
     audio_channels: int = Field(default=1, ge=1, le=1, alias="AUDIO_CHANNELS")
     audio_sample_format: str = Field(default="s16le", alias="AUDIO_SAMPLE_FORMAT")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import signal
 import socket
@@ -27,7 +28,9 @@ from videoclip.db import create_database_engine
 from videoclip.models import (
     AnalysisAttempt,
     AnalysisExecution,
+    AnalysisSummary,
     AnalysisTask,
+    SummaryRequest,
     TranscriptSegment,
     Video,
 )
@@ -35,6 +38,21 @@ from videoclip.recovery_rules import checkpoint_matches
 from videoclip.services import db_transaction
 from videoclip.settings import Settings, get_settings
 from videoclip.storage import MediaStore
+from videoclip.summarization import (
+    SummaryFailure,
+    build_summary_prompt,
+    correction_for_failure,
+    is_repairable_summary_failure,
+    resolve_summary_contract,
+    summary_request_fingerprint,
+    validate_context_budget,
+    validate_summary_output,
+    validate_transcript_context_budget,
+    validate_transcript_manifest,
+)
+from videoclip.summarization import (
+    canonical_sha256 as summary_canonical_sha256,
+)
 
 logger = logging.getLogger("videoclip.analysis_worker")
 ADVISORY_LOCK_KEY = 0x566964656F436C69
@@ -63,6 +81,7 @@ class ClaimedAttempt:
     storage_name: str
     snapshot: dict[str, Any]
     work_directory_name: str
+    execution_mode: str = "full"
 
 
 @dataclass(frozen=True)
@@ -284,7 +303,9 @@ def _claim_attempt(
         attempt.first_claimed_at = datetime.now(UTC)
         attempt.status = "running"
         task.status = "running"
-        task.stage = "validating_source"
+        task.stage = "summarizing" if attempt.execution_mode == "summary_only" else "validating_source"
+        if attempt.execution_mode == "summary_only":
+            task.summary_status = "running"
         session.flush()
         return ClaimedAttempt(
             task_id=task.id,
@@ -295,6 +316,7 @@ def _claim_attempt(
             storage_name=video.storage_name,
             snapshot=attempt.config_snapshot,
             work_directory_name=attempt.work_directory_name,
+            execution_mode=attempt.execution_mode,
         )
 
 
@@ -317,8 +339,12 @@ def _set_stage(
 ) -> None:
     lease.assert_alive()
     with db_transaction(maker) as session:
-        task, _, _, _ = _lock_execution_rows(session, claim)
+        task, attempt, _, _ = _lock_execution_rows(session, claim)
         task.stage = stage
+        if stage == "summarizing":
+            task.status = "running"
+            task.summary_status = "running"
+            attempt.status = "running"
 
 
 def _progress_check(maker: sessionmaker[Session], lease: ExecutionLease, claim: ClaimedAttempt) -> None:
@@ -711,6 +737,7 @@ def _mark_awaiting_summary(
             raise AnalysisFailure("TRANSCRIPT_INCOMPLETE")
         task.status = "awaiting_summary"
         task.stage = "awaiting_summary"
+        task.summary_status = "waiting"
         task.failure_code = None
         attempt.status = "awaiting_summary"
 
@@ -719,12 +746,27 @@ def _fail_task(maker: sessionmaker[Session], lease: ExecutionLease, claim: Claim
     lease.assert_alive()
     with db_transaction(maker) as session:
         task, attempt, _, _ = _lock_execution_rows(session, claim, allow_invalid_video=True)
-        if task.status != "awaiting_summary":
-            task.status = "failed"
-            task.stage = "failed"
-            task.failure_code = task.failure_code or code[:64]
-            attempt.status = "failed"
-            attempt.failure_code = attempt.failure_code or code[:64]
+        task.status = "failed"
+        task.stage = "failed"
+        task.failure_code = task.failure_code or code[:64]
+        if task.summary_status == "running" or claim.execution_mode == "summary_only":
+            task.summary_status = "failed"
+            unfinished_requests = list(
+                session.scalars(
+                    select(SummaryRequest)
+                    .where(
+                        SummaryRequest.attempt_id == attempt.id,
+                        SummaryRequest.status.in_(("started", "response_received")),
+                    )
+                    .with_for_update()
+                )
+            )
+            for request in unfinished_requests:
+                request.status = "failed"
+                request.error_code = code[:64]
+                request.finished_at = datetime.now(UTC)
+        attempt.status = "failed"
+        attempt.failure_code = attempt.failure_code or code[:64]
 
 
 def _confirm_stopped(
@@ -743,6 +785,8 @@ def _confirm_stopped(
             task.status = "failed"
             task.stage = "failed"
             task.failure_code = task.failure_code or "WORKER_STOPPED_UNFINISHED"
+        if task.summary_status == "running":
+            task.summary_status = "failed"
         if attempt.status == "running":
             attempt.status = "failed"
             attempt.failure_code = attempt.failure_code or "WORKER_STOPPED_UNFINISHED"
@@ -983,6 +1027,463 @@ def _transcribe(
     _mark_awaiting_summary(maker, lease, claim)
 
 
+def _summary_transcript(
+    maker: sessionmaker[Session], lease: ExecutionLease, claim: ClaimedAttempt
+) -> tuple[list[dict[str, Any]], str, float]:
+    lease.assert_alive()
+    with maker() as session:
+        _, attempt, video, _ = _lock_execution_rows(session, claim)
+        rows = list(
+            session.scalars(
+                select(TranscriptSegment)
+                .where(TranscriptSegment.attempt_id == attempt.id)
+                .order_by(TranscriptSegment.segment_number)
+            )
+        )
+        row_values = [
+            {
+                "segment_number": row.segment_number,
+                "audio_start_seconds": row.audio_start_seconds,
+                "audio_end_seconds": row.audio_end_seconds,
+                "actual_audio_seconds": row.actual_audio_seconds,
+                "video_start_seconds": row.video_start_seconds,
+                "video_end_seconds": row.video_end_seconds,
+                "audio_sha256": row.audio_sha256,
+                "request_fingerprint": row.request_fingerprint,
+                "status": row.status,
+                "text": row.text,
+            }
+            for row in rows
+        ]
+        try:
+            segments, transcript_fingerprint = validate_transcript_manifest(
+                row_values,
+                snapshot=claim.snapshot,
+                video_duration_seconds=video.duration_seconds,
+                expected_manifest_fingerprint=attempt.manifest_fingerprint,
+            )
+        except SummaryFailure as exc:
+            raise AnalysisFailure(exc.code) from exc
+        duration = video.duration_seconds
+        session.commit()
+    lease.assert_alive()
+    return segments, transcript_fingerprint, duration
+
+
+def _start_summary_request(
+    maker: sessionmaker[Session],
+    lease: ExecutionLease,
+    claim: ClaimedAttempt,
+    contract: Any,
+    request_fingerprint: str,
+) -> SummaryRequest:
+    lease.assert_alive()
+    with db_transaction(maker) as session:
+        task, attempt, _, execution = _lock_execution_rows(session, claim)
+        if task.summary_status != "running" or task.stage != "summarizing":
+            raise AnalysisFailure("SUMMARY_EXECUTION_NOT_ELIGIBLE")
+        attempt_request_count = session.scalar(
+            select(func.count(SummaryRequest.id)).where(SummaryRequest.attempt_id == attempt.id)
+        )
+        task_request_count = session.scalar(
+            select(func.count(SummaryRequest.id)).where(SummaryRequest.task_id == task.id)
+        )
+        request_number = int(attempt_request_count or 0) + 1
+        if int(task_request_count or 0) >= contract.max_requests:
+            raise AnalysisFailure("SUMMARY_REPAIR_EXHAUSTED")
+        record = SummaryRequest(
+            task_id=task.id,
+            attempt_id=attempt.id,
+            execution_id=execution.id,
+            request_number=request_number,
+            request_fingerprint=request_fingerprint,
+            status="started",
+            provider=contract.provider,
+            model=contract.model,
+            prompt_version=contract.prompt_version,
+            started_at=datetime.now(UTC),
+        )
+        session.add(record)
+        session.flush()
+        session.expunge(record)
+        return record
+
+
+def _record_summary_response(
+    maker: sessionmaker[Session],
+    lease: ExecutionLease,
+    claim: ClaimedAttempt,
+    request_id: uuid.UUID,
+    metadata: dict[str, Any],
+) -> None:
+    lease.assert_alive()
+    with db_transaction(maker) as session:
+        _lock_execution_rows(session, claim)
+        record = session.scalar(
+            select(SummaryRequest).where(SummaryRequest.id == request_id).with_for_update()
+        )
+        if record is None or record.attempt_id != claim.attempt_id or record.status != "started":
+            raise AnalysisFailure("SUMMARY_REQUEST_AUDIT_INVALID")
+        record.status = "response_received"
+        record.finished_at = datetime.now(UTC)
+        record.elapsed_seconds = float(metadata["elapsed_seconds"])
+        record.finish_reason = metadata.get("finish_reason")
+        record.provider_trace_id = metadata.get("trace_id")
+        record.usage = metadata.get("usage") if isinstance(metadata.get("usage"), dict) else {}
+        record.response_bytes = int(metadata["response_bytes"])
+
+
+def _record_summary_failure(
+    maker: sessionmaker[Session],
+    lease: ExecutionLease,
+    claim: ClaimedAttempt,
+    request_id: uuid.UUID,
+    error_code: str,
+    *,
+    elapsed_seconds: float,
+    validation_error_code: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    lease.assert_alive()
+    with db_transaction(maker) as session:
+        _lock_execution_rows(session, claim)
+        record = session.scalar(
+            select(SummaryRequest).where(SummaryRequest.id == request_id).with_for_update()
+        )
+        if record is None or record.attempt_id != claim.attempt_id:
+            raise AnalysisFailure("SUMMARY_REQUEST_AUDIT_INVALID")
+        record.status = "failed"
+        record.error_code = error_code[:64]
+        record.validation_error_code = validation_error_code[:64] if validation_error_code else None
+        record.finished_at = datetime.now(UTC)
+        record.elapsed_seconds = max(0.0, float(elapsed_seconds))
+        if metadata is not None:
+            record.finish_reason = metadata.get("finish_reason")
+            record.provider_trace_id = metadata.get("trace_id")
+            record.usage = metadata.get("usage") if isinstance(metadata.get("usage"), dict) else {}
+            record.response_bytes = int(metadata.get("response_bytes", 0))
+
+
+def _publish_summary(
+    maker: sessionmaker[Session],
+    lease: ExecutionLease,
+    claim: ClaimedAttempt,
+    request_id: uuid.UUID,
+    *,
+    contract: Any,
+    expected_transcript_fingerprint: str,
+    payload: dict[str, Any],
+) -> None:
+    lease.assert_alive()
+    with db_transaction(maker) as session:
+        task, attempt, video, execution = _lock_execution_rows(session, claim)
+        if task.summary_status != "running" or task.status != "running":
+            raise AnalysisFailure("SUMMARY_EXECUTION_NOT_ELIGIBLE")
+        request = session.scalar(
+            select(SummaryRequest).where(SummaryRequest.id == request_id).with_for_update()
+        )
+        if (
+            request is None
+            or request.task_id != task.id
+            or request.attempt_id != attempt.id
+            or request.execution_id != execution.id
+            or request.status != "response_received"
+        ):
+            raise AnalysisFailure("SUMMARY_REQUEST_AUDIT_INVALID")
+        existing = session.scalar(
+            select(AnalysisSummary.id).where(AnalysisSummary.task_id == task.id).limit(1)
+        )
+        if existing is not None:
+            raise AnalysisFailure("SUMMARY_ALREADY_PUBLISHED")
+        row_values = [
+            {
+                "segment_number": row.segment_number,
+                "audio_start_seconds": row.audio_start_seconds,
+                "audio_end_seconds": row.audio_end_seconds,
+                "actual_audio_seconds": row.actual_audio_seconds,
+                "video_start_seconds": row.video_start_seconds,
+                "video_end_seconds": row.video_end_seconds,
+                "audio_sha256": row.audio_sha256,
+                "request_fingerprint": row.request_fingerprint,
+                "status": row.status,
+                "text": row.text,
+            }
+            for row in session.scalars(
+                select(TranscriptSegment)
+                .where(TranscriptSegment.attempt_id == attempt.id)
+                .order_by(TranscriptSegment.segment_number)
+            )
+        ]
+        try:
+            _, transcript_fingerprint = validate_transcript_manifest(
+                row_values,
+                snapshot=claim.snapshot,
+                video_duration_seconds=video.duration_seconds,
+                expected_manifest_fingerprint=attempt.manifest_fingerprint,
+            )
+        except SummaryFailure as exc:
+            raise AnalysisFailure(exc.code) from exc
+        if transcript_fingerprint != expected_transcript_fingerprint or video.status != "ready":
+            raise AnalysisFailure("TRANSCRIPT_SOURCE_MISMATCH")
+        payload_hash = summary_canonical_sha256(payload)
+        session.add(
+            AnalysisSummary(
+                task_id=task.id,
+                video_id=video.id,
+                attempt_id=attempt.id,
+                manifest_fingerprint=str(attempt.manifest_fingerprint),
+                transcript_fingerprint=transcript_fingerprint,
+                structure_version=contract.schema_version,
+                provider=contract.provider,
+                model=contract.model,
+                prompt_version=contract.prompt_version,
+                prompt_sha256=contract.template_sha256,
+                response_schema_sha256=contract.response_schema_sha256,
+                payload_sha256=payload_hash,
+                payload=payload,
+            )
+        )
+        request.status = "succeeded"
+        attempt.status = "succeeded"
+        attempt.failure_code = None
+        attempt.cleanup_state = "pending"
+        attempt.cleanup_error_code = None
+        task.status = "succeeded"
+        task.stage = "succeeded"
+        task.summary_status = "succeeded"
+        task.failure_code = None
+
+
+def _read_llm_result(path: Path, maximum_bytes: int) -> tuple[str, dict[str, Any]]:
+    try:
+        if path.is_symlink() or path.stat().st_size > maximum_bytes + 8192:
+            raise AnalysisFailure("LLM_RESPONSE_TOO_LARGE")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AnalysisFailure("LLM_INVALID_RESPONSE") from exc
+    code = payload.get("error_code") if isinstance(payload, dict) else None
+    if isinstance(code, str):
+        if len(code) > 64 or not code.replace("_", "").isalnum():
+            raise AnalysisFailure("LLM_INVALID_RESPONSE")
+        raise AnalysisFailure(code)
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("content"), str)
+        or not isinstance(payload.get("metadata"), dict)
+    ):
+        raise AnalysisFailure("LLM_INVALID_RESPONSE")
+    metadata = payload["metadata"]
+    elapsed = metadata.get("elapsed_seconds")
+    response_bytes = metadata.get("response_bytes")
+    if (
+        not isinstance(elapsed, int | float)
+        or isinstance(elapsed, bool)
+        or not math.isfinite(float(elapsed))
+        or elapsed < 0
+        or not isinstance(response_bytes, int)
+        or isinstance(response_bytes, bool)
+        or response_bytes < 0
+        or response_bytes > maximum_bytes
+    ):
+        raise AnalysisFailure("LLM_INVALID_RESPONSE")
+    return payload["content"], metadata
+
+
+def _summarize(
+    maker: sessionmaker[Session],
+    lease: ExecutionLease,
+    claim: ClaimedAttempt,
+    store: MediaStore,
+    attempt_deadline: float,
+) -> None:
+    _set_stage(maker, lease, claim, "summarizing")
+    try:
+        contract = resolve_summary_contract(claim.snapshot)
+    except SummaryFailure as exc:
+        raise AnalysisFailure(exc.code) from exc
+    segments, transcript_fingerprint, duration = _summary_transcript(maker, lease, claim)
+    source_config = claim.snapshot["source"]
+    source_path = store.target_path(claim.storage_name)
+    _hash_source(
+        source_path,
+        int(source_config["byte_count"]),
+        str(source_config["sha256"]),
+        maker=maker,
+        lease=lease,
+        claim=claim,
+        attempt_deadline=attempt_deadline,
+    )
+    directory = _work_directory(store, claim)
+    if not directory.is_dir():
+        if claim.execution_mode != "summary_only":
+            raise AnalysisFailure("SUMMARY_WORK_DIRECTORY_UNAVAILABLE")
+        directory = _build_attempt_directory(store, claim)
+    try:
+        validate_transcript_context_budget(segments, contract)
+        prompt = build_summary_prompt(segments, contract.prompt_version)
+        validate_context_budget(prompt, contract)
+    except SummaryFailure as exc:
+        raise AnalysisFailure(exc.code) from exc
+    correction_code: str | None = None
+    for request_number in range(1, contract.max_requests + 1):
+        remaining = attempt_deadline - time.monotonic()
+        if remaining <= 0:
+            raise AnalysisFailure("ATTEMPT_TIMEOUT")
+        request_fingerprint = summary_request_fingerprint(
+            contract=contract,
+            transcript_fingerprint=transcript_fingerprint,
+            correction_code=correction_code,
+        )
+        request_record = _start_summary_request(maker, lease, claim, contract, request_fingerprint)
+        request_path = directory / f"summary-request-{request_record.request_number:02d}.json"
+        response_path = directory / f"summary-response-{request_record.request_number:02d}.json"
+        request_total = min(contract.timeouts["total"], remaining)
+        messages = [
+            {"role": "system", "content": "输出严格 JSON。不得臆造引文或时间。"},
+            {
+                "role": "user",
+                "content": prompt
+                + (
+                    "\n校验错误，请只修正这些问题：\n" + correction_for_failure(correction_code)
+                    if correction_code
+                    else ""
+                ),
+            },
+        ]
+        request_document = {
+            "base_url": contract.base_url,
+            "model": contract.model,
+            "messages": messages,
+            "temperature": contract.temperature,
+            "max_output_tokens": contract.max_output_tokens,
+            "enable_thinking": contract.enable_thinking,
+            "timeouts": {
+                **contract.timeouts,
+                "total": request_total,
+                "connect": min(contract.timeouts["connect"], request_total),
+                "read": min(contract.timeouts["read"], request_total),
+                "write": min(contract.timeouts["write"], request_total),
+                "pool": min(contract.timeouts["pool"], request_total),
+            },
+            "max_response_bytes": contract.max_response_bytes,
+            "max_diagnostic_bytes": contract.max_diagnostic_bytes,
+        }
+        if request_path.is_symlink() or response_path.is_symlink():
+            raise AnalysisFailure("SUMMARY_WORK_DIRECTORY_INVALID")
+        try:
+            request_path.write_text(
+                json.dumps(request_document, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            raise AnalysisFailure("SUMMARY_WORK_DIRECTORY_UNAVAILABLE") from exc
+        started = time.monotonic()
+        try:
+            _run_process(
+                [
+                    sys.executable,
+                    "-m",
+                    "videoclip.llm_client",
+                    "--request",
+                    str(request_path),
+                    "--output",
+                    str(response_path),
+                ],
+                timeout_seconds=request_total,
+                grace_seconds=float(claim.snapshot["limits"]["process_stop_grace_seconds"]),
+                maker=maker,
+                lease=lease,
+                claim=claim,
+                attempt_deadline=attempt_deadline,
+            )
+            raw, metadata = _read_llm_result(response_path, contract.max_response_bytes)
+        except AnalysisFailure as exc:
+            if exc.code in {
+                "EXECUTION_OWNERSHIP_LOST",
+                "VIDEO_UNAVAILABLE",
+                "PROCESS_STOP_UNCONFIRMED",
+                "ATTEMPT_TIMEOUT",
+            }:
+                raise
+            error_code = "LLM_TOTAL_TIMEOUT" if exc.code == "LOCAL_PROCESS_TIMEOUT" else exc.code
+            _record_summary_failure(
+                maker,
+                lease,
+                claim,
+                request_record.id,
+                error_code,
+                elapsed_seconds=time.monotonic() - started,
+            )
+            raise AnalysisFailure(error_code) from exc
+        finally:
+            request_path.unlink(missing_ok=True)
+            response_path.unlink(missing_ok=True)
+
+        _record_summary_response(maker, lease, claim, request_record.id, metadata)
+        finish_reason = metadata.get("finish_reason")
+        if finish_reason == "length":
+            error_code = "LLM_OUTPUT_TRUNCATED"
+            _record_summary_failure(
+                maker,
+                lease,
+                claim,
+                request_record.id,
+                error_code,
+                validation_error_code=error_code,
+                elapsed_seconds=float(metadata["elapsed_seconds"]),
+                metadata=metadata,
+            )
+            correction_code = error_code
+            if request_number < contract.max_requests:
+                continue
+            raise AnalysisFailure("SUMMARY_REPAIR_EXHAUSTED")
+        if finish_reason != "stop":
+            error_code = "LLM_FINISH_REASON_UNSUPPORTED"
+            _record_summary_failure(
+                maker,
+                lease,
+                claim,
+                request_record.id,
+                error_code,
+                elapsed_seconds=float(metadata["elapsed_seconds"]),
+                metadata=metadata,
+            )
+            raise AnalysisFailure(error_code)
+        try:
+            result = validate_summary_output(raw, segments, video_duration_seconds=duration)
+        except SummaryFailure as exc:
+            _record_summary_failure(
+                maker,
+                lease,
+                claim,
+                request_record.id,
+                "SUMMARY_OUTPUT_INVALID",
+                validation_error_code=exc.code,
+                elapsed_seconds=float(metadata["elapsed_seconds"]),
+                metadata=metadata,
+            )
+            if is_repairable_summary_failure(exc.code) and request_number < contract.max_requests:
+                correction_code = exc.code
+                continue
+            raise AnalysisFailure(
+                "SUMMARY_REPAIR_EXHAUSTED" if is_repairable_summary_failure(exc.code) else exc.code
+            ) from exc
+        try:
+            _publish_summary(
+                maker,
+                lease,
+                claim,
+                request_record.id,
+                contract=contract,
+                expected_transcript_fingerprint=transcript_fingerprint,
+                payload=result,
+            )
+        except SQLAlchemyError as exc:
+            raise AnalysisFailure("SUMMARY_PUBLISH_FAILED") from exc
+        return
+    raise AnalysisFailure("SUMMARY_REPAIR_EXHAUSTED")
+
+
 def _attempt_config_hash(maker: sessionmaker[Session], claim: ClaimedAttempt) -> str:
     with maker() as session:
         value = session.scalar(
@@ -1047,8 +1548,10 @@ def transcribe_analysis(task_id_value: str, attempt_id_value: str | None = None)
         maker = sessionmaker(bind=lease.connection, autoflush=False, expire_on_commit=False)
         attempt_deadline = time.monotonic() + int(claim.snapshot["limits"]["attempt_total_seconds"])
         try:
-            _transcribe(maker, lease, claim, settings, store, attempt_deadline)
-            terminal_reason = "transcription_complete"
+            if claim.execution_mode != "summary_only":
+                _transcribe(maker, lease, claim, settings, store, attempt_deadline)
+            _summarize(maker, lease, claim, store, attempt_deadline)
+            terminal_reason = "summary_published"
         except StopUnconfirmed:
             logger.error(
                 "analysis_stop_unconfirmed task_id=%s attempt_id=%s", task_id.hex, claim.attempt_id.hex
@@ -1095,7 +1598,7 @@ def transcribe_analysis(task_id_value: str, attempt_id_value: str | None = None)
                 claim.attempt_id.hex,
             )
             return {"status": "stop_unconfirmed"}
-        return {"status": "awaiting_summary" if failure_code is None else "failed"}
+        return {"status": "succeeded" if failure_code is None else "failed"}
     finally:
         if lease is not None:
             lease.release()

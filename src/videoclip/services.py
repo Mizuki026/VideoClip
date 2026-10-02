@@ -21,8 +21,10 @@ from videoclip.media import MediaError, MediaInfo, probe_media
 from videoclip.models import (
     AnalysisAttempt,
     AnalysisExecution,
+    AnalysisSummary,
     AnalysisTask,
     CleanupIntent,
+    SummaryRequest,
     TaskDelivery,
     TranscriptSegment,
     UploadHandoff,
@@ -466,6 +468,12 @@ def delete_video(
                             )
                         )
                         if current_attempt_ids:
+                            session.query(SummaryRequest).filter(
+                                SummaryRequest.attempt_id.in_(current_attempt_ids)
+                            ).delete(synchronize_session=False)
+                            session.query(AnalysisSummary).filter(AnalysisSummary.task_id == task.id).delete(
+                                synchronize_session=False
+                            )
                             session.query(TranscriptSegment).filter(
                                 TranscriptSegment.attempt_id.in_(current_attempt_ids)
                             ).delete(synchronize_session=False)
@@ -647,7 +655,7 @@ def recover_confirmed_attempt_cleanup(factory: sessionmaker[Session], store: Med
                 .join(Video, Video.id == AnalysisTask.video_id)
                 .where(
                     Video.status == "ready",
-                    AnalysisAttempt.status.in_(("failed", "awaiting_summary")),
+                    AnalysisAttempt.status.in_(("failed", "awaiting_summary", "succeeded")),
                     AnalysisAttempt.cleanup_state.in_(("pending", "failed")),
                 )
                 .order_by(AnalysisAttempt.created_at)

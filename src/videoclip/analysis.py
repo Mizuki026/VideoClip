@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from videoclip.models import (
     AnalysisAttempt,
     AnalysisExecution,
+    AnalysisSummary,
     AnalysisTask,
     TaskDelivery,
     TranscriptSegment,
@@ -22,12 +23,24 @@ from videoclip.models import (
 from videoclip.recovery_rules import evaluate_recovery
 from videoclip.schemas import (
     AnalysisAttemptResponse,
+    AnalysisSummaryResponse,
     AnalysisTaskResponse,
     TranscriptResponse,
     TranscriptSegmentResponse,
 )
 from videoclip.services import db_transaction
 from videoclip.settings import Settings
+from videoclip.summarization import (
+    CHAT_MESSAGE_OVERHEAD_TOKENS,
+    MAX_SUMMARY_REQUESTS,
+    QUOTE_NORMALIZATION_VERSION,
+    SUMMARY_REQUEST_CONTRACT_VERSION,
+    SummaryFailure,
+    resolve_summary_contract,
+    response_schema_sha256,
+    template_sha256,
+    validate_transcript_manifest,
+)
 
 TASK_CONFIGURATION_VERSION = "analysis-config-v1"
 SOURCE_FINGERPRINT_VERSION = "source-v1"
@@ -46,6 +59,101 @@ class RecoverySubmission:
     task_id: uuid.UUID
     attempt_id: uuid.UUID
     created: bool
+
+
+def _transcript_rows(session: Session, attempt_id: uuid.UUID) -> list[dict[str, Any]]:
+    rows = list(
+        session.scalars(
+            select(TranscriptSegment)
+            .where(TranscriptSegment.attempt_id == attempt_id)
+            .order_by(TranscriptSegment.segment_number)
+        )
+    )
+    return [
+        {
+            "segment_number": row.segment_number,
+            "audio_start_seconds": row.audio_start_seconds,
+            "audio_end_seconds": row.audio_end_seconds,
+            "actual_audio_seconds": row.actual_audio_seconds,
+            "video_start_seconds": row.video_start_seconds,
+            "video_end_seconds": row.video_end_seconds,
+            "audio_sha256": row.audio_sha256,
+            "request_fingerprint": row.request_fingerprint,
+            "status": row.status,
+            "text": row.text,
+        }
+        for row in rows
+    ]
+
+
+def _validated_transcript(
+    session: Session, video: Video, attempt: AnalysisAttempt
+) -> tuple[list[dict[str, Any]], str]:
+    snapshot = attempt.config_snapshot
+    source = snapshot.get("source") if isinstance(snapshot, dict) else None
+    try:
+        compatible = (
+            snapshot.get("version") == TASK_CONFIGURATION_VERSION
+            and canonical_sha256(snapshot) == attempt.config_sha256
+            and isinstance(source, dict)
+            and source.get("fingerprint") == attempt.source_fingerprint
+            and source.get("fingerprint")
+            == build_source_fingerprint(video, int(source["audio_stream_index"]))
+            and source.get("storage_name") == video.storage_name
+            and source.get("byte_count") == video.byte_count
+            and source.get("sha256") == video.content_sha256
+            and source.get("duration_seconds") == video.duration_seconds
+        )
+        resolve_summary_contract(snapshot)
+    except (KeyError, TypeError, ValueError, SummaryFailure) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "SUMMARY_CONFIGURATION_INCOMPATIBLE"},
+        ) from exc
+    if not compatible or attempt.manifest_fingerprint is None:
+        raise HTTPException(status_code=409, detail={"code": "TRANSCRIPT_SOURCE_MISMATCH"})
+    rows = _transcript_rows(session, attempt.id)
+    try:
+        validated, transcript_fingerprint = validate_transcript_manifest(
+            rows,
+            snapshot=snapshot,
+            video_duration_seconds=video.duration_seconds,
+            expected_manifest_fingerprint=attempt.manifest_fingerprint,
+        )
+    except SummaryFailure as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code}) from exc
+    return validated, transcript_fingerprint
+
+
+def _copy_complete_transcript(
+    session: Session, source_attempt: AnalysisAttempt, target_attempt: AnalysisAttempt
+) -> None:
+    source_rows = list(
+        session.scalars(
+            select(TranscriptSegment)
+            .where(TranscriptSegment.attempt_id == source_attempt.id)
+            .order_by(TranscriptSegment.segment_number)
+        )
+    )
+    for source in source_rows:
+        session.add(
+            TranscriptSegment(
+                attempt_id=target_attempt.id,
+                source_attempt_id=source_attempt.id,
+                segment_number=source.segment_number,
+                audio_start_seconds=source.audio_start_seconds,
+                audio_end_seconds=source.audio_end_seconds,
+                actual_audio_seconds=source.actual_audio_seconds,
+                video_start_seconds=source.video_start_seconds,
+                video_end_seconds=source.video_end_seconds,
+                audio_sha256=source.audio_sha256,
+                request_fingerprint=source.request_fingerprint,
+                status="succeeded",
+                text=source.text,
+                request_count=0,
+            )
+        )
+    target_attempt.manifest_fingerprint = source_attempt.manifest_fingerprint
 
 
 def canonical_sha256(value: Any) -> str:
@@ -76,7 +184,7 @@ def build_configuration_snapshot(video: Video, settings: Settings) -> dict[str, 
     if audio_stream is None or not isinstance(audio_stream.get("index"), int):
         raise HTTPException(status_code=409, detail="video has no verified audio stream")
     audio_stream_index = int(audio_stream["index"])
-    return {
+    snapshot = {
         "version": TASK_CONFIGURATION_VERSION,
         "source": {
             "storage_name": video.storage_name,
@@ -111,6 +219,28 @@ def build_configuration_snapshot(video: Video, settings: Settings) -> dict[str, 
             "schema_version": settings.summary_schema_version,
             "context_tokens": settings.llm_context_tokens,
             "max_output_tokens": settings.llm_max_output_tokens,
+            "request": {
+                "contract_version": SUMMARY_REQUEST_CONTRACT_VERSION,
+                "base_url": settings.asr_base_url,
+                "temperature": settings.llm_temperature,
+                "enable_thinking": settings.llm_enable_thinking,
+                "timeouts": {
+                    "total": settings.llm_http_total_timeout_seconds,
+                    "connect": settings.llm_http_connect_timeout_seconds,
+                    "read": settings.llm_http_read_timeout_seconds,
+                    "write": settings.llm_http_write_timeout_seconds,
+                    "pool": settings.llm_http_pool_timeout_seconds,
+                },
+                "max_response_bytes": settings.max_llm_response_bytes,
+                "max_diagnostic_bytes": settings.max_llm_diagnostic_bytes,
+                "max_requests": MAX_SUMMARY_REQUESTS,
+                "context_overhead_tokens": CHAT_MESSAGE_OVERHEAD_TOKENS,
+                "template_sha256": template_sha256(
+                    settings.summary_prompt_version, settings.summary_schema_version
+                ),
+                "response_schema_sha256": response_schema_sha256(),
+                "quote_normalization_version": QUOTE_NORMALIZATION_VERSION,
+            },
         },
         "limits": {
             "attempt_total_seconds": settings.attempt_total_timeout_seconds,
@@ -123,6 +253,14 @@ def build_configuration_snapshot(video: Video, settings: Settings) -> dict[str, 
             "diagnostic_max_bytes": settings.max_media_diagnostic_bytes,
         },
     }
+    try:
+        resolve_summary_contract(snapshot)
+    except SummaryFailure as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "SUMMARY_CONFIGURATION_UNSUPPORTED"},
+        ) from exc
+    return snapshot
 
 
 def submit_analysis_task(
@@ -286,6 +424,15 @@ def recover_analysis_attempt(
                 detail={"code": "SOURCE_CONFIGURATION_INCOMPATIBLE", "recovery_eligible": False},
             )
 
+        source_rows = _transcript_rows(session, parent.id)
+        summary_only = bool(
+            parent.manifest_fingerprint
+            and source_rows
+            and all(item["status"] == "succeeded" and item["text"] for item in source_rows)
+        )
+        if summary_only:
+            _validated_transcript(session, video, parent)
+
         if parent.claim_count == 0:
             parent.failure_code = "ATTEMPT_SUPERSEDED"
         else:
@@ -307,6 +454,7 @@ def recover_analysis_attempt(
             parent_attempt_id=parent.id,
             attempt_number=next_number,
             status="queued",
+            execution_mode="summary_only" if summary_only else "full",
             config_snapshot=snapshot,
             config_sha256=parent.config_sha256,
             source_fingerprint=parent.source_fingerprint,
@@ -318,7 +466,118 @@ def recover_analysis_attempt(
         session.flush()
         task.current_attempt_id = child.id
         task.status = "queued"
-        task.stage = "queued"
+        task.stage = "queued_summary" if summary_only else "queued"
+        task.summary_status = "waiting" if summary_only else "not_started"
+        task.failure_code = None
+        session.add(TaskDelivery(attempt_id=child.id, status="pending"))
+        if summary_only:
+            _copy_complete_transcript(session, parent, child)
+        session.flush()
+        return RecoverySubmission(task_id=task.id, attempt_id=child.id, created=True)
+
+
+def continue_summary_attempt(
+    factory: sessionmaker[Session],
+    owner_id: uuid.UUID,
+    video_id: uuid.UUID,
+    task_id: uuid.UUID,
+    parent_attempt_id: uuid.UUID,
+) -> RecoverySubmission:
+    with db_transaction(factory) as session:
+        video = session.scalar(
+            select(Video).where(Video.id == video_id, Video.owner_id == owner_id).with_for_update()
+        )
+        if video is None:
+            raise HTTPException(status_code=404, detail="analysis task not found")
+        task = session.scalar(
+            select(AnalysisTask)
+            .where(
+                AnalysisTask.id == task_id,
+                AnalysisTask.video_id == video.id,
+                AnalysisTask.owner_id == owner_id,
+            )
+            .with_for_update()
+        )
+        parent = session.scalar(
+            select(AnalysisAttempt)
+            .where(AnalysisAttempt.id == parent_attempt_id, AnalysisAttempt.task_id == task_id)
+            .with_for_update()
+        )
+        if task is None or parent is None:
+            raise HTTPException(status_code=404, detail="analysis task not found")
+        if video.status != "ready":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "VIDEO_DELETION_IN_PROGRESS", "summary_available": False},
+            )
+        child = session.scalar(select(AnalysisAttempt).where(AnalysisAttempt.parent_attempt_id == parent.id))
+        if child is not None:
+            if session.get(TaskDelivery, child.id) is None:
+                raise HTTPException(status_code=503, detail="attempt delivery state needs maintenance")
+            return RecoverySubmission(task_id=task.id, attempt_id=child.id, created=False)
+        if task.current_attempt_id != parent.id or task.status != "awaiting_summary":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "SUMMARY_CONTINUATION_NOT_ELIGIBLE", "summary_available": False},
+            )
+        if task.summary_status != "waiting" or session.get(AnalysisSummary, task.id) is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "SUMMARY_CONTINUATION_NOT_ELIGIBLE", "summary_available": False},
+            )
+        execution = session.scalar(select(AnalysisExecution).where(AnalysisExecution.attempt_id == parent.id))
+        stopped = (
+            parent.claim_count == 1
+            and parent.execution_id is not None
+            and parent.stop_confirmed_at is not None
+            and execution is not None
+            and execution.id == parent.execution_id
+            and execution.stop_confirmed_at is not None
+        )
+        if not stopped:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "STOP_CONFIRMATION_REQUIRED", "summary_available": False},
+            )
+        unconfirmed = session.scalar(
+            select(AnalysisExecution.id).where(AnalysisExecution.stop_confirmed_at.is_(None)).limit(1)
+        )
+        if unconfirmed is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "STOP_CONFIRMATION_REQUIRED", "summary_available": False},
+            )
+        _validated_transcript(session, video, parent)
+        next_number = (
+            int(
+                session.scalar(
+                    select(func.coalesce(func.max(AnalysisAttempt.attempt_number), 0)).where(
+                        AnalysisAttempt.task_id == task.id
+                    )
+                )
+            )
+            + 1
+        )
+        child = AnalysisAttempt(
+            task_id=task.id,
+            parent_attempt_id=parent.id,
+            attempt_number=next_number,
+            status="queued",
+            execution_mode="summary_only",
+            config_snapshot=parent.config_snapshot,
+            config_sha256=parent.config_sha256,
+            source_fingerprint=parent.source_fingerprint,
+            work_directory_name=uuid.uuid4().hex,
+            claim_count=0,
+            cleanup_state="pending",
+        )
+        session.add(child)
+        session.flush()
+        _copy_complete_transcript(session, parent, child)
+        task.current_attempt_id = child.id
+        task.status = "queued"
+        task.stage = "queued_summary"
+        task.summary_status = "waiting"
         task.failure_code = None
         session.add(TaskDelivery(attempt_id=child.id, status="pending"))
         session.flush()
@@ -462,7 +721,7 @@ def task_response(
                 for row in call_rows
                 if row.request_metadata is not None
             ],
-            summary_status="waiting" if task.status == "awaiting_summary" else "not_started",
+            summary_status=task.summary_status,
             execution_state=(
                 "not_started"
                 if execution is None
@@ -480,6 +739,7 @@ def task_response(
                 attempt_number=attempt.attempt_number,
                 parent_attempt_id=attempt.parent_attempt_id,
                 status=attempt.status,
+                execution_mode=attempt.execution_mode,
                 execution_id=attempt.execution_id,
                 first_claimed_at=attempt.first_claimed_at,
                 stop_confirmed_at=attempt.stop_confirmed_at,
@@ -524,10 +784,13 @@ def transcript_response(
             task_id=task.id,
             complete=(
                 task.status == "awaiting_summary"
-                and bool(segments)
-                and all(item.status == "succeeded" for item in segments)
+                or (
+                    bool(segments)
+                    and attempt.manifest_fingerprint is not None
+                    and all(item.status == "succeeded" for item in segments)
+                )
             ),
-            summary_status="waiting" if task.status == "awaiting_summary" else "not_started",
+            summary_status=task.summary_status,
             items=[
                 TranscriptSegmentResponse(
                     segment_number=item.segment_number,
@@ -542,4 +805,55 @@ def transcript_response(
                 )
                 for item in segments
             ],
+        )
+
+
+def summary_response(
+    factory: sessionmaker[Session], owner_id: uuid.UUID, video_id: uuid.UUID
+) -> AnalysisSummaryResponse:
+    with factory() as session:
+        video = session.scalar(select(Video).where(Video.id == video_id, Video.owner_id == owner_id))
+        if video is None:
+            raise HTTPException(status_code=404, detail="summary not found")
+        if video.status != "ready":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "VIDEO_DELETION_IN_PROGRESS", "summary_available": False},
+            )
+        task = session.scalar(
+            select(AnalysisTask).where(
+                AnalysisTask.video_id == video.id,
+                AnalysisTask.owner_id == owner_id,
+            )
+        )
+        if task is None:
+            raise HTTPException(status_code=404, detail="summary not found")
+        if task.status != "succeeded" or task.summary_status != "succeeded":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "SUMMARY_NOT_READY", "summary_status": task.summary_status},
+            )
+        result = session.scalar(
+            select(AnalysisSummary).where(
+                AnalysisSummary.task_id == task.id,
+                AnalysisSummary.video_id == video.id,
+            )
+        )
+        if result is None or result.attempt_id != task.current_attempt_id:
+            raise HTTPException(status_code=503, detail="summary publication needs maintenance")
+        return AnalysisSummaryResponse(
+            video_id=result.video_id,
+            task_id=result.task_id,
+            attempt_id=result.attempt_id,
+            status="succeeded",
+            structure_version=result.structure_version,
+            provider=result.provider,
+            model=result.model,
+            prompt_version=result.prompt_version,
+            prompt_sha256=result.prompt_sha256,
+            manifest_fingerprint=result.manifest_fingerprint,
+            transcript_fingerprint=result.transcript_fingerprint,
+            summary_sha256=result.payload_sha256,
+            payload=result.payload,
+            created_at=result.created_at,
         )

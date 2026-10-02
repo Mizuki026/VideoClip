@@ -59,6 +59,7 @@ class AnalysisAttemptResponse(BaseModel):
     attempt_number: int
     parent_attempt_id: UUID | None
     status: str
+    execution_mode: str
     execution_id: UUID | None
     first_claimed_at: datetime | None
     stop_confirmed_at: datetime | None
@@ -97,6 +98,23 @@ class AnalysisTaskResponse(BaseModel):
     is_current_attempt: bool
     created_at: datetime
     attempt: AnalysisAttemptResponse
+
+
+class AnalysisSummaryResponse(BaseModel):
+    video_id: UUID
+    task_id: UUID
+    attempt_id: UUID
+    status: str
+    structure_version: str
+    provider: str
+    model: str
+    prompt_version: str
+    prompt_sha256: str
+    manifest_fingerprint: str
+    transcript_fingerprint: str
+    summary_sha256: str
+    payload: dict[str, Any]
+    created_at: datetime
 
 
 class RecoveryRequest(BaseModel):

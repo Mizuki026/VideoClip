@@ -20,10 +20,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from videoclip.analysis import (
+    continue_summary_attempt,
     mark_publish_started,
     recover_analysis_attempt,
     set_delivery_status,
     submit_analysis_task,
+    summary_response,
     task_response,
     transcript_response,
 )
@@ -32,6 +34,7 @@ from videoclip.db import check_database, create_database_engine, create_session_
 from videoclip.models import AnalysisAttempt, AnalysisExecution, SessionRecord, User, Video
 from videoclip.recovery import recover_interrupted_work
 from videoclip.schemas import (
+    AnalysisSummaryResponse,
     AnalysisTaskResponse,
     CleanupRequest,
     CleanupResponse,
@@ -555,6 +558,32 @@ def create_app(
             recovered.attempt_id,
         )
 
+    @app.post(
+        "/videos/{video_id}/tasks/{task_id}/summarize",
+        status_code=status.HTTP_202_ACCEPTED,
+        response_model=AnalysisTaskResponse,
+    )
+    def continue_summary(
+        video_id: uuid.UUID,
+        task_id: uuid.UUID,
+        payload: RecoveryRequest,
+        request: Request,
+    ) -> AnalysisTaskResponse:
+        current = _current_auth(request, resolved_factory)
+        _require_csrf(request, resolved_settings, resolved_factory, current)
+        assert current is not None
+        user, _ = current
+        continued = continue_summary_attempt(resolved_factory, user.id, video_id, task_id, payload.attempt_id)
+        if continued.created:
+            publish_new_attempt(continued.task_id, continued.attempt_id)
+        return task_response(
+            resolved_factory,
+            user.id,
+            video_id,
+            continued.task_id,
+            continued.attempt_id,
+        )
+
     @app.post("/videos/{video_id}/cleanup", response_model=CleanupResponse)
     def cleanup_attempt(
         video_id: uuid.UUID,
@@ -587,6 +616,12 @@ def create_app(
     def get_transcript(video_id: uuid.UUID, request: Request) -> TranscriptResponse:
         user, _ = _current_auth(request, resolved_factory) or _raise_auth()
         return transcript_response(resolved_factory, user.id, video_id)
+
+    @app.get("/videos/{video_id}/summary", response_model=AnalysisSummaryResponse)
+    def get_summary(video_id: uuid.UUID, request: Request, response: Response) -> AnalysisSummaryResponse:
+        user, _ = _current_auth(request, resolved_factory) or _raise_auth()
+        response.headers["Cache-Control"] = "private, no-store"
+        return summary_response(resolved_factory, user.id, video_id)
 
     @app.api_route("/videos/{video_id}/content", methods=["GET", "HEAD"])
     def video_content(

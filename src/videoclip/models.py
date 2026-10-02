@@ -143,13 +143,17 @@ class AnalysisTask(Base):
     __table_args__ = (
         UniqueConstraint("video_id", name="uq_analysis_tasks_video"),
         CheckConstraint(
-            "status IN ('queued', 'running', 'awaiting_summary', 'failed')",
+            "status IN ('queued', 'running', 'awaiting_summary', 'failed', 'succeeded')",
             name="ck_analysis_tasks_status",
         ),
         CheckConstraint(
             "stage IN ('queued', 'validating_source', 'extracting_audio', 'preparing_manifest', "
-            "'transcribing', 'awaiting_summary', 'failed')",
+            "'transcribing', 'awaiting_summary', 'queued_summary', 'summarizing', 'failed', 'succeeded')",
             name="ck_analysis_tasks_stage",
+        ),
+        CheckConstraint(
+            "summary_status IN ('not_started', 'waiting', 'running', 'failed', 'succeeded')",
+            name="ck_analysis_tasks_summary_status",
         ),
         Index("ix_analysis_tasks_owner_created", "owner_id", "created_at"),
     )
@@ -173,6 +177,7 @@ class AnalysisTask(Base):
     )
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
     stage: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    summary_status: Mapped[str] = mapped_column(String(24), nullable=False, default="not_started")
     failure_code: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -187,8 +192,11 @@ class AnalysisAttempt(Base):
         CheckConstraint("attempt_number > 0", name="ck_analysis_attempts_number_positive"),
         CheckConstraint("claim_count IN (0, 1)", name="ck_analysis_attempts_claim_once"),
         CheckConstraint(
-            "status IN ('queued', 'running', 'awaiting_summary', 'failed')",
+            "status IN ('queued', 'running', 'awaiting_summary', 'failed', 'succeeded')",
             name="ck_analysis_attempts_status",
+        ),
+        CheckConstraint(
+            "execution_mode IN ('full', 'summary_only')", name="ck_analysis_attempts_execution_mode"
         ),
         CheckConstraint(
             "cleanup_state IN ('pending', 'cleaned', 'failed')",
@@ -211,6 +219,7 @@ class AnalysisAttempt(Base):
     )
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    execution_mode: Mapped[str] = mapped_column(String(24), nullable=False, default="full")
     config_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     source_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -313,3 +322,72 @@ class AnalysisExecution(Base):
     stop_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     stop_confirmation_source: Mapped[str | None] = mapped_column(String(64))
     stop_reason: Mapped[str | None] = mapped_column(String(64))
+
+
+class AnalysisSummary(Base):
+    __tablename__ = "analysis_summaries"
+    __table_args__ = (
+        UniqueConstraint("task_id", name="uq_analysis_summaries_task"),
+        UniqueConstraint("video_id", name="uq_analysis_summaries_video"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("analysis_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    video_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("videos.id", ondelete="CASCADE"), nullable=False
+    )
+    attempt_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("analysis_attempts.id", ondelete="RESTRICT"), nullable=False
+    )
+    manifest_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    transcript_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    structure_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    prompt_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    response_schema_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SummaryRequest(Base):
+    __tablename__ = "summary_requests"
+    __table_args__ = (
+        UniqueConstraint("attempt_id", "request_number", name="uq_summary_requests_attempt_number"),
+        CheckConstraint("request_number BETWEEN 1 AND 3", name="ck_summary_requests_request_number"),
+        CheckConstraint(
+            "status IN ('started', 'response_received', 'failed', 'succeeded')",
+            name="ck_summary_requests_status",
+        ),
+        Index("ix_summary_requests_task_attempt", "task_id", "attempt_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("analysis_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    attempt_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("analysis_attempts.id", ondelete="CASCADE"), nullable=False
+    )
+    execution_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("analysis_executions.id", ondelete="CASCADE"), nullable=False
+    )
+    request_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="started")
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    elapsed_seconds: Mapped[float | None] = mapped_column(Float)
+    finish_reason: Mapped[str | None] = mapped_column(String(64))
+    provider_trace_id: Mapped[str | None] = mapped_column(String(128))
+    usage: Mapped[dict[str, int] | None] = mapped_column(JSONB)
+    response_bytes: Mapped[int | None] = mapped_column(Integer)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    validation_error_code: Mapped[str | None] = mapped_column(String(64))

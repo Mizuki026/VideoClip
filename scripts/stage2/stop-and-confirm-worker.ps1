@@ -72,9 +72,16 @@ WITH stopped AS MATERIALIZED (
   UPDATE analysis_tasks t
   SET status = CASE WHEN t.status = 'running' THEN 'failed' ELSE t.status END,
       stage = CASE WHEN t.status = 'running' THEN 'failed' ELSE t.stage END,
+      summary_status = CASE WHEN t.summary_status = 'running' THEN 'failed' ELSE t.summary_status END,
       failure_code = CASE WHEN t.status = 'running' THEN COALESCE(t.failure_code, 'WORKER_STOPPED_OPERATOR') ELSE t.failure_code END,
       updated_at = now()
   FROM stopped s WHERE t.id = s.task_id RETURNING t.id
+), changed_summary_requests AS (
+  UPDATE summary_requests r
+  SET status = 'failed', error_code = 'WORKER_STOPPED_OPERATOR', finished_at = now()
+  FROM stopped s
+  WHERE r.execution_id = '$executionValue' AND r.status IN ('started', 'response_received')
+  RETURNING r.id
 )
 SELECT count(*) FROM stopped
 "@
