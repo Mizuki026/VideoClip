@@ -42,7 +42,7 @@ async function readResponse(response: Response): Promise<unknown> {
 
 export async function request<T>(
   path: string,
-  options: { method?: string; csrf?: string; body?: unknown; signal?: AbortSignal } = {},
+  options: { method?: string; csrf?: string; body?: unknown; signal?: AbortSignal; headers?: HeadersInit } = {},
 ): Promise<T> {
   const result = await requestResult<T>(path, options);
   return result.data;
@@ -50,9 +50,10 @@ export async function request<T>(
 
 export async function requestResult<T>(
   path: string,
-  options: { method?: string; csrf?: string; body?: unknown; signal?: AbortSignal } = {},
+  options: { method?: string; csrf?: string; body?: unknown; signal?: AbortSignal; headers?: HeadersInit } = {},
 ): Promise<{ status: number; data: T }> {
   const headers = new Headers({ Accept: 'application/json' });
+  new Headers(options.headers).forEach((value, key) => headers.set(key, value));
   if (options.csrf) headers.set('X-CSRF-Token', options.csrf);
   if (options.body !== undefined) headers.set('Content-Type', 'application/json');
 

@@ -13,6 +13,14 @@ import {
   requestResult,
 } from './api';
 import {
+  abandonUploadRecovery,
+  getUploadRecoveries,
+  runResumableUpload,
+  type UploadProgress,
+  type UploadRecovery,
+  uploadErrorMessage,
+} from './resumableUpload';
+import {
   errorMessage,
   formatBytes,
   formatDate,
@@ -36,11 +44,6 @@ interface SessionState {
   user: User | null;
   csrf: string;
   message: string | null;
-}
-
-interface UploadResponseBody {
-  video?: VideoDetail;
-  detail?: { code?: string } | string;
 }
 
 function apiMessage(error: unknown): string {
@@ -214,87 +217,97 @@ function AuthPage({
   );
 }
 
-function UploadPanel({ csrf, onUploaded, onExpired }: {
+function UploadPanel({ csrf, userId, onUploaded, onExpired }: {
   csrf: string;
+  userId: string;
   onUploaded: (video: VideoDetail) => void;
   onExpired: () => void;
 }) {
   const fileInput = useRef<HTMLInputElement>(null);
-  const xhrRef = useRef<XMLHttpRequest | null>(null);
+  const uploadAbortRef = useRef<AbortController | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [working, setWorking] = useState(false);
-  const [loaded, setLoaded] = useState(0);
-  const [total, setTotal] = useState<number | null>(null);
+  const [progress, setProgress] = useState<UploadProgress | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [recoveries, setRecoveries] = useState<UploadRecovery[]>(() => getUploadRecoveries(userId));
+  const [abandoning, setAbandoning] = useState<string | null>(null);
 
-  useEffect(() => () => xhrRef.current?.abort(), []);
+  useEffect(() => {
+    setRecoveries(getUploadRecoveries(userId));
+    return () => uploadAbortRef.current?.abort();
+  }, [userId]);
 
   function cancel() {
-    xhrRef.current?.abort();
-    xhrRef.current = null;
-    setWorking(false);
-    setFeedback('上传已中断。按后端规则，需要重新选择文件并从头上传。');
-    setLoaded(0);
-    setTotal(null);
+    uploadAbortRef.current?.abort();
+    setFeedback('正在暂停当前请求；临时会话会保留，重新选择原文件后可续传。');
   }
 
-  function upload() {
+  async function upload() {
     if (!file || !csrf || working) return;
+    const controller = new AbortController();
+    uploadAbortRef.current = controller;
     setWorking(true);
     setFeedback(null);
-    setLoaded(0);
-    setTotal(null);
-    const xhr = new XMLHttpRequest();
-    xhrRef.current = xhr;
-    xhr.open('POST', '/api/videos');
-    xhr.withCredentials = true;
-    xhr.setRequestHeader('X-CSRF-Token', csrf);
-    xhr.setRequestHeader('X-Video-Filename', encodeURIComponent(file.name));
-    xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
-    xhr.upload.addEventListener('progress', (event) => {
-      setLoaded(event.loaded);
-      setTotal(event.lengthComputable ? event.total : null);
-    });
-    xhr.addEventListener('load', () => {
-      xhrRef.current = null;
+    setProgress({ phase: 'hashing', processed: 0, total: file.size, confirmed: 0, requestSent: 0, requestTotal: 0 });
+    try {
+      const video = await runResumableUpload(
+        userId,
+        file,
+        csrf,
+        controller.signal,
+        setProgress,
+        () => setRecoveries(getUploadRecoveries(userId)),
+        () => setFeedback('所选文件与同名同大小的旧上传内容不同，不会接续旧会话；本次将作为新的上传。'),
+      );
+      setFile(null);
+      if (fileInput.current) fileInput.current.value = '';
+      setFeedback('服务端已完成媒体校验并登记视频。');
+      onUploaded(video);
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) onExpired();
+      else setFeedback(uploadErrorMessage(error));
+    } finally {
+      if (uploadAbortRef.current === controller) uploadAbortRef.current = null;
       setWorking(false);
-      const body = (() => {
-        try { return JSON.parse(xhr.responseText) as UploadResponseBody; } catch { return null; }
-      })();
-      if (xhr.status >= 200 && xhr.status < 300 && body?.video) {
-        setFile(null);
-        if (fileInput.current) fileInput.current.value = '';
-        setFeedback('上传完成，服务器已验证视频媒体信息。');
-        onUploaded(body.video);
-      } else if (xhr.status === 401) {
-        onExpired();
-      } else if (xhr.status === 403) {
-        setFeedback('安全校验失败，请刷新页面后重试。');
-      } else if (body?.detail === 'upload exceeded its total deadline' || xhr.status === 408) {
-        setFeedback('上传超时。请确认本机磁盘和服务状态后重新上传。');
-      } else if (xhr.status === 413) {
-        setFeedback('服务端拒绝了请求体。');
-      } else if (typeof body?.detail === 'object' && body.detail?.code) {
-        setFeedback(errorMessage(body.detail.code) ?? `服务器拒绝了视频（${body.detail.code}）。`);
-      } else if (xhr.status >= 500) {
-        setFeedback('服务器无法完成视频保存或媒体校验，请检查 Stage 2 服务和本机数据目录。');
-      } else {
-        setFeedback(`服务器拒绝了视频（HTTP ${xhr.status}）。请检查文件格式、音轨和 20 分钟时长限制。`);
-      }
-    });
-    xhr.addEventListener('error', () => {
-      xhrRef.current = null;
-      setWorking(false);
-      setFeedback('网络中断，上传未完成。按后端规则，需要重新上传整个文件。');
-    });
-    xhr.addEventListener('abort', () => {
-      xhrRef.current = null;
-      setWorking(false);
-    });
-    xhr.send(file);
+      setRecoveries(getUploadRecoveries(userId));
+    }
   }
 
-  const percent = total && total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : null;
+  async function abandon(recovery: UploadRecovery) {
+    if (working || abandoning) return;
+    const controller = new AbortController();
+    setAbandoning(recovery.idempotencyKey);
+    setFeedback(null);
+    try {
+      const result = await abandonUploadRecovery(
+        userId,
+        recovery.idempotencyKey,
+        csrf,
+        controller.signal,
+        () => setRecoveries(getUploadRecoveries(userId)),
+      );
+      setFeedback(result === 'pending'
+        ? '放弃请求已受理，服务端仍待完成临时文件清理；该记录会保留以便安全重试。'
+        : '临时上传已清理。');
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) onExpired();
+      else setFeedback(uploadErrorMessage(error));
+    } finally {
+      setAbandoning(null);
+      setRecoveries(getUploadRecoveries(userId));
+    }
+  }
+
+  const phaseLabels: Record<UploadProgress['phase'], string> = {
+    hashing: '正在计算文件摘要',
+    creating: '正在准备上传会话',
+    checking: '正在查询服务端确认偏移',
+    transferring: '正在传输当前分片',
+    completing: '分片已确认，服务端正在校验并登记视频',
+  };
+  const confirmedPercent = progress && progress.total > 0
+    ? Math.min(100, Math.round((progress.confirmed / progress.total) * 100))
+    : 0;
 
   return (
     <section className="upload-panel" aria-labelledby="upload-title">
@@ -302,7 +315,7 @@ function UploadPanel({ csrf, onUploaded, onExpired }: {
         <span className="section-label">ADD A VIDEO</span>
         <h2 id="upload-title">把一堂课放进来</h2>
         <p>使用原始文件上传。可播放格式为 MP4、H.264 视频与 AAC 音轨，时长不超过 20 分钟。</p>
-        <p className="subtle-note">文件大小由磁盘和服务端写入能力决定，本页面不设字节数门槛。上传中断后需重新上传。</p>
+        <p className="subtle-note">文件大小由磁盘和服务端写入能力决定，本页面不设字节数门槛。中断后重新选择相同文件，会先核对摘要并按服务端确认偏移续传。</p>
       </div>
       <div className="upload-actions">
         <input
@@ -311,25 +324,48 @@ function UploadPanel({ csrf, onUploaded, onExpired }: {
           id="video-file"
           type="file"
           accept="video/mp4,.mp4"
+          disabled={working || abandoning !== null}
           onChange={(event) => { setFile(event.target.files?.[0] ?? null); setFeedback(null); }}
         />
         <label className="button button-outline choose-file" htmlFor="video-file">
           <span aria-hidden="true">＋</span>{file ? '更换文件' : '选择视频文件'}
         </label>
         {file && <div className="selected-file"><strong>{file.name}</strong><span>{formatBytes(file.size)}</span></div>}
-        {working ? (
+        {working && progress ? (
           <div className="upload-progress" aria-live="polite">
             <div className="progress-copy">
-              <span>{percent === null ? `已发送 ${formatBytes(loaded)}` : `正在上传 ${percent}%`}</span>
-              {total !== null && <span>{formatBytes(loaded)} / {formatBytes(total)}</span>}
+              <span>{phaseLabels[progress.phase]}</span>
+              <span>服务端已确认 {formatBytes(progress.confirmed)} / {formatBytes(progress.total)}</span>
             </div>
-            {percent === null ? <div className="progress-indeterminate" /> : <progress max={100} value={percent} />}
-            <button className="text-button" type="button" onClick={cancel}>取消上传</button>
+            <progress max={100} value={confirmedPercent} aria-label="服务端已确认上传进度" />
+            {progress.phase === 'hashing' && <small>摘要计算：{formatBytes(progress.processed)} / {formatBytes(progress.total)}</small>}
+            {progress.phase === 'transferring' && progress.requestTotal > 0 && (
+              <small>当前请求已发送 {formatBytes(progress.requestSent)} / {formatBytes(progress.requestTotal)}</small>
+            )}
+            <button className="text-button" type="button" onClick={cancel}>暂停上传</button>
           </div>
         ) : (
-          <button className="button button-primary" type="button" onClick={upload} disabled={!file || !csrf}>
-            上传视频 <span aria-hidden="true">↑</span>
+          <button className="button button-primary" type="button" onClick={() => void upload()} disabled={!file || !csrf || abandoning !== null}>
+            上传 / 继续上传 <span aria-hidden="true">↑</span>
           </button>
+        )}
+        {recoveries.length > 0 && (
+          <div className="recovery-list" aria-label="待恢复的临时上传">
+            <p>此账户有 {recoveries.length} 个临时上传。选择原文件并点击“上传 / 继续上传”后，页面会校验完整摘要。</p>
+            {recoveries.map((recovery) => (
+              <div className="recovery-item" key={recovery.idempotencyKey}>
+                <span>{recovery.fileName} · {formatBytes(recovery.totalBytes)}</span>
+                <button
+                  className="text-button"
+                  type="button"
+                  onClick={() => void abandon(recovery)}
+                  disabled={working || abandoning !== null}
+                >
+                  {abandoning === recovery.idempotencyKey ? '正在放弃…' : '放弃临时上传'}
+                </button>
+              </div>
+            ))}
+          </div>
         )}
         {feedback && <p className="form-feedback" role="status" aria-live="polite">{feedback}</p>}
       </div>
@@ -376,7 +412,7 @@ function useDeletionPolling(
   return read;
 }
 
-function VideoLibrary({ csrf, onExpired, username, onLogout }: { csrf: string; onExpired: () => void; username: string; onLogout: () => void }) {
+function VideoLibrary({ csrf, userId, onExpired, username, onLogout }: { csrf: string; userId: string; onExpired: () => void; username: string; onLogout: () => void }) {
   const [videos, setVideos] = useState<VideoSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadingError, setLoadingError] = useState<string | null>(null);
@@ -453,6 +489,7 @@ function VideoLibrary({ csrf, onExpired, username, onLogout }: { csrf: string; o
         </div>
         <UploadPanel
           csrf={csrf}
+          userId={userId}
           onExpired={onExpired}
           onUploaded={(video) => { window.location.assign(`/videos/${encodeURIComponent(video.id)}`); }}
         />
@@ -946,6 +983,7 @@ function EmptyInline({ title, body }: { title: string; body: string }) {
 
 export default function App() {
   const [session, setSession] = useState<SessionState>({ user: null, csrf: '', message: null });
+  const [uploadSessionEpoch, setUploadSessionEpoch] = useState(0);
   const [booting, setBooting] = useState(true);
   const [bootError, setBootError] = useState<string | null>(null);
   const [pathname, setPathname] = useState(window.location.pathname);
@@ -978,6 +1016,7 @@ export default function App() {
   }, []);
 
   const sessionExpired = useCallback(() => {
+    setUploadSessionEpoch((value) => value + 1);
     setSession({ user: null, csrf: '', message: '登录状态已失效，请重新登录。' });
     window.history.replaceState(null, '', '/');
     setPathname('/');
@@ -994,6 +1033,7 @@ export default function App() {
   }, []);
 
   const logout = useCallback(async () => {
+    setUploadSessionEpoch((value) => value + 1);
     try {
       await request<void>('/auth/logout', { method: 'POST', csrf: session.csrf });
       const csrf = await getCsrfToken().catch(() => ({ csrf_token: '' }));
@@ -1016,8 +1056,8 @@ export default function App() {
     return <AuthPage csrf={session.csrf} notice={session.message ?? bootError} onAuthenticated={authenticated} onCsrf={(csrf) => setSession((current) => ({ ...current, csrf }))} />;
   }
   return videoId ? (
-    <VideoDetailPage key={videoId} videoId={videoId} csrf={session.csrf} onExpired={sessionExpired} username={session.user.username} onLogout={() => void logout()} />
+    <VideoDetailPage key={`${videoId}:${uploadSessionEpoch}`} videoId={videoId} csrf={session.csrf} onExpired={sessionExpired} username={session.user.username} onLogout={() => void logout()} />
   ) : (
-    <VideoLibrary key={session.user.id} csrf={session.csrf} onExpired={sessionExpired} username={session.user.username} onLogout={() => void logout()} />
+    <VideoLibrary key={`${session.user.id}:${uploadSessionEpoch}`} csrf={session.csrf} userId={session.user.id} onExpired={sessionExpired} username={session.user.username} onLogout={() => void logout()} />
   );
 }

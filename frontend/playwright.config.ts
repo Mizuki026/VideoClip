@@ -1,6 +1,9 @@
 import { defineConfig, devices } from '@playwright/test';
+import { randomUUID } from 'node:crypto';
 
 const browserMode = process.env.MVP_WEB_MODE ?? 'preview';
+const outputDir = process.env.MVP_PLAYWRIGHT_OUTPUT_DIR
+  ?? `../data/mvp-stage-2/acceptance/playwright-run-${Date.now()}-${process.pid}-${randomUUID()}`;
 
 export default defineConfig({
   testDir: './e2e',
@@ -9,7 +12,7 @@ export default defineConfig({
   timeout: 30_000,
   expect: { timeout: 10_000 },
   reporter: 'list',
-  outputDir: './test-results',
+  outputDir,
   webServer: {
     command: browserMode === 'dev' ? 'npm run dev' : 'npm run preview',
     url: 'http://127.0.0.1:5174',
