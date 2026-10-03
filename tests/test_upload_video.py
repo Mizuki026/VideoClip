@@ -146,6 +146,75 @@ def test_raw_stream_upload_is_owner_scoped_and_supports_head_and_ranges(
             assert session.scalars(select(CleanupIntent)).all() == []
 
 
+def test_disconnected_video_stream_closes_open_media_file(
+    session_factory: sessionmaker[Session], test_settings: Settings, tmp_path: Path, valid_mp4: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    from uuid import UUID
+
+    from starlette.requests import ClientDisconnect, Request
+
+    store = MediaStore(tmp_path / "disconnect-stream-media")
+    app = create_app(test_settings, session_factory, store)
+    with TestClient(app) as client:
+        _new_account(client, "disconnect-stream-owner")
+        response, _ = _upload(client, valid_mp4)
+        assert response.status_code == 201, response.text
+        video_id = UUID(response.json()["video"]["id"])
+        with session_factory() as session:
+            video = session.get(Video, video_id)
+            assert video is not None
+            media_path = store.target_path(video.storage_name)
+
+        original_open = Path.open
+        opened_files = []
+
+        def track_open(path: Path, *args, **kwargs):
+            opened = original_open(path, *args, **kwargs)
+            if path == media_path:
+                opened_files.append(opened)
+            return opened
+
+        monkeypatch.setattr(Path, "open", track_open)
+        route = next(
+            route
+            for route in app.routes
+            if getattr(route, "path", None) == "/videos/{video_id}/content"
+        )
+        cookie = "; ".join(f"{name}={value}" for name, value in client.cookies.items())
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": f"/videos/{video_id}/content",
+            "raw_path": f"/videos/{video_id}/content".encode(),
+            "query_string": b"",
+            "root_path": "",
+            "headers": [(b"cookie", cookie.encode())],
+            "client": ("127.0.0.1", 43210),
+            "server": ("127.0.0.1", 58001),
+            "app": app,
+        }
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            if message["type"] == "http.response.body" and message.get("body"):
+                raise OSError("client disconnected")
+
+        request = Request(scope, receive)
+        streaming_response = route.endpoint(video_id, request, None)
+        with pytest.raises(ClientDisconnect):
+            asyncio.run(streaming_response(scope, receive, send))
+
+        assert len(opened_files) == 1
+        assert opened_files[0].closed
+
+
 def test_upload_ignores_declared_content_length_and_persists_across_app_restart(
     session_factory: sessionmaker[Session], test_settings: Settings, tmp_path: Path, valid_mp4: Path
 ) -> None:

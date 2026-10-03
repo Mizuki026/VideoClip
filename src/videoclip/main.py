@@ -8,7 +8,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import BinaryIO, Literal
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
@@ -86,6 +86,26 @@ from videoclip.storage import MediaStore
 logger = logging.getLogger("videoclip.api")
 SESSION_COOKIE = "videoclip_session"
 CSRF_COOKIE = "videoclip_csrf"
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    def __init__(
+        self,
+        content: Iterator[bytes],
+        source: BinaryIO,
+        *,
+        status_code: int,
+        media_type: str,
+        headers: dict[str, str],
+    ) -> None:
+        super().__init__(content, status_code=status_code, media_type=media_type, headers=headers)
+        self._source = source
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._source.close()
 
 
 class JsonBodyLimitMiddleware:
@@ -796,8 +816,12 @@ def create_app(
                 source.close()
 
         headers["Content-Length"] = str(content_length)
-        return StreamingResponse(
-            file_chunks(), status_code=response_status, media_type="video/mp4", headers=headers
+        return _ClosingStreamingResponse(
+            file_chunks(),
+            source,
+            status_code=response_status,
+            media_type="video/mp4",
+            headers=headers,
         )
 
     @app.delete("/videos/{video_id}")
