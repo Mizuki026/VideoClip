@@ -1,8 +1,138 @@
+import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { resolve } from 'node:path';
 import { expect, test } from '@playwright/test';
 
 const sourceVideo = process.env.MVP_ACCEPTANCE_VIDEO;
 const uuidPattern = /[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/gi;
+const repoRoot = resolve(process.cwd(), '..');
+const generatedAccounts = new Map<string, string>();
+
+type TaskState = {
+  status: string;
+  summary_status: string;
+  execution_stop_confirmed: boolean | null;
+  recovery_eligible: boolean;
+  current_attempt_id: string;
+  completed_segments: number;
+  expected_segments: number;
+  asr_request_count: number;
+  asr_elapsed_seconds: number;
+  reused_segments: number;
+  attempt: { id: string; parent_attempt_id: string | null; execution_mode: string };
+};
+
+function stage2Command(...args: string[]): string {
+  return execFileSync(
+    'docker',
+    [
+      'compose', '--env-file', 'data/mvp-stage-2/.env', '-p', 'videoclip-mvp-stage2',
+      '-f', 'compose.yaml', ...args,
+    ],
+    { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+  ).trim();
+}
+
+function readSummaryRequestAudit(taskId: string) {
+  if (!/^[0-9a-f-]{36}$/i.test(taskId)) throw new Error('Invalid task identifier for acceptance audit.');
+  const sql = `SELECT concat_ws('|', count(*)::text, coalesce(round(sum(elapsed_seconds)::numeric, 3)::text, '0'), coalesce(string_agg(status, ',' ORDER BY started_at), ''), coalesce(max(model), ''), coalesce(max(prompt_version), '')) FROM summary_requests WHERE task_id = '${taskId}'::uuid`;
+  const output = stage2Command(
+    'exec', '-T', 'postgres', 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-qAt',
+    '-U', 'videoclip_stage2', '-d', 'videoclip_mvp_stage2', '-c', sql,
+  );
+  const [count, elapsed, statuses, model, promptVersion] = output.split('|');
+  return {
+    count: Number(count),
+    elapsedSeconds: Number(elapsed),
+    statuses: statuses ? statuses.split(',') : [],
+    model,
+    promptVersion,
+  };
+}
+
+async function readTask(page: import('@playwright/test').Page, videoId: string, taskId: string): Promise<TaskState> {
+  return page.evaluate(async ({ id, analysisId }) => {
+    const response = await fetch(`/api/videos/${id}/tasks/${analysisId}`, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`Task read failed with HTTP ${response.status}.`);
+    return await response.json() as TaskState;
+  }, { id: videoId, analysisId: taskId });
+}
+
+async function waitForStage2Health(): Promise<void> {
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch('http://127.0.0.1:58002/health', { signal: AbortSignal.timeout(2_000) });
+      if (response.status === 200) return;
+    } catch {
+      // The API container may need a few seconds to restart.
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 1_000));
+  }
+  throw new Error('Stage 2 API did not become healthy after the acceptance restart.');
+}
+
+async function cleanupGeneratedAccount(page: import('@playwright/test').Page, username: string, password: string): Promise<void> {
+  await page.context().clearCookies();
+  await loginAccount(page, username, password);
+  const videos = await page.evaluate(async () => {
+    const response = await fetch('/api/videos', { cache: 'no-store' });
+    if (!response.ok) throw new Error(`Test-account video list failed with HTTP ${response.status}.`);
+    return (await response.json() as { items: Array<{ id: string }> }).items;
+  });
+  for (const video of videos) {
+    const initial = await page.evaluate(async (id) => {
+      const csrf = await (await fetch('/api/auth/csrf', { cache: 'no-store' })).json() as { csrf_token: string };
+      const response = await fetch(`/api/videos/${id}`, {
+        method: 'DELETE', headers: { 'X-CSRF-Token': csrf.csrf_token },
+      });
+      return response.status;
+    }, video.id);
+    if (![202, 204, 404].includes(initial)) throw new Error(`Test video deletion returned HTTP ${initial}.`);
+    if (initial === 202) {
+      let deleted = false;
+      for (let attempt = 0; attempt < 300; attempt += 1) {
+        const state = await page.evaluate(async (id) => {
+          const response = await fetch(`/api/videos/${id}/deletion`, { cache: 'no-store' });
+          if (response.status === 404) return 'deleted';
+          if (!response.ok) throw new Error(`Deletion progress returned HTTP ${response.status}.`);
+          return (await response.json() as { state: string }).state;
+        }, video.id);
+        if (state === 'deleted') { deleted = true; break; }
+        if (state === 'cleanup_failed') {
+          const retry = await page.evaluate(async (id) => {
+            const csrf = await (await fetch('/api/auth/csrf', { cache: 'no-store' })).json() as { csrf_token: string };
+            return (await fetch(`/api/videos/${id}`, {
+              method: 'DELETE', headers: { 'X-CSRF-Token': csrf.csrf_token },
+            })).status;
+          }, video.id);
+          if (![202, 204, 404].includes(retry)) throw new Error(`Test video cleanup retry returned HTTP ${retry}.`);
+        }
+        await page.waitForTimeout(2_000);
+      }
+      if (!deleted) throw new Error('Test video deletion did not complete safely; the task data was retained.');
+    }
+  }
+  await page.context().clearCookies();
+  const python = resolve(repoRoot, 'data', 'mvp-stage-2', '.venv', 'Scripts', 'python.exe');
+  execFileSync(python, [
+    'scripts/stage2/stage5-recovery-fixture.py', 'cleanup-account', '--username', username,
+  ], {
+    cwd: repoRoot,
+    env: { ...process.env, DB_HOST: '127.0.0.1', DB_PORT: '55443', PYTHONPATH: resolve(repoRoot, 'src') },
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+test.afterEach(async ({ page, baseURL }) => {
+  if (!baseURL) return;
+  for (const [username, password] of generatedAccounts) {
+    await page.goto(baseURL);
+    await cleanupGeneratedAccount(page, username, password);
+  }
+  generatedAccounts.clear();
+});
 
 function responsePath(path: string): string {
   return path.replace(uuidPattern, '{id}');
@@ -19,6 +149,7 @@ function citationSeconds(label: string): number | null {
 }
 
 async function createAccount(page: import('@playwright/test').Page, username: string, password: string) {
+  generatedAccounts.set(username, password);
   await page.goto('/');
   await expect(page.getByRole('heading', { name: '欢迎回来' })).toBeVisible();
   await page.getByRole('button', { name: '创建账户', exact: true }).click();
@@ -45,8 +176,8 @@ test('same-origin registration, raw upload, real processing, playback, account i
   expect(baseURL).toBe('http://127.0.0.1:5174');
 
   const entropy = randomBytes(6).toString('hex');
-  const primaryUser = `stage5-${entropy}`;
-  const secondaryUser = `stage5-other-${entropy}`;
+  const primaryUser = `stage5fixture-${entropy}`;
+  const secondaryUser = `stage5fixture-${randomBytes(6).toString('hex')}`;
   const password = `VideoClip-${randomBytes(16).toString('hex')}!`;
   const requests: Array<{ path: string; method: string; status: number; contentType: string; origin: string | null; csrfPresent: boolean; cookiePresent: boolean }> = [];
   const sessionCookieWasHttpOnly: boolean[] = [];
@@ -132,12 +263,121 @@ test('same-origin registration, raw upload, real processing, playback, account i
   expect(['awaiting_summary', 'succeeded']).toContain(checkpoint.body.status);
   expect(checkpoint.body.completed_segments).toBe(checkpoint.body.expected_segments);
   await expect(page.locator('.transcript-row').first()).toBeVisible();
-  if (checkpoint.body.status === 'awaiting_summary') {
-    await page.getByRole('button', { name: '继续生成总结' }).click();
+  const summaryDeadline = Date.now() + 18 * 60_000;
+  let recoveredSummaryAttempts = 0;
+  let summaryStarted = false;
+  let finalTask = await readTask(page, videoId, task.id);
+  while (finalTask.status !== 'succeeded' || finalTask.summary_status !== 'succeeded') {
+    if (Date.now() >= summaryDeadline) throw new Error('Summary acceptance exceeded its bounded deadline.');
+    if (finalTask.status === 'awaiting_summary' && finalTask.summary_status === 'waiting') {
+      if (!summaryStarted) {
+        await page.getByRole('button', { name: '继续生成总结' }).click();
+        summaryStarted = true;
+      }
+    } else if (finalTask.status === 'failed' && finalTask.summary_status === 'failed') {
+      if (finalTask.execution_stop_confirmed !== true) {
+        await page.waitForTimeout(2_000);
+        finalTask = await readTask(page, videoId, task.id);
+        continue;
+      }
+      const audit = readSummaryRequestAudit(task.id);
+      expect(audit.count).toBeLessThanOrEqual(3);
+      expect(finalTask.execution_stop_confirmed).toBe(true);
+      if (audit.count >= 3 || !finalTask.recovery_eligible) {
+        throw new Error(`Summary recovery stopped safely at ${audit.count} task-level requests.`);
+      }
+      const parentAttemptId = finalTask.current_attempt_id;
+      await page.reload();
+      await expect(page.getByRole('button', { name: '手动恢复分析' })).toBeVisible({ timeout: 15_000 });
+      await page.getByRole('button', { name: '手动恢复分析' }).click();
+      await expect.poll(async () => (await readTask(page, videoId, task.id)).current_attempt_id, { timeout: 30_000 })
+        .not.toBe(parentAttemptId);
+      const child = await readTask(page, videoId, task.id);
+      expect(child.attempt.parent_attempt_id).toBe(parentAttemptId);
+      expect(child.attempt.execution_mode).toBe('summary_only');
+      recoveredSummaryAttempts += 1;
+      summaryStarted = true;
+    } else if (finalTask.status !== 'queued' && finalTask.status !== 'running') {
+      throw new Error(`Summary stopped in ${finalTask.status}:${finalTask.summary_status}.`);
+    }
+    await page.waitForTimeout(2_000);
+    finalTask = await readTask(page, videoId, task.id);
   }
-  await expect(page.getByRole('heading', { name: '课程总结' })).toBeVisible({ timeout: 1_500_000 });
+  await expect(page.getByRole('heading', { name: '课程总结' })).toBeVisible({ timeout: 30_000 });
+
+  const summaryAudit = readSummaryRequestAudit(task.id);
+  expect(summaryAudit.count).toBeGreaterThan(0);
+  expect(summaryAudit.count).toBeLessThanOrEqual(3);
+  expect(summaryAudit.statuses.at(-1)).toBe('succeeded');
+  expect(summaryAudit.model).toBe('Qwen/Qwen3.5-4B');
+  expect(summaryAudit.promptVersion).toBe('stage0-summary-v4');
+  if (recoveredSummaryAttempts > 0) {
+    expect(finalTask.asr_request_count).toBe(0);
+    expect(finalTask.reused_segments).toBe(finalTask.expected_segments);
+  }
+
+  const citationAudit = await page.evaluate(async (id) => {
+    const [summaryResponse, transcriptResponse] = await Promise.all([
+      fetch(`/api/videos/${id}/summary`, { cache: 'no-store' }),
+      fetch(`/api/videos/${id}/transcript`, { cache: 'no-store' }),
+    ]);
+    if (!summaryResponse.ok || !transcriptResponse.ok) throw new Error('Published result readback failed.');
+    const summary = await summaryResponse.json() as {
+      payload: { chapters: Array<{ evidence: Array<{ segment_id: number; quote: string; start_seconds: number; end_seconds: number }> }>; key_points: Array<{ evidence: Array<{ segment_id: number; quote: string; start_seconds: number; end_seconds: number }> }> };
+    };
+    const transcript = await transcriptResponse.json() as {
+      items: Array<{ segment_number: number; text: string | null; video_start_seconds: number; video_end_seconds: number }>;
+    };
+    const bySegment = new Map(transcript.items.map((item) => [item.segment_number, item]));
+    const evidence = [...summary.payload.chapters, ...summary.payload.key_points].flatMap((item) => item.evidence);
+    const normalize = (value: string) => value.normalize('NFKC').toLowerCase().replace(/\s+/gu, '');
+    const quoteMatches = evidence.filter((item) => {
+      const source = bySegment.get(item.segment_id)?.text;
+      return source !== undefined && source !== null && normalize(source).includes(normalize(item.quote));
+    }).length;
+    const timeMatches = evidence.filter((item) => {
+      const source = bySegment.get(item.segment_id);
+      return source !== undefined && item.start_seconds === source.video_start_seconds && item.end_seconds === source.video_end_seconds;
+    }).length;
+    return {
+      chapters: summary.payload.chapters.length,
+      keyPoints: summary.payload.key_points.length,
+      citations: evidence.length,
+      quoteMatches,
+      timeMatches,
+    };
+  }, videoId);
+  expect(citationAudit.citations).toBeGreaterThan(0);
+  expect(citationAudit.quoteMatches).toBe(citationAudit.citations);
+  expect(citationAudit.timeMatches).toBe(citationAudit.citations);
+
+  if (process.env.MVP_STAGE6_RESTART_SERVICES === '1') {
+    const persisted = await readTask(page, videoId, task.id);
+    expect(persisted.status).toBe('succeeded');
+    expect(persisted.execution_stop_confirmed).toBe(true);
+    stage2Command('restart', '--timeout', '30', 'api', 'worker');
+    await waitForStage2Health();
+  }
   await page.reload();
   await expect(page.getByRole('heading', { name: '课程总结' })).toBeVisible({ timeout: 30_000 });
+  const taskAfterReload = await readTask(page, videoId, task.id);
+  expect(taskAfterReload.status).toBe('succeeded');
+  expect(taskAfterReload.completed_segments).toBe(taskAfterReload.expected_segments);
+  expect(taskAfterReload.execution_stop_confirmed).toBe(true);
+  console.log(`stage6_browser_audit=${JSON.stringify({
+    asrRequests: taskAfterReload.asr_request_count,
+    asrElapsedSeconds: Number(taskAfterReload.asr_elapsed_seconds.toFixed(3)),
+    completedSegments: taskAfterReload.completed_segments,
+    summaryRequests: summaryAudit.count,
+    summaryElapsedSeconds: summaryAudit.elapsedSeconds,
+    summaryStatuses: summaryAudit.statuses,
+    model: summaryAudit.model,
+    promptVersion: summaryAudit.promptVersion,
+    recoveredSummaryAttempts,
+    reusedSegments: taskAfterReload.reused_segments,
+    ...citationAudit,
+    apiWorkerRestartReadback: process.env.MVP_STAGE6_RESTART_SERVICES === '1',
+  })}`);
   const citeButtons = page.locator('button.cite-button');
   await expect(citeButtons.first()).toBeVisible();
   const labels = await citeButtons.evaluateAll((buttons) => buttons.map((button) => button.getAttribute('aria-label') ?? ''));
@@ -186,8 +426,15 @@ test('same-origin registration, raw upload, real processing, playback, account i
   await page.context().clearCookies();
   await page.reload();
   await expect(page.getByRole('heading', { name: '欢迎回来' })).toBeVisible({ timeout: 20_000 });
-  await expect(page.getByText('登录状态已失效，请重新登录。')).toBeVisible();
   await expect(page.locator('video')).toHaveCount(0);
+  const expiredSessionStatus = await page.evaluate(async (id) => {
+    const [me, content] = await Promise.all([
+      fetch('/api/auth/me', { cache: 'no-store' }),
+      fetch(`/api/videos/${id}/content`, { headers: { Range: 'bytes=0-0' }, cache: 'no-store' }),
+    ]);
+    return { me: me.status, content: content.status };
+  }, videoId);
+  expect(expiredSessionStatus).toEqual({ me: 401, content: 401 });
   await loginAccount(page, primaryUser, password);
   await page.goto(`/videos/${videoId}`);
   await expect(page.locator('video')).toBeVisible({ timeout: 20_000 });
