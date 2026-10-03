@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from videoclip.models import CleanupIntent, UploadHandoff, Video
+from videoclip.resumable_uploads import recover_resumable_uploads_on_startup
 from videoclip.services import (
     _intent_for_upload,
     db_transaction,
@@ -172,11 +173,15 @@ def _recover_one(
 
 def recover_interrupted_work(factory: sessionmaker[Session], settings: Settings, store: MediaStore) -> None:
     store.prepare()
+    recover_resumable_uploads_on_startup(factory, store)
     with factory() as session:
         pending_upload_ids = list(
             session.scalars(
                 select(UploadHandoff.id)
-                .where(UploadHandoff.state != "complete")
+                .where(
+                    UploadHandoff.protocol_type == "ordinary",
+                    UploadHandoff.state != "complete",
+                )
                 .order_by(UploadHandoff.created_at)
             )
         )

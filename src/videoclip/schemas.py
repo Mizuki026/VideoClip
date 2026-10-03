@@ -55,6 +55,56 @@ class UploadResponse(BaseModel):
     video: VideoDetailResponse
 
 
+class ResumableUploadCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=False)
+
+    file_name: str = Field(min_length=1, max_length=2048)
+    total_bytes: int = Field(gt=0, le=9_223_372_036_854_775_807)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ResumableUploadCreateResponse(BaseModel):
+    upload_id: UUID
+    state: str
+    chunk_size: int
+    total_bytes: int
+    confirmed_offset: int
+    expires_at: datetime
+    replayed: bool
+
+
+class UploadChunkSummary(BaseModel):
+    chunk_index: int
+    byte_offset: int
+    byte_count: int
+    sha256: str
+
+
+class ResumableUploadStatusResponse(BaseModel):
+    upload_id: UUID
+    state: str
+    chunk_size: int
+    total_bytes: int
+    confirmed_offset: int
+    next_chunk_index: int
+    expires_at: datetime
+    chunks: list[UploadChunkSummary]
+    error_code: str | None
+    video_id: UUID | None
+
+
+class UploadChunkResponse(BaseModel):
+    upload_id: UUID
+    state: str
+    chunk_index: int
+    byte_offset: int
+    byte_count: int
+    sha256: str
+    confirmed_offset: int
+    expires_at: datetime
+    replayed: bool
+
+
 class AnalysisAttemptResponse(BaseModel):
     id: UUID
     attempt_number: int

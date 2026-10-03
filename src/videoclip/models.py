@@ -56,7 +56,9 @@ class UploadHandoff(Base):
     __tablename__ = "upload_handoffs"
     __table_args__ = (
         Index("ix_upload_handoffs_state_created", "state", "created_at"),
+        Index("ix_upload_handoffs_protocol_expiry", "protocol_type", "expires_at", "state"),
         UniqueConstraint("writer_id", name="uq_upload_handoffs_writer"),
+        UniqueConstraint("owner_id", "idempotency_key", name="uq_upload_handoffs_owner_idempotency"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -73,10 +75,41 @@ class UploadHandoff(Base):
     media_info: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     duration_seconds: Mapped[float | None] = mapped_column()
     error_code: Mapped[str | None] = mapped_column(String(64))
+    protocol_type: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="ordinary", server_default=text("'ordinary'")
+    )
+    declared_total_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    expected_content_sha256: Mapped[str | None] = mapped_column(String(64))
+    confirmed_offset: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    idempotency_key: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class UploadChunk(Base):
+    __tablename__ = "upload_chunks"
+    __table_args__ = (
+        UniqueConstraint("upload_id", "chunk_index", name="uq_upload_chunks_upload_index"),
+        CheckConstraint("chunk_index >= 0", name="ck_upload_chunks_index_nonnegative"),
+        CheckConstraint("byte_offset >= 0", name="ck_upload_chunks_offset_nonnegative"),
+        CheckConstraint("byte_count > 0", name="ck_upload_chunks_length_positive"),
+        Index("ix_upload_chunks_upload_offset", "upload_id", "byte_offset"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    upload_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("upload_handoffs.id", ondelete="CASCADE"), nullable=False
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    byte_offset: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    byte_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class Video(Base):

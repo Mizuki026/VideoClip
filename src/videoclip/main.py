@@ -33,6 +33,14 @@ from videoclip.celery_app import celery_app
 from videoclip.db import check_database, create_database_engine, create_session_factory
 from videoclip.models import AnalysisAttempt, AnalysisExecution, SessionRecord, User, Video
 from videoclip.recovery import recover_interrupted_work
+from videoclip.resumable_uploads import (
+    CHUNK_SIZE,
+    abandon_upload_session,
+    complete_upload_session,
+    create_upload_session,
+    get_upload_status,
+    write_upload_chunk,
+)
 from videoclip.schemas import (
     AnalysisSummaryResponse,
     AnalysisTaskResponse,
@@ -42,7 +50,12 @@ from videoclip.schemas import (
     LoginRequest,
     RecoveryRequest,
     RegisterRequest,
+    ResumableUploadCreateRequest,
+    ResumableUploadCreateResponse,
+    ResumableUploadStatusResponse,
     TranscriptResponse,
+    UploadChunkResponse,
+    UploadChunkSummary,
     UploadResponse,
     UserResponse,
     VideoDeletionProgress,
@@ -309,7 +322,9 @@ def create_app(
     app.add_middleware(JsonBodyLimitMiddleware, max_bytes=resolved_settings.max_json_body_bytes)
 
     @app.exception_handler(RequestValidationError)
-    async def invalid_request(_: Request, __: RequestValidationError) -> JSONResponse:
+    async def invalid_request(request: Request, __: RequestValidationError) -> JSONResponse:
+        if request.url.path.startswith("/uploads"):
+            return JSONResponse({"detail": {"code": "INVALID_UPLOAD_METADATA"}}, status_code=422)
         return JSONResponse({"detail": "invalid request"}, status_code=422)
 
     @app.exception_handler(Exception)
@@ -452,6 +467,103 @@ def create_app(
             request, resolved_factory, resolved_settings, resolved_store, user.id
         )
         return UploadResponse(video=_video_detail(video))
+
+    @app.post("/uploads", status_code=201, response_model=ResumableUploadCreateResponse)
+    def create_resumable_upload(
+        payload: ResumableUploadCreateRequest,
+        request: Request,
+        response: Response,
+    ) -> ResumableUploadCreateResponse:
+        current = _current_auth(request, resolved_factory)
+        _require_csrf(request, resolved_settings, resolved_factory, current)
+        assert current is not None
+        user, _ = current
+        result = create_upload_session(
+            resolved_factory,
+            user.id,
+            payload.file_name,
+            payload.total_bytes,
+            payload.sha256,
+            request.headers.get("idempotency-key", ""),
+        )
+        upload_id, state, total_bytes, confirmed_offset, expires_at, replayed = result
+        response.status_code = 200 if replayed else 201
+        response.headers["Cache-Control"] = "no-store"
+        return ResumableUploadCreateResponse(
+            upload_id=upload_id,
+            state=state,
+            chunk_size=CHUNK_SIZE,
+            total_bytes=total_bytes,
+            confirmed_offset=confirmed_offset,
+            expires_at=expires_at,
+            replayed=replayed,
+        )
+
+    @app.get("/uploads/{upload_id}", response_model=ResumableUploadStatusResponse)
+    def resumable_upload_status(upload_id: uuid.UUID, request: Request) -> ResumableUploadStatusResponse:
+        user, _ = _current_auth(request, resolved_factory) or _raise_auth()
+        data = get_upload_status(resolved_factory, resolved_store, user.id, upload_id)
+        return ResumableUploadStatusResponse(
+            upload_id=data["upload_id"],
+            state=data["state"],
+            chunk_size=data["chunk_size"],
+            total_bytes=data["total_bytes"],
+            confirmed_offset=data["confirmed_offset"],
+            next_chunk_index=data["next_chunk_index"],
+            expires_at=data["expires_at"],
+            chunks=[UploadChunkSummary(**chunk) for chunk in data["chunks"]],
+            error_code=data["error_code"],
+            video_id=data["video_id"],
+        )
+
+    @app.put("/uploads/{upload_id}/chunks/{chunk_index}", response_model=UploadChunkResponse)
+    async def resumable_upload_chunk(
+        upload_id: uuid.UUID, chunk_index: int, request: Request
+    ) -> UploadChunkResponse:
+        current = _current_auth(request, resolved_factory)
+        _require_csrf(request, resolved_settings, resolved_factory, current)
+        assert current is not None
+        user, _ = current
+        result = await write_upload_chunk(
+            request,
+            resolved_factory,
+            resolved_store,
+            user.id,
+            upload_id,
+            chunk_index,
+            request.headers.get("x-chunk-sha256", ""),
+        )
+        return UploadChunkResponse(**result)
+
+    @app.post("/uploads/{upload_id}/complete", response_model=UploadResponse)
+    async def complete_resumable_upload(upload_id: uuid.UUID, request: Request) -> UploadResponse:
+        current = _current_auth(request, resolved_factory)
+        _require_csrf(request, resolved_settings, resolved_factory, current)
+        assert current is not None
+        user, _ = current
+        video = await complete_upload_session(
+            resolved_factory, resolved_settings, resolved_store, user.id, upload_id
+        )
+        return UploadResponse(video=_video_detail(video))
+
+    @app.delete("/uploads/{upload_id}")
+    def abandon_resumable_upload(
+        upload_id: uuid.UUID, request: Request, response: Response
+    ) -> Response:
+        current = _current_auth(request, resolved_factory)
+        _require_csrf(request, resolved_settings, resolved_factory, current)
+        assert current is not None
+        user, _ = current
+        response_status, code = abandon_upload_session(
+            resolved_factory, resolved_store, user.id, upload_id
+        )
+        response.status_code = response_status
+        response.headers["Cache-Control"] = "no-store"
+        if code is not None:
+            return JSONResponse(
+                {"detail": {"code": code}}, status_code=response_status, headers={"Cache-Control": "no-store"}
+            )
+        return response
 
     @app.get("/videos", response_model=VideoListResponse)
     def list_videos(request: Request) -> VideoListResponse:

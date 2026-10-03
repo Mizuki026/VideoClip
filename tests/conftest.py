@@ -53,7 +53,7 @@ def empty_database(session_factory: sessionmaker[Session]) -> None:
             text(
                 "TRUNCATE TABLE summary_requests, analysis_summaries, analysis_executions, "
                 "transcript_segments, task_deliveries, "
-                "analysis_attempts, analysis_tasks, cleanup_intents, videos, upload_handoffs, "
+                "analysis_attempts, analysis_tasks, cleanup_intents, videos, upload_chunks, upload_handoffs, "
                 "sessions, users "
                 "RESTART IDENTITY CASCADE"
             )

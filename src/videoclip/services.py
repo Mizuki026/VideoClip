@@ -75,26 +75,28 @@ def safe_display_name(value: str | None) -> str:
     return candidate
 
 
-def _intent_for_upload(session: Session, owner_id: uuid.UUID, upload_id: uuid.UUID, state: str) -> None:
+def _intent_for_upload(
+    session: Session, owner_id: uuid.UUID, upload_id: uuid.UUID, state: str
+) -> CleanupIntent:
     intent = session.scalar(
         select(CleanupIntent)
         .where(CleanupIntent.upload_id == upload_id, CleanupIntent.kind == "upload")
         .with_for_update()
     )
     if intent is None:
-        session.add(
-            CleanupIntent(
-                owner_id=owner_id,
-                upload_id=upload_id,
-                storage_name=upload_id.hex,
-                kind="upload",
-                state=state,
-                attempts=0,
-            )
+        intent = CleanupIntent(
+            owner_id=owner_id,
+            upload_id=upload_id,
+            storage_name=upload_id.hex,
+            kind="upload",
+            state=state,
+            attempts=0,
         )
+        session.add(intent)
     else:
         intent.state = state
         intent.attempts += 1
+    return intent
 
 
 def _mark_upload_failed(
