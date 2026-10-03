@@ -128,10 +128,11 @@ services:
       FFMPEG_PATH: /usr/bin/ffmpeg
       FFPROBE_PATH: /usr/bin/ffprobe
       CELERY_BROKER_URL: redis://redis:6379/0
+      ANALYSIS_WORKER_INSTANCE_ID: ${ANALYSIS_WORKER_INSTANCE_ID:-}
+      ANALYSIS_SUPERVISOR_SOCKET: /tmp/videoclip-analysis-supervisor.sock
     secrets:
       - postgres_password
-    command:
-      ["celery", "-A", "videoclip.celery_app:celery_app", "worker", "--queues=analysis", "--loglevel=INFO", "--concurrency=1", "--prefetch-multiplier=1", "--hostname=stage2-analysis@%h"]
+    command: ["python", "-m", "videoclip.analysis_supervisor"]
     volumes:
       - type: bind
         source: ${MVP_STAGE1_DATA_DIR:?set MVP_STAGE1_DATA_DIR to the private E drive business directory}/app

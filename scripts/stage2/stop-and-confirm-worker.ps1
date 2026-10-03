@@ -30,66 +30,100 @@ if ($databaseName -notmatch '^[A-Za-z0-9_]+$' -or $databaseUser -notmatch '^[A-Z
 
 Push-Location $repoRoot
 try {
-    $precheck = "SELECT count(*) FROM analysis_executions WHERE id = '$executionValue' AND stop_confirmed_at IS NULL"
-    $matching = (& docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile exec -T postgres psql -X -v ON_ERROR_STOP=1 -qAt -U $databaseUser -d $databaseName -c $precheck).Trim()
-    if ($LASTEXITCODE -ne 0 -or $matching -ne '1') {
+    & docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile up -d postgres
+    if ($LASTEXITCODE -ne 0) { throw 'Could not start the Stage 2 database for stop confirmation.' }
+    $databaseDeadline = [DateTime]::UtcNow.AddMinutes(3)
+    do {
+        $postgresId = (& docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile ps -q postgres).Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $postgresId) { throw 'Stage 2 PostgreSQL is unavailable.' }
+        $postgresHealth = (& docker inspect --format '{{.State.Health.Status}}' $postgresId).Trim()
+        if ($LASTEXITCODE -ne 0) { throw 'Could not inspect Stage 2 PostgreSQL health.' }
+        if ($postgresHealth -eq 'healthy') { break }
+        if ([DateTime]::UtcNow -ge $databaseDeadline) { throw 'Stage 2 PostgreSQL did not become healthy.' }
+        Start-Sleep -Seconds 2
+    } while ($true)
+
+    $lookup = @"
+SELECT coalesce(worker_instance_id::text, '<null>') || '|' || coalesce(worker_container_id, '<null>') || '|' ||
+       coalesce(process_scope, '<null>') || '|' || coalesce(boundary_pid::text, '<null>') || '|' ||
+       coalesce(boundary_start_ticks::text, '<null>') || '|' || coalesce(boundary_session_id::text, '<null>') || '|' ||
+       coalesce(boundary_boot_id, '<null>')
+FROM analysis_executions
+WHERE id = '$executionValue' AND stop_confirmed_at IS NULL
+"@
+    $binding = (& docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile exec -T postgres psql -X -v ON_ERROR_STOP=1 -qAt -U $databaseUser -d $databaseName -c $lookup).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $binding) {
         throw 'The specified execution is not an unconfirmed Stage 2 execution. No stop was performed.'
+    }
+    $parts = $binding -split '\|', 7
+    if ($parts.Count -ne 7 -or $parts -contains '<null>' -or $parts[2] -ne 'linux-session-v1') {
+        throw 'This execution has no supported supervised identity binding. It remains blocked for manual handling.'
+    }
+    $workerInstanceId = [Guid]::Empty
+    if (-not [Guid]::TryParse($parts[0], [ref]$workerInstanceId)) {
+        throw 'The execution Worker generation is invalid; no stop was performed.'
     }
 
     $workerIds = @(& docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile ps --all -q worker)
     if ($LASTEXITCODE -ne 0 -or $workerIds.Count -ne 1) {
         throw 'Cannot establish exactly one Stage 2 Worker container; no database stop confirmation was written.'
     }
-    if ($workerIds.Count -eq 1) {
-        $workerId = $workerIds[0].Trim()
-        $running = (& docker inspect --format '{{.State.Running}}' $workerId).Trim()
-        if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the Stage 2 Worker container.' }
-        if ($running -eq 'true') {
-            & docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile stop --timeout 0 worker
-            if ($LASTEXITCODE -ne 0) { throw 'Worker stop did not complete; database state was left unchanged.' }
-        }
-        $running = (& docker inspect --format '{{.State.Running}}' $workerId).Trim()
-        $state = (& docker inspect --format '{{.State.Status}}' $workerId).Trim()
-        if ($LASTEXITCODE -ne 0 -or $running -ne 'false' -or $state -ne 'exited') {
-            throw 'Docker did not confirm the Stage 2 Worker container and its child processes stopped.'
-        }
+    $workerId = $workerIds[0].Trim()
+    $containerInstanceSetting = @(& docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' $workerId | Where-Object { $_ -match '^ANALYSIS_WORKER_INSTANCE_ID=' })
+    if ($LASTEXITCODE -ne 0 -or $containerInstanceSetting.Count -ne 1) {
+        throw 'The Stage 2 Worker container has no inspectable instance generation.'
+    }
+    $containerInstanceId = [Guid]::Empty
+    if (-not [Guid]::TryParse(($containerInstanceSetting[0] -split '=', 2)[1], [ref]$containerInstanceId) -or
+        $containerInstanceId -ne $workerInstanceId) {
+        throw 'The target execution does not belong to this Worker instance; no stop was performed.'
+    }
+    $shortContainerId = (& docker inspect --format '{{.Id}}' $workerId).Trim()
+    $boundContainerId = $parts[1]
+    if ($LASTEXITCODE -ne 0 -or $shortContainerId.Length -lt 12 -or
+        $boundContainerId -ne $shortContainerId.Substring(0, 12)) {
+        throw 'The target execution does not match this exact Worker container; no stop was performed.'
     }
 
-    $confirmation = @"
-WITH stopped AS MATERIALIZED (
-  UPDATE analysis_executions
-  SET stop_confirmed_at = now(), stop_confirmation_source = 'operator_container_exit',
-      stop_reason = 'operator_confirmed_container_stopped'
-  WHERE id = '$executionValue' AND stop_confirmed_at IS NULL
-  RETURNING task_id, attempt_id
-), changed_attempt AS (
-  UPDATE analysis_attempts a
-  SET stop_confirmed_at = now(), finished_at = COALESCE(a.finished_at, now()),
-      status = CASE WHEN a.status = 'running' THEN 'failed' ELSE a.status END,
-      failure_code = CASE WHEN a.status = 'running' THEN COALESCE(a.failure_code, 'WORKER_STOPPED_OPERATOR') ELSE a.failure_code END
-  FROM stopped s WHERE a.id = s.attempt_id RETURNING a.id
-), changed_task AS (
-  UPDATE analysis_tasks t
-  SET status = CASE WHEN t.status = 'running' THEN 'failed' ELSE t.status END,
-      stage = CASE WHEN t.status = 'running' THEN 'failed' ELSE t.stage END,
-      summary_status = CASE WHEN t.summary_status = 'running' THEN 'failed' ELSE t.summary_status END,
-      failure_code = CASE WHEN t.status = 'running' THEN COALESCE(t.failure_code, 'WORKER_STOPPED_OPERATOR') ELSE t.failure_code END,
-      updated_at = now()
-  FROM stopped s WHERE t.id = s.task_id RETURNING t.id
-), changed_summary_requests AS (
-  UPDATE summary_requests r
-  SET status = 'failed', error_code = 'WORKER_STOPPED_OPERATOR', finished_at = now()
-  FROM stopped s
-  WHERE r.execution_id = '$executionValue' AND r.status IN ('started', 'response_received')
-  RETURNING r.id
-)
-SELECT count(*) FROM stopped
-"@
-    $confirmed = (& docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile exec -T postgres psql -X -v ON_ERROR_STOP=1 -qAt -U $databaseUser -d $databaseName -c $confirmation).Trim()
-    if ($LASTEXITCODE -ne 0 -or $confirmed -ne '1') {
-        throw 'Stop confirmation was not written. Keep the project database available and inspect the execution record.'
+    $running = (& docker inspect --format '{{.State.Running}}' $workerId).Trim()
+    if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the Stage 2 Worker container.' }
+    if ($running -eq 'true') {
+        & docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile stop --timeout 0 worker
+        if ($LASTEXITCODE -ne 0) { throw 'Worker stop did not complete; database state was left unchanged.' }
     }
-    Write-Output "Execution $executionValue is confirmed stopped; an unfinished attempt was recorded as failed. No retry was created."
+    $finalContainerId = (& docker inspect --format '{{.Id}}' $workerId).Trim()
+    $running = (& docker inspect --format '{{.State.Running}}' $workerId).Trim()
+    $state = (& docker inspect --format '{{.State.Status}}' $workerId).Trim()
+    if ($LASTEXITCODE -ne 0 -or $finalContainerId -ne $shortContainerId -or $running -ne 'false' -or $state -ne 'exited') {
+        throw 'Docker did not confirm that the exact bound Stage 2 Worker container exited.'
+    }
+
+    & docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile up -d api
+    if ($LASTEXITCODE -ne 0) { throw 'Could not start the Stage 2 API for stop confirmation.' }
+    $apiDeadline = [DateTime]::UtcNow.AddMinutes(3)
+    do {
+        try {
+            $health = Invoke-RestMethod -Uri 'http://127.0.0.1:58002/health' -TimeoutSec 3
+            if ($health.status -eq 'ok') { break }
+        } catch { }
+        if ([DateTime]::UtcNow -ge $apiDeadline) { throw 'Stage 2 API did not become healthy for stop confirmation.' }
+        Start-Sleep -Seconds 2
+    } while ($true)
+
+    $workerInstanceIdValue = $workerInstanceId.ToString('D')
+    & docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile exec -T api python -m videoclip.stop_confirmation `
+        --execution-id $executionValue `
+        --worker-instance-id $workerInstanceIdValue `
+        --container-id $finalContainerId `
+        --container-exited
+    if ($LASTEXITCODE -ne 0) {
+        throw 'The stopped container evidence did not match the current execution binding. Keep the database and Worker stopped for manual review.'
+    }
+    $confirmedCount = (& docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile exec -T postgres psql -X -v ON_ERROR_STOP=1 -qAt -U $databaseUser -d $databaseName -c "SELECT count(*) FROM analysis_executions WHERE id = '$executionValue' AND stop_confirmed_at IS NOT NULL").Trim()
+    if ($LASTEXITCODE -ne 0 -or $confirmedCount -ne '1') {
+        throw 'The exact execution stop confirmation was not persisted.'
+    }
+    Write-Output "Execution $executionValue is confirmed stopped after container $finalContainerId exited. No retry was created."
 }
 finally {
     Pop-Location

@@ -585,6 +585,39 @@ def _remove_attempt_files(
     return True
 
 
+def cleanup_confirmed_attempt_files(
+    factory: sessionmaker[Session], store: MediaStore, attempt_id: uuid.UUID
+) -> bool:
+    """Clean only the exact attempt whose execution and attempt both carry stop confirmation."""
+    with factory() as session:
+        row = session.execute(
+            select(Video.owner_id, Video.id, Video.status)
+            .join(AnalysisTask, AnalysisTask.video_id == Video.id)
+            .join(AnalysisAttempt, AnalysisAttempt.task_id == AnalysisTask.id)
+            .where(AnalysisAttempt.id == attempt_id)
+        ).one_or_none()
+        attempt = session.get(AnalysisAttempt, attempt_id)
+        eligible = attempt is not None and _attempt_stop_is_confirmed(session, attempt)
+        session.commit()
+    if row is None or not eligible:
+        return False
+    owner_id, video_id, video_status = row
+    if video_status == "ready":
+        deletion_mode = False
+    elif video_status in {"deleting", "cleanup_failed"}:
+        deletion_mode = True
+    else:
+        return False
+    return _remove_attempt_files(
+        factory,
+        store,
+        owner_id,
+        video_id,
+        attempt_id,
+        deletion_mode=deletion_mode,
+    )
+
+
 def _set_video_cleanup_failure(
     factory: sessionmaker[Session], video_id: uuid.UUID, upload_id: uuid.UUID, code: str
 ) -> None:

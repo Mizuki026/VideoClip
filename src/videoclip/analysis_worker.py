@@ -24,6 +24,12 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from videoclip.analysis import ASR_REQUEST_FINGERPRINT_VERSION, canonical_sha256
+from videoclip.analysis_supervisor import (
+    BoundaryUnknown,
+    WorkerBoundary,
+    establish_execution_boundary,
+    register_execution_with_supervisor,
+)
 from videoclip.db import create_database_engine
 from videoclip.models import (
     AnalysisAttempt,
@@ -37,6 +43,7 @@ from videoclip.models import (
 from videoclip.recovery_rules import checkpoint_matches
 from videoclip.services import db_transaction
 from videoclip.settings import Settings, get_settings
+from videoclip.stop_confirmation import ExecutionIdentity
 from videoclip.storage import MediaStore
 from videoclip.summarization import (
     SummaryFailure,
@@ -82,6 +89,13 @@ class ClaimedAttempt:
     snapshot: dict[str, Any]
     work_directory_name: str
     execution_mode: str = "full"
+    worker_instance_id: uuid.UUID | None = None
+    worker_container_id: str | None = None
+    process_scope: str | None = None
+    boundary_pid: int | None = None
+    boundary_start_ticks: int | None = None
+    boundary_session_id: int | None = None
+    boundary_boot_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -246,6 +260,18 @@ def _lock_execution_rows(
         or execution.attempt_id != attempt.id
         or execution.task_id != task.id
         or execution.stop_confirmed_at is not None
+        or (
+            claim.worker_instance_id is not None
+            and (
+                execution.worker_instance_id != claim.worker_instance_id
+                or execution.worker_container_id != claim.worker_container_id
+                or execution.process_scope != claim.process_scope
+                or execution.boundary_pid != claim.boundary_pid
+                or execution.boundary_start_ticks != claim.boundary_start_ticks
+                or execution.boundary_session_id != claim.boundary_session_id
+                or execution.boundary_boot_id != claim.boundary_boot_id
+            )
+        )
         or attempt.claim_count != 1
         or (not allow_invalid_video and video.status != "ready")
     ):
@@ -258,6 +284,7 @@ def _claim_attempt(
     task_id: uuid.UUID,
     attempt_id: uuid.UUID,
     worker_id: str,
+    boundary: WorkerBoundary | None = None,
 ) -> ClaimedAttempt | None:
     maker = sessionmaker(bind=lease.connection, autoflush=False, expire_on_commit=False)
     with db_transaction(maker) as session:
@@ -296,6 +323,13 @@ def _claim_attempt(
             attempt_id=attempt.id,
             worker_id=worker_id[:128],
             backend_pid=lease.backend_pid,
+            worker_instance_id=boundary.worker_instance_id if boundary is not None else None,
+            worker_container_id=boundary.worker_container_id if boundary is not None else None,
+            process_scope=boundary.process_scope if boundary is not None else None,
+            boundary_pid=boundary.boundary_pid if boundary is not None else None,
+            boundary_start_ticks=boundary.boundary_start_ticks if boundary is not None else None,
+            boundary_session_id=boundary.boundary_session_id if boundary is not None else None,
+            boundary_boot_id=boundary.boundary_boot_id if boundary is not None else None,
         )
         session.add(execution)
         attempt.claim_count = 1
@@ -317,7 +351,39 @@ def _claim_attempt(
             snapshot=attempt.config_snapshot,
             work_directory_name=attempt.work_directory_name,
             execution_mode=attempt.execution_mode,
+            worker_instance_id=execution.worker_instance_id,
+            worker_container_id=execution.worker_container_id,
+            process_scope=execution.process_scope,
+            boundary_pid=execution.boundary_pid,
+            boundary_start_ticks=execution.boundary_start_ticks,
+            boundary_session_id=execution.boundary_session_id,
+            boundary_boot_id=execution.boundary_boot_id,
         )
+
+
+def _execution_identity(claim: ClaimedAttempt) -> ExecutionIdentity:
+    if (
+        claim.worker_instance_id is None
+        or claim.worker_container_id is None
+        or claim.process_scope is None
+        or claim.boundary_pid is None
+        or claim.boundary_start_ticks is None
+        or claim.boundary_session_id is None
+        or claim.boundary_boot_id is None
+    ):
+        raise BoundaryUnknown("the claimed execution has no complete supervised process binding")
+    return ExecutionIdentity(
+        execution_id=claim.execution_id,
+        task_id=claim.task_id,
+        attempt_id=claim.attempt_id,
+        worker_instance_id=claim.worker_instance_id,
+        worker_container_id=claim.worker_container_id,
+        process_scope=claim.process_scope,
+        boundary_pid=claim.boundary_pid,
+        boundary_start_ticks=claim.boundary_start_ticks,
+        boundary_session_id=claim.boundary_session_id,
+        boundary_boot_id=claim.boundary_boot_id,
+    )
 
 
 def _validate_execution(
@@ -424,15 +490,19 @@ def _run_process(
     if timeout_seconds <= 0:
         raise AnalysisFailure("ATTEMPT_TIMEOUT")
     _progress_check(maker, lease, claim)
-    creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    launch_options: dict[str, Any] = {}
+    if os.name == "nt":
+        launch_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        # A fresh process group stays inside the execution's supervised Linux session.
+        launch_options["process_group"] = 0
     try:
         process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=creation_flags,
-            start_new_session=os.name != "nt",
+            **launch_options,
         )
     except OSError as exc:
         raise AnalysisFailure("LOCAL_PROCESS_START_FAILED") from exc
@@ -769,36 +839,6 @@ def _fail_task(maker: sessionmaker[Session], lease: ExecutionLease, claim: Claim
         attempt.failure_code = attempt.failure_code or code[:64]
 
 
-def _confirm_stopped(
-    maker: sessionmaker[Session],
-    lease: ExecutionLease,
-    claim: ClaimedAttempt,
-    *,
-    cleanup_state: str,
-    reason: str,
-) -> None:
-    lease.assert_alive()
-    now = datetime.now(UTC)
-    with db_transaction(maker) as session:
-        task, attempt, _, execution = _lock_execution_rows(session, claim, allow_invalid_video=True)
-        if task.status == "running":
-            task.status = "failed"
-            task.stage = "failed"
-            task.failure_code = task.failure_code or "WORKER_STOPPED_UNFINISHED"
-        if task.summary_status == "running":
-            task.summary_status = "failed"
-        if attempt.status == "running":
-            attempt.status = "failed"
-            attempt.failure_code = attempt.failure_code or "WORKER_STOPPED_UNFINISHED"
-        attempt.cleanup_state = cleanup_state
-        attempt.cleanup_error_code = "ATTEMPT_TEMP_CLEANUP_FAILED" if cleanup_state == "failed" else None
-        attempt.stop_confirmed_at = now
-        attempt.finished_at = now
-        execution.stop_confirmed_at = now
-        execution.stop_confirmation_source = "worker_process_group_exit"
-        execution.stop_reason = reason[:64]
-
-
 def _work_directory(store: MediaStore, claim: ClaimedAttempt) -> Path:
     if len(claim.work_directory_name) != 32 or any(
         character not in "0123456789abcdef" for character in claim.work_directory_name
@@ -812,14 +852,7 @@ def _work_directory(store: MediaStore, claim: ClaimedAttempt) -> Path:
     return path
 
 
-def _deletion_cleanup_is_pending(maker: sessionmaker[Session], claim: ClaimedAttempt) -> bool:
-    with maker() as session:
-        status_value = session.scalar(select(Video.status).where(Video.id == claim.video_id))
-        session.commit()
-    return status_value != "ready"
-
-
-def _cleanup_work_directory(
+def _cleanup_work_directory_for_inline_tests(
     store: MediaStore,
     claim: ClaimedAttempt,
     maker: sessionmaker[Session],
@@ -851,6 +884,46 @@ def _cleanup_work_directory(
         return "cleaned"
     except OSError:
         return "failed"
+
+
+def _confirm_inline_test_stop(
+    maker: sessionmaker[Session],
+    lease: ExecutionLease,
+    claim: ClaimedAttempt,
+    *,
+    cleanup_state: str,
+    reason: str,
+) -> None:
+    """Legacy inline confirmation is available only to the isolated test fixture path."""
+    if os.environ.get("APP_ENV") != "test" or os.environ.get("ANALYSIS_TEST_INLINE_SUPERVISOR") != "1":
+        raise BoundaryUnknown("inline test confirmation is disabled")
+    lease.assert_alive()
+    now = datetime.now(UTC)
+    with db_transaction(maker) as session:
+        task, attempt, _, execution = _lock_execution_rows(session, claim, allow_invalid_video=True)
+        if task.status == "running":
+            task.status = "failed"
+            task.stage = "failed"
+            task.failure_code = task.failure_code or "WORKER_STOPPED_UNFINISHED"
+        if task.summary_status == "running":
+            task.summary_status = "failed"
+        if attempt.status == "running":
+            attempt.status = "failed"
+            attempt.failure_code = attempt.failure_code or "WORKER_STOPPED_UNFINISHED"
+        attempt.cleanup_state = cleanup_state
+        attempt.cleanup_error_code = "ATTEMPT_TEMP_CLEANUP_FAILED" if cleanup_state == "failed" else None
+        attempt.stop_confirmed_at = now
+        attempt.finished_at = now
+        execution.stop_confirmed_at = now
+        execution.stop_confirmation_source = "test_inline_synthetic"
+        execution.stop_reason = reason[:64]
+
+
+def _deletion_cleanup_is_pending(maker: sessionmaker[Session], claim: ClaimedAttempt) -> bool:
+    with maker() as session:
+        status_value = session.scalar(select(Video.status).where(Video.id == claim.video_id))
+        session.commit()
+    return status_value != "ready"
 
 
 def _create_wav_segments(
@@ -1526,6 +1599,16 @@ def transcribe_analysis(task_id_value: str, attempt_id_value: str | None = None)
     except ValueError:
         return {"status": "ignored_invalid_message_id"}
     settings = get_settings()
+    inline_test_supervisor = (
+        settings.app_env == "test" and os.environ.get("ANALYSIS_TEST_INLINE_SUPERVISOR") == "1"
+    )
+    boundary: WorkerBoundary | None = None
+    if not inline_test_supervisor:
+        try:
+            boundary = establish_execution_boundary()
+        except BoundaryUnknown as exc:
+            logger.error("analysis_supervision_unavailable reason=%s", exc)
+            return {"status": "stop_confirmation_required"}
     engine, store = _get_or_make_worker_components(settings)
     lease: ExecutionLease | None = None
     claim: ClaimedAttempt | None = None
@@ -1537,12 +1620,22 @@ def transcribe_analysis(task_id_value: str, attempt_id_value: str | None = None)
             return {"status": "global_execution_busy"}
         worker_id = f"{socket.gethostname()}:{os.getpid()}"
         try:
-            claim = _claim_attempt(lease, task_id, attempt_id, worker_id)
+            claim = _claim_attempt(lease, task_id, attempt_id, worker_id, boundary)
         except IntegrityError:
             return {"status": "global_execution_busy"}
         if claim is None:
             return {"status": "ignored_not_eligible"}
         maker = sessionmaker(bind=lease.connection, autoflush=False, expire_on_commit=False)
+        if not inline_test_supervisor:
+            try:
+                register_execution_with_supervisor(_execution_identity(claim))
+            except BoundaryUnknown as exc:
+                logger.error(
+                    "analysis_supervisor_registration_required execution_id=%s reason=%s",
+                    claim.execution_id,
+                    exc,
+                )
+                return {"status": "stop_confirmation_required"}
         attempt_deadline = time.monotonic() + int(claim.snapshot["limits"]["attempt_total_seconds"])
         try:
             if claim.execution_mode != "summary_only":
@@ -1566,36 +1659,33 @@ def transcribe_analysis(task_id_value: str, attempt_id_value: str | None = None)
             logger.error("analysis_worker_failed task_id=%s attempt_id=%s", task_id.hex, claim.attempt_id.hex)
 
         try:
-            cleanup_state = (
-                "pending"
-                if _deletion_cleanup_is_pending(maker, claim)
-                else _cleanup_work_directory(store, claim, maker, lease)
-            )
-        except SQLAlchemyError:
-            logger.error(
-                "analysis_cleanup_status_unavailable task_id=%s attempt_id=%s",
-                task_id.hex,
-                claim.attempt_id.hex,
-            )
-            return {"status": "stop_unconfirmed"}
-        try:
             if failure_code is not None:
                 _fail_task(maker, lease, claim, failure_code)
-            _confirm_stopped(
-                maker,
-                lease,
-                claim,
-                cleanup_state=cleanup_state,
-                reason=terminal_reason,
-            )
+            if inline_test_supervisor:
+                cleanup_state = (
+                    "pending"
+                    if _deletion_cleanup_is_pending(maker, claim)
+                    else _cleanup_work_directory_for_inline_tests(store, claim, maker, lease)
+                )
+                _confirm_inline_test_stop(
+                    maker,
+                    lease,
+                    claim,
+                    cleanup_state=cleanup_state,
+                    reason=terminal_reason,
+                )
         except (AnalysisFailure, SQLAlchemyError):
             logger.error(
-                "analysis_stop_registration_unconfirmed task_id=%s attempt_id=%s",
+                "analysis_result_write_unconfirmed task_id=%s attempt_id=%s",
                 task_id.hex,
                 claim.attempt_id.hex,
             )
             return {"status": "stop_unconfirmed"}
-        return {"status": "succeeded" if failure_code is None else "failed"}
+        return (
+            {"status": "succeeded" if failure_code is None else "failed"}
+            if inline_test_supervisor
+            else {"status": "awaiting_stop_evidence"}
+        )
     finally:
         if lease is not None:
             lease.release()

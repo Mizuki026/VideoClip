@@ -9,6 +9,7 @@ import time
 import uuid
 import wave
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -23,12 +24,14 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 import videoclip.analysis_worker as analysis_worker
+import videoclip.stop_confirmation as stop_confirmation
 from videoclip.analysis import (
     build_configuration_snapshot,
     canonical_sha256,
     recover_analysis_attempt,
     submit_analysis_task,
 )
+from videoclip.analysis_supervisor import BoundaryUnknown, WorkerBoundary
 from videoclip.analysis_worker import (
     ASR_REQUEST_FINGERPRINT_VERSION,
     AnalysisFailure,
@@ -62,6 +65,12 @@ from videoclip.recovery_rules import checkpoint_matches, evaluate_recovery
 from videoclip.schemas import AnalysisTaskResponse
 from videoclip.services import delete_video
 from videoclip.settings import Settings
+from videoclip.stop_confirmation import (
+    PROCESS_SCOPE,
+    confirm_operator_container_stop,
+    confirm_stopped_execution,
+    worker_stop_evidence,
+)
 from videoclip.storage import MediaStore
 
 PASSWORD = "correct horse battery staple 42"
@@ -1983,3 +1992,295 @@ def test_delete_winning_summary_race_blocks_publication_and_later_requests(
             assert attempt.execution_mode == "summary_only"
         assert delete_video(session_factory, store, owner_id, video_id) == 204
         assert child_id != parent_id
+
+
+def _claim_bound_execution(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+    suffix: str,
+) -> tuple[Any, ExecutionLease, WorkerBoundary]:
+    store = MediaStore(test_settings.app_data_root)
+    with TestClient(create_app(test_settings, session_factory, run_recovery=False)) as client:
+        owner_id = _register(client, f"stop-evidence-{suffix}")
+        video_id = _video(session_factory, store, owner_id)
+    submitted = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
+    lease = ExecutionLease.acquire(test_engine)
+    assert lease is not None
+    boundary = WorkerBoundary(
+        worker_instance_id=uuid.uuid4(),
+        worker_container_id=uuid.uuid4().hex[:12],
+        process_scope=PROCESS_SCOPE,
+        boundary_pid=100_000 + int(uuid.uuid4().hex[:4], 16),
+        boundary_start_ticks=987_654,
+        boundary_session_id=100_000 + int(uuid.uuid4().hex[:4], 16),
+        boundary_boot_id="isolated-test-boot",
+    )
+    boundary = replace(boundary, boundary_session_id=boundary.boundary_pid)
+    claim = _claim_attempt(
+        lease,
+        submitted.task_id,
+        submitted.attempt_id,
+        f"test-supervised-{suffix}",
+        boundary,
+    )
+    assert claim is not None
+    lease.release()
+    return claim, lease, boundary
+
+
+def test_stop_confirmation_binds_identity_is_idempotent_and_preserves_request_budget(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+) -> None:
+    claim, _, _ = _claim_bound_execution(
+        test_settings, test_engine, session_factory, "transaction"
+    )
+    identity = analysis_worker._execution_identity(claim)
+    with session_factory.begin() as session:
+        execution = session.get(AnalysisExecution, claim.execution_id)
+        task = session.get(AnalysisTask, claim.task_id)
+        assert execution is not None and task is not None
+    evidence = worker_stop_evidence(identity, session_stopped=True)
+    assert confirm_stopped_execution(session_factory, evidence) == "rejected"
+
+    with session_factory.begin() as session:
+        execution = session.get(AnalysisExecution, claim.execution_id)
+        task = session.get(AnalysisTask, claim.task_id)
+        assert execution is not None and task is not None
+        execution.supervisor_registered_at = datetime.now(UTC)
+        task.summary_status = "running"
+        session.add(
+            SummaryRequest(
+                task_id=claim.task_id,
+                attempt_id=claim.attempt_id,
+                execution_id=claim.execution_id,
+                request_number=1,
+                request_fingerprint="a" * 64,
+                status="started",
+                provider="test-local",
+                model="test-local",
+                prompt_version="test",
+                started_at=datetime.now(UTC),
+            )
+        )
+
+    wrong_generation = replace(identity, worker_instance_id=uuid.uuid4())
+    wrong_evidence = worker_stop_evidence(wrong_generation, session_stopped=True)
+    assert confirm_stopped_execution(session_factory, wrong_evidence) == "rejected"
+    assert confirm_stopped_execution(session_factory, replace(evidence, sha256="0" * 64)) == "rejected"
+    with session_factory() as session:
+        execution = session.get(AnalysisExecution, claim.execution_id)
+        assert execution is not None and execution.stop_confirmed_at is None
+
+    assert confirm_stopped_execution(session_factory, evidence) == "confirmed"
+    assert confirm_stopped_execution(session_factory, evidence) == "already_confirmed"
+    with session_factory() as session:
+        execution = session.get(AnalysisExecution, claim.execution_id)
+        task = session.get(AnalysisTask, claim.task_id)
+        attempt = session.get(AnalysisAttempt, claim.attempt_id)
+        request = session.scalar(
+            select(SummaryRequest).where(SummaryRequest.execution_id == claim.execution_id)
+        )
+        assert execution is not None and execution.stop_evidence_sha256 == evidence.sha256
+        assert task is not None and task.status == "failed" and task.summary_status == "failed"
+        assert attempt is not None and attempt.status == "failed" and attempt.cleanup_state == "pending"
+        assert request is not None and request.status == "failed"
+        assert session.scalar(
+            select(func.count(SummaryRequest.id)).where(SummaryRequest.task_id == claim.task_id)
+        ) == 1
+
+
+def test_confirmation_database_failure_keeps_the_execution_slot(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claim, _, _ = _claim_bound_execution(test_settings, test_engine, session_factory, "write-failure")
+    identity = analysis_worker._execution_identity(claim)
+    with session_factory.begin() as session:
+        execution = session.get(AnalysisExecution, claim.execution_id)
+        assert execution is not None
+        execution.supervisor_registered_at = datetime.now(UTC)
+    evidence = worker_stop_evidence(identity, session_stopped=True)
+
+    def fail_transaction(_factory: Any) -> Any:
+        raise SQLAlchemyError("injected confirmation write failure")
+
+    monkeypatch.setattr(stop_confirmation, "db_transaction", fail_transaction)
+    with pytest.raises(SQLAlchemyError, match="injected confirmation write failure"):
+        confirm_stopped_execution(session_factory, evidence)
+
+    with session_factory() as session:
+        execution = session.get(AnalysisExecution, claim.execution_id)
+        assert execution is not None and execution.stop_confirmed_at is None
+        assert execution.stop_evidence_sha256 is None
+        assert session.scalar(
+            select(func.count(AnalysisExecution.id)).where(AnalysisExecution.stop_confirmed_at.is_(None))
+        ) == 1
+
+
+def test_late_confirmation_for_old_execution_cannot_release_new_execution_slot(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+) -> None:
+    old_claim, _, _ = _claim_bound_execution(
+        test_settings, test_engine, session_factory, "old"
+    )
+    old_identity = analysis_worker._execution_identity(old_claim)
+    with session_factory.begin() as session:
+        execution = session.get(AnalysisExecution, old_claim.execution_id)
+        assert execution is not None
+        execution.supervisor_registered_at = datetime.now(UTC)
+    old_evidence = worker_stop_evidence(old_identity, session_stopped=True)
+    assert confirm_stopped_execution(session_factory, old_evidence) == "confirmed"
+
+    new_attempt_id = uuid.uuid4()
+    with session_factory.begin() as session:
+        old_attempt = session.get(AnalysisAttempt, old_claim.attempt_id)
+        task = session.get(AnalysisTask, old_claim.task_id)
+        assert old_attempt is not None and task is not None
+        successor = AnalysisAttempt(
+            id=new_attempt_id,
+            task_id=task.id,
+            attempt_number=old_attempt.attempt_number + 1,
+            status="queued",
+            execution_mode="full",
+            config_snapshot=old_attempt.config_snapshot,
+            config_sha256=old_attempt.config_sha256,
+            source_fingerprint=old_attempt.source_fingerprint,
+            work_directory_name=uuid.uuid4().hex,
+            claim_count=0,
+            cleanup_state="pending",
+        )
+        session.add(successor)
+        session.flush()
+        task.current_attempt_id = successor.id
+        task.status = "queued"
+        task.stage = "queued"
+        task.failure_code = None
+        session.add(TaskDelivery(attempt_id=successor.id, status="pending"))
+
+    lease = ExecutionLease.acquire(test_engine)
+    assert lease is not None
+    new_boundary = WorkerBoundary(
+        worker_instance_id=uuid.uuid4(),
+        worker_container_id=uuid.uuid4().hex[:12],
+        process_scope=PROCESS_SCOPE,
+        boundary_pid=200_000 + int(uuid.uuid4().hex[:4], 16),
+        boundary_start_ticks=123_456,
+        boundary_session_id=1,
+        boundary_boot_id="isolated-test-boot-new",
+    )
+    new_boundary = replace(new_boundary, boundary_session_id=new_boundary.boundary_pid)
+    new_claim = _claim_attempt(
+        lease,
+        old_claim.task_id,
+        new_attempt_id,
+        "test-supervised-new",
+        new_boundary,
+    )
+    lease.release()
+    assert new_claim is not None
+    wrong_execution_identity = replace(
+        analysis_worker._execution_identity(new_claim),
+        execution_id=old_claim.execution_id,
+    )
+    wrong_execution_evidence = worker_stop_evidence(
+        wrong_execution_identity, session_stopped=True
+    )
+    assert confirm_stopped_execution(session_factory, wrong_execution_evidence) == "rejected"
+    assert confirm_stopped_execution(session_factory, old_evidence) == "already_confirmed"
+    with session_factory() as session:
+        unconfirmed = list(
+            session.scalars(
+                select(AnalysisExecution.id).where(AnalysisExecution.stop_confirmed_at.is_(None))
+            )
+        )
+        assert unconfirmed == [new_claim.execution_id]
+        new_execution = session.get(AnalysisExecution, new_claim.execution_id)
+        assert new_execution is not None and new_execution.stop_confirmed_at is None
+
+
+def test_confirmation_preserves_a_published_terminal_result(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+) -> None:
+    claim, _, _ = _claim_bound_execution(test_settings, test_engine, session_factory, "published")
+    identity = analysis_worker._execution_identity(claim)
+    with session_factory.begin() as session:
+        execution = session.get(AnalysisExecution, claim.execution_id)
+        task = session.get(AnalysisTask, claim.task_id)
+        attempt = session.get(AnalysisAttempt, claim.attempt_id)
+        assert execution is not None and task is not None and attempt is not None
+        execution.supervisor_registered_at = datetime.now(UTC)
+        task.status = "succeeded"
+        task.stage = "succeeded"
+        task.summary_status = "succeeded"
+        attempt.status = "succeeded"
+        session.add(
+            AnalysisSummary(
+                task_id=claim.task_id,
+                video_id=claim.video_id,
+                attempt_id=claim.attempt_id,
+                manifest_fingerprint="a" * 64,
+                transcript_fingerprint="b" * 64,
+                structure_version="test-v1",
+                provider="test-local",
+                model="test-local",
+                prompt_version="test-v1",
+                prompt_sha256="c" * 64,
+                response_schema_sha256="d" * 64,
+                payload_sha256="e" * 64,
+                payload={"preserved": True},
+            )
+        )
+
+    evidence = worker_stop_evidence(identity, session_stopped=True)
+    assert confirm_stopped_execution(session_factory, evidence) == "confirmed"
+    with session_factory() as session:
+        task = session.get(AnalysisTask, claim.task_id)
+        attempt = session.get(AnalysisAttempt, claim.attempt_id)
+        summary = session.scalar(select(AnalysisSummary).where(AnalysisSummary.task_id == claim.task_id))
+        assert task is not None and task.status == "succeeded" and task.stage == "succeeded"
+        assert task.summary_status == "succeeded"
+        assert attempt is not None and attempt.status == "succeeded"
+        assert summary is not None and summary.payload == {"preserved": True}
+
+
+def test_legacy_execution_without_new_identity_cannot_be_confirmed_from_operator_claim(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    with TestClient(create_app(test_settings, session_factory, run_recovery=False)) as client:
+        owner_id = _register(client, "stop-evidence-legacy")
+        video_id = _video(session_factory, store, owner_id)
+    submitted = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
+    lease = ExecutionLease.acquire(test_engine)
+    assert lease is not None
+    claim = _claim_attempt(lease, submitted.task_id, submitted.attempt_id, "legacy-worker")
+    assert claim is not None
+    lease.release()
+    with session_factory() as session:
+        execution = session.get(AnalysisExecution, claim.execution_id)
+        assert execution is not None
+        with pytest.raises(BoundaryUnknown):
+            analysis_worker._execution_identity(claim)
+        assert execution.worker_instance_id is None
+        assert execution.stop_confirmed_at is None
+    assert (
+        confirm_operator_container_stop(
+            session_factory,
+            claim.execution_id,
+            uuid.uuid4(),
+            "a" * 64,
+            container_exited=True,
+        )
+        == "rejected"
+    )

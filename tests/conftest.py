@@ -13,9 +13,13 @@ from videoclip.db import create_database_engine, create_session_factory
 from videoclip.settings import Settings, get_settings
 
 ROOT = Path(__file__).resolve().parents[1]
-TEST_DATA = ROOT / "data" / "mvp-stage-1" / "test-data"
+TEST_DB_NAME = os.environ.get("VIDEOCLIP_TEST_DB_NAME", "videoclip_mvp_stage1_test")
+TEST_DATA = Path(
+    os.environ.get("VIDEOCLIP_TEST_DATA_DIR", str(ROOT / "data" / "mvp-stage-1" / "test-data"))
+)
 os.environ["APP_ENV"] = "test"
-os.environ["DB_NAME"] = "videoclip_mvp_stage1_test"
+os.environ["ANALYSIS_TEST_INLINE_SUPERVISOR"] = "1"
+os.environ["DB_NAME"] = TEST_DB_NAME
 os.environ["APP_DATA_ROOT"] = str(TEST_DATA / "app")
 get_settings.cache_clear()
 TEST_SETTINGS = Settings()
@@ -46,8 +50,8 @@ def session_factory(test_engine: Engine) -> sessionmaker[Session]:
 
 @pytest.fixture(autouse=True)
 def empty_database(session_factory: sessionmaker[Session]) -> None:
-    if TEST_SETTINGS.db_name != "videoclip_mvp_stage1_test":
-        raise AssertionError("integration tests must only use the isolated Stage 1 test database")
+    if TEST_SETTINGS.db_name != TEST_DB_NAME:
+        raise AssertionError("integration tests must only use the configured isolated test database")
     with session_factory.begin() as session:
         session.execute(
             text(

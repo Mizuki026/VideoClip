@@ -124,13 +124,17 @@ def validate_probe(probe: dict[str, Any], max_seconds: float = 1200.0) -> MediaI
 
 
 def _run_bounded(command: list[str], timeout: float, grace: float, max_output: int) -> bytes:
-    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    launch_options: dict[str, Any] = {}
+    if os.name == "nt":
+        launch_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        # Isolate the tool's process group while keeping it in its owning execution session.
+        launch_options["process_group"] = 0
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
-        creationflags=creationflags,
-        start_new_session=os.name != "nt",
+        **launch_options,
     )
     if process.stdout is None:
         process.kill()
@@ -145,7 +149,14 @@ def _run_bounded(command: list[str], timeout: float, grace: float, max_output: i
             if len(captured) + len(chunk) > max_output:
                 exceeded.set()
                 try:
-                    process.kill()
+                    if os.name == "nt":
+                        process.kill()
+                    else:
+                        kill_group = getattr(os, "killpg", None)
+                        kill_signal = getattr(signal, "SIGKILL", None)
+                        if kill_group is None or kill_signal is None:
+                            raise OSError("process group signaling is unavailable")
+                        kill_group(process.pid, kill_signal)
                 except OSError:
                     pass
                 return

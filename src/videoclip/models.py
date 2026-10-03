@@ -340,6 +340,15 @@ class AnalysisExecution(Base):
             postgresql_where=text("stop_confirmed_at IS NULL"),
         ),
         Index("ix_analysis_executions_started", "started_at"),
+        CheckConstraint(
+            "(worker_instance_id IS NULL AND worker_container_id IS NULL AND process_scope IS NULL "
+            "AND boundary_pid IS NULL AND boundary_start_ticks IS NULL AND boundary_session_id IS NULL "
+            "AND boundary_boot_id IS NULL) OR (worker_instance_id IS NOT NULL "
+            "AND worker_container_id IS NOT NULL AND process_scope IS NOT NULL AND boundary_pid IS NOT NULL "
+            "AND boundary_start_ticks IS NOT NULL AND boundary_session_id IS NOT NULL "
+            "AND boundary_boot_id IS NOT NULL)",
+            name="ck_analysis_execution_boundary_binding",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -351,10 +360,19 @@ class AnalysisExecution(Base):
     )
     worker_id: Mapped[str] = mapped_column(String(128), nullable=False)
     backend_pid: Mapped[int] = mapped_column(Integer, nullable=False)
+    worker_instance_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    worker_container_id: Mapped[str | None] = mapped_column(String(64))
+    process_scope: Mapped[str | None] = mapped_column(String(32))
+    boundary_pid: Mapped[int | None] = mapped_column(Integer)
+    boundary_start_ticks: Mapped[int | None] = mapped_column(BigInteger)
+    boundary_session_id: Mapped[int | None] = mapped_column(Integer)
+    boundary_boot_id: Mapped[str | None] = mapped_column(String(64))
+    supervisor_registered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     stop_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     stop_confirmation_source: Mapped[str | None] = mapped_column(String(64))
     stop_reason: Mapped[str | None] = mapped_column(String(64))
+    stop_evidence_sha256: Mapped[str | None] = mapped_column(String(64))
 
 
 class AnalysisSummary(Base):
