@@ -11,6 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session, sessionmaker
 
+from videoclip.analysis_delivery import DeliveryPolicy, coordinate_due_analysis_deliveries
 from videoclip.celery_app import BROKER_URL, celery_app
 from videoclip.db import create_database_engine, create_session_factory
 from videoclip.resumable_uploads import reclaim_expired_uploads
@@ -19,7 +20,10 @@ from videoclip.storage import MediaStore
 
 logger = logging.getLogger("videoclip.maintenance")
 RECLAIM_LOCK_KEY = "videoclip:maintenance:reclaim-expired:scheduled"
+DELIVERY_LOCK_KEY = "videoclip:maintenance:coordinate-analysis:scheduled"
+SCHEDULE_LOCK_TTL_SECONDS = 180
 RECLAIM_ADVISORY_LOCK_ID = 73_102_026_100_003
+DELIVERY_ADVISORY_LOCK_ID = 73_102_026_100_004
 DEFAULT_SCAN_LIMIT = 4
 MAX_SCAN_LIMIT = 8
 
@@ -27,7 +31,7 @@ MAX_SCAN_LIMIT = 8
 def _claim_schedule_lock(token: str, client: Any | None = None) -> bool:
     redis_client = client or Redis.from_url(BROKER_URL, decode_responses=True)
     try:
-        return bool(redis_client.set(RECLAIM_LOCK_KEY, token, nx=True))
+        return bool(redis_client.set(RECLAIM_LOCK_KEY, token, nx=True, ex=SCHEDULE_LOCK_TTL_SECONDS))
     finally:
         if client is None:
             redis_client.close()
@@ -47,26 +51,46 @@ def _configured_scan_limit() -> int:
 def _release_schedule_lock(token: str, client: Any | None = None) -> bool:
     redis_client = client or Redis.from_url(BROKER_URL, decode_responses=True)
     try:
-        current = redis_client.get(RECLAIM_LOCK_KEY)
-        if current != token:
-            return False
-        return bool(redis_client.delete(RECLAIM_LOCK_KEY))
+        return bool(
+            redis_client.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                "return redis.call('del', KEYS[1]) else return 0 end",
+                1,
+                RECLAIM_LOCK_KEY,
+                token,
+            )
+        )
     finally:
         if client is None:
             redis_client.close()
 
 
-class SingleFlightReclaimTask(Task):  # type: ignore[misc]
-    """Keep at most one scheduled reclaim task queued or running in Redis."""
+class SingleFlightMaintenanceTask(Task):  # type: ignore[misc]
+    """Coalesce scheduled work with an expiring, owner-checked Redis lock."""
 
     abstract = True
+    lock_key = RECLAIM_LOCK_KEY
+
+    def _claim(self, token: str, client: Any) -> bool:
+        return bool(client.set(self.lock_key, token, nx=True, ex=SCHEDULE_LOCK_TTL_SECONDS))
+
+    def _release(self, token: str, client: Any) -> bool:
+        return bool(
+            client.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                "return redis.call('del', KEYS[1]) else return 0 end",
+                1,
+                self.lock_key,
+                token,
+            )
+        )
 
     def apply_async(self, args: Any = None, kwargs: Any = None, **options: Any) -> Any:
         task_id = str(options.get("task_id") or uuid.uuid4())
         redis_client = Redis.from_url(BROKER_URL, decode_responses=True)
         try:
-            if not _claim_schedule_lock(task_id, redis_client):
-                logger.info("reclaim_schedule_coalesced")
+            if not self._claim(task_id, redis_client):
+                logger.info("maintenance_schedule_coalesced task=%s", self.name)
                 return None
             task_kwargs = dict(kwargs or {})
             task_kwargs["_schedule_lock_token"] = task_id
@@ -74,7 +98,7 @@ class SingleFlightReclaimTask(Task):  # type: ignore[misc]
             try:
                 return super().apply_async(args=args, kwargs=task_kwargs, **options)
             except Exception:
-                _release_schedule_lock(task_id, redis_client)
+                self._release(task_id, redis_client)
                 raise
         except Exception:
             logger.warning("reclaim_schedule_publish_unavailable")
@@ -93,27 +117,69 @@ class SingleFlightReclaimTask(Task):  # type: ignore[misc]
     ) -> None:
         token = kwargs.get("_schedule_lock_token") if isinstance(kwargs, dict) else None
         if isinstance(token, str):
+            redis_client = Redis.from_url(BROKER_URL, decode_responses=True)
             try:
-                _release_schedule_lock(token)
+                self._release(token, redis_client)
             except Exception:
-                logger.warning("reclaim_schedule_lock_release_failed")
+                logger.warning("maintenance_schedule_lock_release_failed task=%s", self.name)
+            finally:
+                redis_client.close()  # type: ignore[no-untyped-call]
         super().after_return(status, retval, task_id, args, kwargs, einfo)
+
+
+class SingleFlightReclaimTask(SingleFlightMaintenanceTask):
+    lock_key = RECLAIM_LOCK_KEY
+
+
+class SingleFlightDeliveryTask(SingleFlightMaintenanceTask):
+    lock_key = DELIVERY_LOCK_KEY
 
 
 def _reclaim_with_database_lock(
     factory: sessionmaker[Session], store: MediaStore, connection: Connection, limit: int
 ) -> dict[str, int | str]:
-    acquired = bool(connection.execute(
-        text("SELECT pg_try_advisory_lock(:lock_id)"), {"lock_id": RECLAIM_ADVISORY_LOCK_ID}
-    ).scalar_one())
+    acquired = bool(
+        connection.execute(
+            text("SELECT pg_try_advisory_lock(:lock_id)"), {"lock_id": RECLAIM_ADVISORY_LOCK_ID}
+        ).scalar_one()
+    )
     if not acquired:
         return {"status": "overlap_skipped", "reclaimed": 0}
     try:
         count = reclaim_expired_uploads(factory, store, limit=limit)
         return {"status": "completed", "reclaimed": count}
     finally:
+        connection.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": RECLAIM_ADVISORY_LOCK_ID})
+
+
+def _coordinate_with_database_lock(
+    factory: sessionmaker[Session], connection: Connection, policy: DeliveryPolicy
+) -> dict[str, int | str]:
+    acquired = bool(
         connection.execute(
-            text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": RECLAIM_ADVISORY_LOCK_ID}
+            text("SELECT pg_try_advisory_lock(:lock_id)"), {"lock_id": DELIVERY_ADVISORY_LOCK_ID}
+        ).scalar_one()
+    )
+    if not acquired:
+        return {"status": "overlap_skipped", "scanned": 0, "published": 0, "blocked": 0, "exhausted": 0}
+    try:
+        result = coordinate_due_analysis_deliveries(
+            factory,
+            lambda task_id, attempt_id: celery_app.send_task(
+                "videoclip.transcribe_analysis", args=[task_id, attempt_id], retry=False
+            ),
+            policy=policy,
+        )
+        return {
+            "status": "completed",
+            "scanned": result.scanned,
+            "published": result.published,
+            "blocked": result.blocked,
+            "exhausted": result.exhausted,
+        }
+    finally:
+        connection.execute(
+            text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": DELIVERY_ADVISORY_LOCK_ID}
         )
 
 
@@ -146,6 +212,40 @@ def reclaim_expired_uploads_task(_schedule_lock_token: str | None = None) -> dic
         return result
     except Exception:
         logger.exception("reclaim_cycle_failed")
+        raise
+    finally:
+        engine.dispose()
+
+
+@celery_app.task(  # type: ignore[misc]
+    name="videoclip.maintenance.coordinate_analysis_deliveries",
+    base=SingleFlightDeliveryTask,
+    queue="maintenance",
+    acks_late=True,
+    reject_on_worker_lost=True,
+    ignore_result=True,
+    soft_time_limit=140,
+    time_limit=150,
+)
+def coordinate_analysis_deliveries_task(_schedule_lock_token: str | None = None) -> dict[str, int | str]:
+    del _schedule_lock_token
+    settings = get_settings()
+    engine = create_database_engine(settings)
+    policy = DeliveryPolicy.from_settings(settings)
+    try:
+        with engine.connect() as connection:
+            result = _coordinate_with_database_lock(create_session_factory(engine), connection, policy)
+        logger.info(
+            "analysis_delivery_cycle_finished status=%s scanned=%s published=%s blocked=%s exhausted=%s",
+            result["status"],
+            result["scanned"],
+            result["published"],
+            result["blocked"],
+            result["exhausted"],
+        )
+        return result
+    except Exception:
+        logger.exception("analysis_delivery_cycle_failed")
         raise
     finally:
         engine.dispose()

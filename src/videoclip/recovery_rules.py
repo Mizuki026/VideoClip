@@ -2,10 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
-
-QUEUE_RECOVERY_GRACE_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -27,6 +25,7 @@ def evaluate_recovery(
     execution_stop_confirmed: bool,
     is_current_attempt: bool,
     now: datetime,
+    delivery_budget_exhausted: bool = False,
 ) -> RecoveryEligibility:
     """Classify explicit recovery eligibility without treating timeouts as stop proof."""
     if video_status != "ready":
@@ -35,21 +34,12 @@ def evaluate_recovery(
         return RecoveryEligibility(False, "TRANSCRIPT_COMPLETE_AWAITING_SUMMARY")
     if not is_current_attempt:
         return RecoveryEligibility(False, "ATTEMPT_NOT_CURRENT")
+    if delivery_budget_exhausted:
+        return RecoveryEligibility(False, "ANALYSIS_DELIVERY_BUDGET_EXHAUSTED")
 
     if claim_count == 0:
         if attempt_status == "queued" and task_status == "queued":
-            if delivery_status in {"pending", "unknown", "failed"}:
-                return RecoveryEligibility(True, None)
-            if delivery_status == "sent":
-                if delivery_updated_at is None:
-                    return RecoveryEligibility(False, "DELIVERY_FACT_INCOMPLETE")
-                available_at = delivery_updated_at + timedelta(seconds=QUEUE_RECOVERY_GRACE_SECONDS)
-                if now >= available_at:
-                    return RecoveryEligibility(True, None, available_at)
-                return RecoveryEligibility(False, "DELIVERY_NOT_STALE", available_at)
-            return RecoveryEligibility(False, "DELIVERY_STATE_UNSUPPORTED")
-        if attempt_status == "failed" and task_status == "failed":
-            return RecoveryEligibility(True, None)
+            return RecoveryEligibility(False, "DELIVERY_COORDINATION_ACTIVE")
         return RecoveryEligibility(False, "ATTEMPT_NOT_RECOVERABLE")
 
     if claim_count != 1:

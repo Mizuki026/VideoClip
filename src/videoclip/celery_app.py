@@ -9,6 +9,9 @@ BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://127.0.0.1:6379/0")
 RECLAIM_INTERVAL_SECONDS = int(os.environ.get("UPLOAD_RECLAIM_INTERVAL_SECONDS", "60"))
 if not 60 <= RECLAIM_INTERVAL_SECONDS <= 3600:
     raise RuntimeError("UPLOAD_RECLAIM_INTERVAL_SECONDS must be between 60 and 3600")
+DELIVERY_INTERVAL_SECONDS = int(os.environ.get("ANALYSIS_DELIVERY_INTERVAL_SECONDS", "60"))
+if not 60 <= DELIVERY_INTERVAL_SECONDS <= 3600:
+    raise RuntimeError("ANALYSIS_DELIVERY_INTERVAL_SECONDS must be between 60 and 3600")
 
 celery_app = Celery(
     "videoclip",
@@ -26,6 +29,10 @@ celery_app.conf.update(
     task_routes={
         "videoclip.transcribe_analysis": {"queue": "analysis", "routing_key": "analysis.transcribe"},
         "videoclip.maintenance.reclaim_expired_uploads": {
+            "queue": "maintenance",
+            "routing_key": "maintenance.reclaim",
+        },
+        "videoclip.maintenance.coordinate_analysis_deliveries": {
             "queue": "maintenance",
             "routing_key": "maintenance.reclaim",
         },
@@ -48,6 +55,11 @@ celery_app.conf.update(
         "reclaim-expired-resumable-uploads": {
             "task": "videoclip.maintenance.reclaim_expired_uploads",
             "schedule": float(RECLAIM_INTERVAL_SECONDS),
+            "options": {"queue": "maintenance", "routing_key": "maintenance.reclaim"},
+        },
+        "coordinate-analysis-deliveries": {
+            "task": "videoclip.maintenance.coordinate_analysis_deliveries",
+            "schedule": float(DELIVERY_INTERVAL_SECONDS),
             "options": {"queue": "maintenance", "routing_key": "maintenance.reclaim"},
         },
     },

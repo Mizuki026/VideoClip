@@ -47,6 +47,14 @@ export interface AnalysisTask {
   delivery_status: string;
   delivery_updated_at: string;
   delivery_error_code: string | null;
+  delivery_operation_generation: number | null;
+  queue_entered_at: string | null;
+  delivery_next_check_at: string | null;
+  delivery_retry_count: number | null;
+  delivery_retry_limit: number | null;
+  delivery_deadline_at: string | null;
+  delivery_wait_reason: string | null;
+  delivery_failure_code: string | null;
   completed_segments: number;
   expected_segments: number;
   transcript_complete: boolean;

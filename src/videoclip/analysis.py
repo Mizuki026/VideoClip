@@ -5,12 +5,18 @@ import json
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any
 
 from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from videoclip.analysis_delivery import (
+    DeliveryPolicy,
+    current_delivery_wait_reason,
+    prepare_task_for_new_attempt,
+    task_delivery_exhausted,
+)
 from videoclip.models import (
     AnalysisAttempt,
     AnalysisExecution,
@@ -266,6 +272,8 @@ def build_configuration_snapshot(video: Video, settings: Settings) -> dict[str, 
 def submit_analysis_task(
     factory: sessionmaker[Session], owner_id: uuid.UUID, video_id: uuid.UUID, settings: Settings
 ) -> SubmittedTask:
+    now = datetime.now(UTC)
+    delivery_policy = DeliveryPolicy.from_settings(settings)
     with db_transaction(factory) as session:
         video = session.scalar(
             select(Video).where(Video.id == video_id, Video.owner_id == owner_id).with_for_update()
@@ -279,27 +287,26 @@ def submit_analysis_task(
             task = session.get(AnalysisTask, video.current_analysis_task_id)
             if task is None:
                 raise HTTPException(status_code=503, detail="analysis task association needs maintenance")
-            if task.status in {"queued", "running", "awaiting_summary"}:
-                attempt = session.get(AnalysisAttempt, task.current_attempt_id)
-                if attempt is None:
-                    raise HTTPException(status_code=503, detail="analysis attempt needs maintenance")
-                return SubmittedTask(task_id=task.id, attempt_id=attempt.id, created=False)
-            raise HTTPException(
-                status_code=409, detail="analysis task already exists; manual recovery is not available"
-            )
-
-        unconfirmed = session.scalar(
-            select(AnalysisExecution.id).where(AnalysisExecution.stop_confirmed_at.is_(None)).limit(1)
-        )
-        if unconfirmed is not None:
-            raise HTTPException(
-                status_code=409, detail="an earlier worker execution has not been confirmed stopped"
-            )
+            attempt = session.get(AnalysisAttempt, task.current_attempt_id)
+            if attempt is None:
+                raise HTTPException(status_code=503, detail="analysis attempt needs maintenance")
+            return SubmittedTask(task_id=task.id, attempt_id=attempt.id, created=False)
 
         snapshot = build_configuration_snapshot(video, settings)
         config_hash = canonical_sha256(snapshot)
         source_hash = snapshot["source"]["fingerprint"]
-        task = AnalysisTask(video_id=video.id, owner_id=owner_id, status="queued", stage="queued")
+        task = AnalysisTask(
+            video_id=video.id,
+            owner_id=owner_id,
+            status="queued",
+            stage="queued",
+            queue_entered_at=now,
+            delivery_next_check_at=now,
+            delivery_retry_count=0,
+            delivery_retry_limit=delivery_policy.retry_limit,
+            delivery_operation_count=0,
+            delivery_wait_reason="queued_for_delivery",
+        )
         session.add(task)
         session.flush()
         attempt = AnalysisAttempt(
@@ -317,8 +324,8 @@ def submit_analysis_task(
         session.flush()
         task.current_attempt_id = attempt.id
         video.current_analysis_task_id = task.id
-        video.analysis_task_created_at = datetime.now(UTC)
-        session.add(TaskDelivery(attempt_id=attempt.id, status="pending"))
+        video.analysis_task_created_at = now
+        session.add(TaskDelivery(attempt_id=attempt.id, status="pending", operation_generation=0))
         session.flush()
         return SubmittedTask(task_id=task.id, attempt_id=attempt.id, created=True)
 
@@ -329,8 +336,10 @@ def recover_analysis_attempt(
     video_id: uuid.UUID,
     task_id: uuid.UUID,
     parent_attempt_id: uuid.UUID,
+    policy: DeliveryPolicy | None = None,
 ) -> RecoverySubmission:
     now = datetime.now(UTC)
+    delivery_policy = policy or DeliveryPolicy()
     with db_transaction(factory) as session:
         video = session.scalar(
             select(Video).where(Video.id == video_id, Video.owner_id == owner_id).with_for_update()
@@ -401,6 +410,14 @@ def recover_analysis_attempt(
                     else None,
                 },
             )
+        if task_delivery_exhausted(task, now):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": task.delivery_failure_code or "ANALYSIS_DELIVERY_BUDGET_EXHAUSTED",
+                    "recovery_eligible": False,
+                },
+            )
         snapshot = parent.config_snapshot
         source = snapshot.get("source") if isinstance(snapshot, dict) else None
         try:
@@ -432,6 +449,13 @@ def recover_analysis_attempt(
         )
         if summary_only:
             _validated_transcript(session, video, parent)
+
+        budget_error = prepare_task_for_new_attempt(task, now, delivery_policy)
+        if budget_error is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": budget_error, "recovery_eligible": False},
+            )
 
         if parent.claim_count == 0:
             parent.failure_code = "ATTEMPT_SUPERSEDED"
@@ -469,7 +493,7 @@ def recover_analysis_attempt(
         task.stage = "queued_summary" if summary_only else "queued"
         task.summary_status = "waiting" if summary_only else "not_started"
         task.failure_code = None
-        session.add(TaskDelivery(attempt_id=child.id, status="pending"))
+        session.add(TaskDelivery(attempt_id=child.id, status="pending", operation_generation=0))
         if summary_only:
             _copy_complete_transcript(session, parent, child)
         session.flush()
@@ -482,6 +506,7 @@ def continue_summary_attempt(
     video_id: uuid.UUID,
     task_id: uuid.UUID,
     parent_attempt_id: uuid.UUID,
+    policy: DeliveryPolicy | None = None,
 ) -> RecoverySubmission:
     with db_transaction(factory) as session:
         video = session.scalar(
@@ -547,7 +572,22 @@ def continue_summary_attempt(
                 status_code=409,
                 detail={"code": "STOP_CONFIRMATION_REQUIRED", "summary_available": False},
             )
+        if task_delivery_exhausted(task, datetime.now(UTC)):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": task.delivery_failure_code or "ANALYSIS_DELIVERY_BUDGET_EXHAUSTED",
+                    "summary_available": False,
+                },
+            )
         _validated_transcript(session, video, parent)
+        now = datetime.now(UTC)
+        budget_error = prepare_task_for_new_attempt(task, now, policy or DeliveryPolicy())
+        if budget_error is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": budget_error, "summary_available": False},
+            )
         next_number = (
             int(
                 session.scalar(
@@ -579,33 +619,9 @@ def continue_summary_attempt(
         task.stage = "queued_summary"
         task.summary_status = "waiting"
         task.failure_code = None
-        session.add(TaskDelivery(attempt_id=child.id, status="pending"))
+        session.add(TaskDelivery(attempt_id=child.id, status="pending", operation_generation=0))
         session.flush()
         return RecoverySubmission(task_id=task.id, attempt_id=child.id, created=True)
-
-
-def set_delivery_status(
-    factory: sessionmaker[Session],
-    attempt_id: uuid.UUID,
-    status: Literal["sent", "unknown", "failed"],
-    code: str | None,
-) -> None:
-    with db_transaction(factory) as session:
-        delivery = session.get(TaskDelivery, attempt_id, with_for_update=True)
-        if delivery is None or delivery.status != "pending":
-            return
-        now = datetime.now(UTC)
-        delivery.status = status
-        delivery.error_code = code
-        delivery.confirmed_at = now if status == "sent" else None
-        delivery.updated_at = now
-
-
-def mark_publish_started(factory: sessionmaker[Session], attempt_id: uuid.UUID) -> None:
-    with db_transaction(factory) as session:
-        delivery = session.get(TaskDelivery, attempt_id, with_for_update=True)
-        if delivery is not None and delivery.status == "pending" and delivery.publish_started_at is None:
-            delivery.publish_started_at = datetime.now(UTC)
 
 
 def task_response(
@@ -671,6 +687,21 @@ def task_response(
             .limit(1)
         )
         is_current = task.current_attempt_id == attempt.id
+        now = datetime.now(UTC)
+        queue_wait_reason = current_delivery_wait_reason(session, task, attempt, delivery, now)
+        delivery_budget_exhausted = (
+            task.delivery_failure_code is not None or queue_wait_reason == "delivery_budget_exhausted"
+        )
+        delivery_failure_code = task.delivery_failure_code
+        if delivery_budget_exhausted and delivery_failure_code is None:
+            if (
+                task.delivery_retry_count is not None
+                and task.delivery_retry_limit is not None
+                and task.delivery_retry_count >= task.delivery_retry_limit
+            ):
+                delivery_failure_code = "ANALYSIS_DELIVERY_RETRIES_EXHAUSTED"
+            else:
+                delivery_failure_code = "ANALYSIS_DELIVERY_DEADLINE_EXPIRED"
         eligibility = evaluate_recovery(
             video_status=video.status,
             task_status=task.status,
@@ -681,7 +712,8 @@ def task_response(
             attempt_stop_confirmed=attempt.stop_confirmed_at is not None,
             execution_stop_confirmed=(execution is not None and execution.stop_confirmed_at is not None),
             is_current_attempt=is_current,
-            now=datetime.now(UTC),
+            now=now,
+            delivery_budget_exhausted=delivery_budget_exhausted,
         )
         return AnalysisTaskResponse(
             id=task.id,
@@ -692,6 +724,14 @@ def task_response(
             delivery_status=delivery.status,
             delivery_updated_at=delivery.updated_at,
             delivery_error_code=delivery.error_code,
+            delivery_operation_generation=delivery.operation_generation,
+            queue_entered_at=task.queue_entered_at,
+            delivery_next_check_at=task.delivery_next_check_at,
+            delivery_retry_count=task.delivery_retry_count,
+            delivery_retry_limit=task.delivery_retry_limit,
+            delivery_deadline_at=task.delivery_deadline_at,
+            delivery_wait_reason=queue_wait_reason,
+            delivery_failure_code=delivery_failure_code,
             completed_segments=int(completed),
             expected_segments=int(expected),
             transcript_complete=(int(expected) > 0 and int(completed) == int(expected)),

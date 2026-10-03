@@ -21,6 +21,7 @@ import {
   uploadErrorMessage,
 } from './resumableUpload';
 import {
+  deliveryWaitLabel,
   errorMessage,
   formatBytes,
   formatDate,
@@ -949,7 +950,11 @@ function AnalysisPanel({ task, csrf, busy, onStart, onRecover, onSummarize, onCl
       ) : (
         <>
           <div className="stage-line"><span className={`stage-marker ${task.status}`} /><div><strong>{stageLabel(task.stage)}</strong><small>{task.stage}</small></div></div>
-          <div className="progress-facts"><div><strong>{task.expected_segments === 0 ? '—' : `${task.completed_segments} / ${task.expected_segments}`}</strong><span>已完成片段</span></div><div><strong>{task.delivery_status === 'sent' ? '已投递' : task.delivery_status === 'pending' ? '等待投递' : task.delivery_status === 'unknown' ? '结果不确定' : task.delivery_status === 'failed' ? '投递失败' : '状态未知'}</strong><span>队列投递</span></div></div>
+          <div className="progress-facts"><div><strong>{task.expected_segments === 0 ? '—' : `${task.completed_segments} / ${task.expected_segments}`}</strong><span>已完成片段</span></div><div><strong>{task.delivery_status === 'sent' ? '已发送，等待领取' : task.delivery_status === 'pending' ? '等待投递确认' : task.delivery_status === 'unknown' ? '发送结果不确定' : task.delivery_status === 'failed' ? '投递失败' : '状态未知'}</strong><span>队列投递</span></div></div>
+          {task.delivery_wait_reason && <StatusRow label="排队协调" value={deliveryWaitLabel(task.delivery_wait_reason) ?? '等待后端检查'} />}
+          {task.delivery_next_check_at && <StatusRow label="下次协调检查" value={formatDate(task.delivery_next_check_at)} />}
+          {task.delivery_retry_count !== null && task.delivery_retry_limit !== null && <StatusRow label="已接受的补投" value={`${task.delivery_retry_count} / ${task.delivery_retry_limit}`} />}
+          {task.delivery_failure_code && <p className="inline-error">{errorMessage(task.delivery_failure_code)}</p>}
           {task.delivery_error_code && <p className="inline-error">{errorMessage(task.delivery_error_code)}</p>}
           {task.failure_code && <p className="inline-error">{errorMessage(task.failure_code) ?? `处理原因：${task.failure_code}`}</p>}
           {task.summary_status === 'running' && <p className="summary-running"><span className="spinner spinner-small" />正在生成总结，结果尚未发布。</p>}

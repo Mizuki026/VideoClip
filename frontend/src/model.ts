@@ -27,9 +27,13 @@ const errorLabels: Record<string, string> = {
   TRANSCRIPT_MANIFEST_INCOMPLETE: '转写片段不完整，暂不能生成总结。',
   SUMMARY_CONFIGURATION_INCOMPATIBLE: '原分析配置无法验证，暂不能继续总结。',
   STOP_CONFIRMATION_REQUIRED: '旧 Worker 尚未确认停止。请按本项目 Stage 2 维护步骤停止并确认 Worker 后，再刷新此页。',
-  DELIVERY_NOT_STALE: '任务仍在等待 Worker；可稍后刷新查看。',
-  BROKER_CONFIRMATION_UNKNOWN: '队列确认结果不确定，请检查投递状态后再按页面资格恢复。',
-  BROKER_PAYLOAD_REJECTED: '队列未接受任务；可使用页面提供的恢复操作。',
+  DELIVERY_COORDINATION_ACTIVE: '任务仍在持久化排队，后台会继续协调投递。',
+  ANALYSIS_DELIVERY_RETRIES_EXHAUSTED: '分析任务投递补偿次数已耗尽，需要人工处理。',
+  ANALYSIS_DELIVERY_DEADLINE_EXPIRED: '分析任务投递等待已超出期限，需要人工处理。',
+  ANALYSIS_DELIVERY_BUDGET_UNAVAILABLE: '分析任务投递预算不可用，需要人工检查。',
+  ANALYSIS_DELIVERY_BUDGET_EXHAUSTED: '分析任务投递预算已耗尽，需要人工处理。',
+  BROKER_CONFIRMATION_UNKNOWN: '队列发送结果暂未确认；后台会按持久化计划复查。',
+  BROKER_PAYLOAD_REJECTED: '队列拒绝了发送内容；后台会在独立补偿预算内重试。',
   ATTEMPT_NOT_CURRENT: '该次处理已被后续尝试替代，请刷新页面。',
   VIDEO_DELETION_IN_PROGRESS: '视频正在删除，删除期间不可读取媒体或分析结果。',
   ATTEMPT_TEMP_CLEANUP_FAILED: '临时文件清理失败。分析结果状态保持不变，可单独重试清理。',
@@ -38,6 +42,17 @@ const errorLabels: Record<string, string> = {
   UPLOAD_MEDIA_INVALID: '服务器未能验证视频格式、音轨或时间轴。',
   MEDIA_DURATION_UNSUPPORTED: '视频时长必须大于 0 且不超过 20 分钟。',
   UPLOAD_IO_FAILED: '服务器写入视频失败，请检查本机数据目录后重试。',
+};
+
+const deliveryWaitLabels: Record<string, string> = {
+  queued_for_delivery: '已排队，等待首次投递',
+  delivery_operation_pending: '投递结果待确认',
+  delivery_claim_pending: '消息已发送，等待分析 Worker 领取',
+  delivery_retry_wait: '投递异常，等待有界退避后补偿',
+  queue_order_wait: '按持久化排队顺序等待前序任务',
+  execution_slot_occupied: '分析执行位被其他任务占用',
+  stop_confirmation_required: '停止确认阻断，新执行者不会启动',
+  delivery_budget_exhausted: '投递补偿预算或期限已耗尽',
 };
 
 export function taskStatusLabel(status: string): string {
@@ -51,6 +66,11 @@ export function stageLabel(stage: string): string {
 export function errorMessage(code: string | null): string | null {
   if (!code) return null;
   return errorLabels[code] ?? `后端返回状态：${code}`;
+}
+
+export function deliveryWaitLabel(reason: string | null): string | null {
+  if (!reason) return null;
+  return deliveryWaitLabels[reason] ?? `投递协调状态：${reason}`;
 }
 
 export function shouldPollTask(task: AnalysisTask): boolean {

@@ -8,27 +8,24 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from typing import BinaryIO, Literal
+from typing import BinaryIO
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
-from kombu.exceptions import EncodeError  # type: ignore[import-untyped]
 from sqlalchemy import select
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from videoclip.analysis import (
     continue_summary_attempt,
-    mark_publish_started,
     recover_analysis_attempt,
-    set_delivery_status,
     submit_analysis_task,
     summary_response,
     task_response,
     transcript_response,
 )
+from videoclip.analysis_delivery import DeliveryPolicy, coordinate_analysis_delivery
 from videoclip.celery_app import celery_app
 from videoclip.db import check_database, create_database_engine, create_session_factory
 from videoclip.models import AnalysisAttempt, AnalysisExecution, SessionRecord, User, Video
@@ -291,38 +288,23 @@ def create_app(
         resolved_factory = session_factory
     resolved_store = storage or MediaStore(resolved_settings.app_data_root)
 
-    def publish_task(task_id: uuid.UUID, attempt_id: uuid.UUID) -> object:
+    def publish_task(task_id: str, attempt_id: str) -> object:
         if task_publisher is not None:
-            return task_publisher(str(task_id), str(attempt_id))
+            return task_publisher(task_id, attempt_id)
         return celery_app.send_task(
-            "videoclip.transcribe_analysis", args=[str(task_id), str(attempt_id)], retry=False
+            "videoclip.transcribe_analysis", args=[task_id, attempt_id], retry=False
         )
 
-    def publish_new_attempt(task_id: uuid.UUID, attempt_id: uuid.UUID) -> None:
-        try:
-            mark_publish_started(resolved_factory, attempt_id)
-        except SQLAlchemyError:
-            logger.warning("analysis_delivery_start_unrecorded task_id=%s", task_id.hex)
-            return
-        try:
-            publish_task(task_id, attempt_id)
-        except Exception as exc:
-            delivery_state: Literal["failed", "unknown"] = (
-                "failed" if isinstance(exc, EncodeError) else "unknown"
-            )
-            delivery_error = (
-                "BROKER_PAYLOAD_REJECTED" if delivery_state == "failed" else "BROKER_CONFIRMATION_UNKNOWN"
-            )
-            try:
-                set_delivery_status(resolved_factory, attempt_id, delivery_state, delivery_error)
-            except SQLAlchemyError:
-                logger.warning("analysis_delivery_error_unrecorded task_id=%s", task_id.hex)
-            logger.warning("analysis_publish_unconfirmed task_id=%s error=%s", task_id.hex, delivery_error)
-        else:
-            try:
-                set_delivery_status(resolved_factory, attempt_id, "sent", None)
-            except SQLAlchemyError:
-                logger.warning("analysis_delivery_confirmation_unrecorded task_id=%s", task_id.hex)
+    delivery_policy = DeliveryPolicy.from_settings(resolved_settings)
+
+    def coordinate_delivery(task_id: uuid.UUID, attempt_id: uuid.UUID) -> None:
+        coordinate_analysis_delivery(
+            resolved_factory,
+            task_id,
+            attempt_id,
+            publish_task,
+            policy=delivery_policy,
+        )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -660,8 +642,7 @@ def create_app(
         assert current is not None
         user, _ = current
         submitted = submit_analysis_task(resolved_factory, user.id, video_id, resolved_settings)
-        if submitted.created:
-            publish_new_attempt(submitted.task_id, submitted.attempt_id)
+        coordinate_delivery(submitted.task_id, submitted.attempt_id)
         response = task_response(resolved_factory, user.id, video_id, submitted.task_id)
         return response
 
@@ -680,9 +661,15 @@ def create_app(
         _require_csrf(request, resolved_settings, resolved_factory, current)
         assert current is not None
         user, _ = current
-        recovered = recover_analysis_attempt(resolved_factory, user.id, video_id, task_id, payload.attempt_id)
-        if recovered.created:
-            publish_new_attempt(recovered.task_id, recovered.attempt_id)
+        recovered = recover_analysis_attempt(
+            resolved_factory,
+            user.id,
+            video_id,
+            task_id,
+            payload.attempt_id,
+            policy=delivery_policy,
+        )
+        coordinate_delivery(recovered.task_id, recovered.attempt_id)
         return task_response(
             resolved_factory,
             user.id,
@@ -706,9 +693,15 @@ def create_app(
         _require_csrf(request, resolved_settings, resolved_factory, current)
         assert current is not None
         user, _ = current
-        continued = continue_summary_attempt(resolved_factory, user.id, video_id, task_id, payload.attempt_id)
-        if continued.created:
-            publish_new_attempt(continued.task_id, continued.attempt_id)
+        continued = continue_summary_attempt(
+            resolved_factory,
+            user.id,
+            video_id,
+            task_id,
+            payload.attempt_id,
+            policy=delivery_policy,
+        )
+        coordinate_delivery(continued.task_id, continued.attempt_id)
         return task_response(
             resolved_factory,
             user.id,

@@ -128,6 +128,14 @@ class AnalysisTaskResponse(BaseModel):
     delivery_status: str
     delivery_updated_at: datetime
     delivery_error_code: str | None
+    delivery_operation_generation: int | None
+    queue_entered_at: datetime | None
+    delivery_next_check_at: datetime | None
+    delivery_retry_count: int | None
+    delivery_retry_limit: int | None
+    delivery_deadline_at: datetime | None
+    delivery_wait_reason: str | None
+    delivery_failure_code: str | None
     completed_segments: int
     expected_segments: int
     transcript_complete: bool

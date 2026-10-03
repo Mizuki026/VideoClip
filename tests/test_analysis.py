@@ -23,6 +23,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
+import videoclip.analysis_delivery as analysis_delivery
 import videoclip.analysis_worker as analysis_worker
 import videoclip.stop_confirmation as stop_confirmation
 from videoclip.analysis import (
@@ -30,6 +31,12 @@ from videoclip.analysis import (
     canonical_sha256,
     recover_analysis_attempt,
     submit_analysis_task,
+    task_response,
+)
+from videoclip.analysis_delivery import (
+    DeliveryPolicy,
+    coordinate_analysis_delivery,
+    coordinate_due_analysis_deliveries,
 )
 from videoclip.analysis_supervisor import BoundaryUnknown, WorkerBoundary
 from videoclip.analysis_worker import (
@@ -49,6 +56,7 @@ from videoclip.analysis_worker import (
 )
 from videoclip.asr_client import AsrCallError, transcribe
 from videoclip.celery_app import celery_app
+from videoclip.execution_gate import EXECUTION_ADVISORY_LOCK_KEY
 from videoclip.main import create_app
 from videoclip.models import (
     AnalysisAttempt,
@@ -135,6 +143,38 @@ def _register(client: TestClient, username: str) -> uuid.UUID:
     return uuid.UUID(response.json()["id"])
 
 
+def _mark_attempt_failed_stopped(
+    factory: sessionmaker[Session], task_id: uuid.UUID, attempt_id: uuid.UUID
+) -> None:
+    now = datetime.now(UTC)
+    with factory.begin() as session:
+        task = session.get(AnalysisTask, task_id)
+        attempt = session.get(AnalysisAttempt, attempt_id)
+        assert task is not None and attempt is not None
+        execution = AnalysisExecution(
+            task_id=task.id,
+            attempt_id=attempt.id,
+            worker_id="test-confirmed-worker",
+            backend_pid=1,
+            stop_confirmed_at=now,
+            stop_confirmation_source="test_operator_evidence",
+        )
+        session.add(execution)
+        session.flush()
+        attempt.claim_count = 1
+        attempt.execution_id = execution.id
+        attempt.first_claimed_at = now - timedelta(seconds=1)
+        attempt.status = "failed"
+        attempt.failure_code = "ASR_REQUEST_FAILED"
+        attempt.stop_confirmed_at = now
+        attempt.finished_at = now
+        task.status = "failed"
+        task.stage = "failed"
+        task.failure_code = "ASR_REQUEST_FAILED"
+        if task.delivery_deadline_at is not None:
+            task.delivery_blocked_since = attempt.first_claimed_at
+
+
 def test_submit_freezes_configuration_and_is_idempotent(
     test_settings: Settings, session_factory: sessionmaker[Session]
 ) -> None:
@@ -198,6 +238,44 @@ def test_submit_freezes_configuration_and_is_idempotent(
 
         removed = client.delete(f"/videos/{video_id}", headers=headers)
         assert removed.status_code == 204
+
+
+def test_duplicate_submission_returns_the_existing_terminal_task(
+    test_settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    published: list[tuple[str, str]] = []
+    app = create_app(
+        test_settings,
+        session_factory,
+        MediaStore(test_settings.app_data_root),
+        run_recovery=False,
+        task_publisher=lambda task_id, attempt_id: published.append((task_id, attempt_id)),
+    )
+    with TestClient(app) as client:
+        owner_id = _register(client, "analysis-terminal-idempotency")
+        video_id = _video(session_factory, app.state.store, owner_id)
+        from tests.helpers import csrf, mutate_headers
+
+        headers = mutate_headers(csrf(client))
+        first = client.post(f"/videos/{video_id}/tasks", headers=headers)
+        assert first.status_code == 202
+        task_id = uuid.UUID(first.json()["id"])
+        attempt_id = uuid.UUID(first.json()["current_attempt_id"])
+        with session_factory.begin() as session:
+            task = session.get(AnalysisTask, task_id)
+            attempt = session.get(AnalysisAttempt, attempt_id)
+            assert task is not None and attempt is not None
+            task.status = "failed"
+            task.stage = "failed"
+            task.failure_code = "TEST_TERMINAL_FIXTURE"
+            attempt.status = "failed"
+            attempt.failure_code = "TEST_TERMINAL_FIXTURE"
+
+        repeated = client.post(f"/videos/{video_id}/tasks", headers=headers)
+        assert repeated.status_code == 202
+        assert repeated.json()["id"] == str(task_id)
+        assert repeated.json()["status"] == "failed"
+        assert len(published) == 1
 
 
 def test_submission_and_task_reads_are_owner_scoped(
@@ -280,37 +358,50 @@ def test_proven_local_payload_failure_is_failed_without_task_failure(
 
 
 def test_database_commit_before_publish_exit_leaves_pending_delivery(
-    test_settings: Settings,
     session_factory: sessionmaker[Session],
-    monkeypatch: pytest.MonkeyPatch,
+    test_settings: Settings,
 ) -> None:
-    import videoclip.main as main
+    with TestClient(create_app(test_settings, session_factory, run_recovery=False)) as client:
+        owner_id = _register(client, "analysis-pending-delivery")
+        video_id = _video(session_factory, MediaStore(test_settings.app_data_root), owner_id)
+    submitted = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
+    started_at = datetime.now(UTC)
+
+    def exit_after_operation_reservation(_task_id: str, _attempt_id: str) -> None:
+        raise SystemExit("injected process exit after durable operation reservation")
+
+    with pytest.raises(SystemExit, match="durable operation reservation"):
+        coordinate_analysis_delivery(
+            session_factory,
+            submitted.task_id,
+            submitted.attempt_id,
+            exit_after_operation_reservation,
+            now=started_at,
+        )
+    with session_factory() as session:
+        task = session.get(AnalysisTask, submitted.task_id)
+        delivery = session.get(TaskDelivery, submitted.attempt_id)
+        assert task is not None and task.delivery_retry_count == 0
+        assert delivery is not None and delivery.status == "pending"
+        assert delivery.operation_generation == 1
 
     published: list[tuple[str, str]] = []
-
-    def fail_before_publish(*_args: Any, **_kwargs: Any) -> None:
-        raise SQLAlchemyError("injected publish-start persistence failure")
-
-    monkeypatch.setattr(main, "mark_publish_started", fail_before_publish)
-    app = create_app(
-        test_settings,
+    retry_at = started_at + timedelta(seconds=61)
+    result = coordinate_analysis_delivery(
         session_factory,
-        run_recovery=False,
-        task_publisher=lambda task_id, attempt_id: published.append((task_id, attempt_id)),
+        submitted.task_id,
+        submitted.attempt_id,
+        lambda task_id, attempt_id: published.append((task_id, attempt_id)),
+        now=retry_at,
     )
-    with TestClient(app) as client:
-        owner_id = _register(client, "analysis-pending-delivery")
-        video_id = _video(session_factory, app.state.store, owner_id)
-        from tests.helpers import csrf, mutate_headers
-
-        headers = mutate_headers(csrf(client))
-        first = client.post(f"/videos/{video_id}/tasks", headers=headers)
-        assert first.status_code == 202
-        assert first.json()["delivery_status"] == "pending"
-        duplicate = client.post(f"/videos/{video_id}/tasks", headers=headers)
-        assert duplicate.status_code == 202
-        assert duplicate.json()["delivery_status"] == "pending"
-        assert published == []
+    assert result == "sent"
+    assert published == [(str(submitted.task_id), str(submitted.attempt_id))]
+    with session_factory() as session:
+        task = session.get(AnalysisTask, submitted.task_id)
+        delivery = session.get(TaskDelivery, submitted.attempt_id)
+        assert task is not None and task.delivery_retry_count == 1
+        assert delivery is not None and delivery.status == "sent"
+        assert delivery.operation_generation == 2
 
 
 def test_successful_publish_with_lost_confirmation_stays_pending(
@@ -318,19 +409,12 @@ def test_successful_publish_with_lost_confirmation_stays_pending(
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import videoclip.main as main
-
     published: list[tuple[str, str]] = []
-    original_set_status = main.set_delivery_status
 
-    def lose_sent_confirmation(
-        factory: sessionmaker[Session], attempt_id: uuid.UUID, state: str, code: str | None
-    ) -> None:
-        if state == "sent":
-            raise SQLAlchemyError("injected lost sent confirmation")
-        original_set_status(factory, attempt_id, state, code)  # pragma: no cover
+    def lose_sent_confirmation(*_args: Any, **_kwargs: Any) -> bool:
+        raise SQLAlchemyError("injected lost sent confirmation")
 
-    monkeypatch.setattr(main, "set_delivery_status", lose_sent_confirmation)
+    monkeypatch.setattr(analysis_delivery, "_record_delivery_outcome", lose_sent_confirmation)
     app = create_app(
         test_settings,
         session_factory,
@@ -350,6 +434,115 @@ def test_successful_publish_with_lost_confirmation_stays_pending(
         assert duplicate.status_code == 202
         assert duplicate.json()["delivery_status"] == "pending"
         assert len(published) == 1
+
+
+def test_http_submission_and_due_scanner_race_is_generation_safe(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    published: list[tuple[str, str]] = []
+
+    def publisher(task_id: str, attempt_id: str) -> None:
+        published.append((task_id, attempt_id))
+        if len(published) == 1:
+            entered.set()
+            assert release.wait(10)
+            raise OSError("injected uncertain first send")
+
+    store = MediaStore(test_settings.app_data_root)
+    app = create_app(
+        test_settings, session_factory, store, run_recovery=False, task_publisher=publisher
+    )
+    with TestClient(app) as client:
+        owner_id = _register(client, "analysis-http-scanner-race")
+        video_id = _video(session_factory, store, owner_id)
+        from tests.helpers import csrf, mutate_headers
+
+        headers = mutate_headers(csrf(client))
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            submission = pool.submit(client.post, f"/videos/{video_id}/tasks", headers=headers)
+            assert entered.wait(10)
+            with session_factory() as session:
+                task = session.scalar(select(AnalysisTask).where(AnalysisTask.video_id == video_id))
+                assert task is not None and task.current_attempt_id is not None
+                task_id, attempt_id = task.id, task.current_attempt_id
+
+            scan = coordinate_due_analysis_deliveries(
+                session_factory,
+                publisher,
+                now=datetime.now(UTC) + timedelta(seconds=61),
+            )
+            assert scan.scanned == 1 and scan.published == 1
+            lease = ExecutionLease.acquire(test_engine)
+            assert lease is not None
+            try:
+                claim = _claim_attempt(lease, task_id, attempt_id, "test-http-scanner-race")
+                assert claim is not None
+            finally:
+                lease.release()
+            release.set()
+            response = submission.result(timeout=15)
+
+        assert response.status_code == 202
+        assert response.json()["status"] == "running"
+        assert len(published) == 2
+        with session_factory() as session:
+            task = session.get(AnalysisTask, task_id)
+            delivery = session.get(TaskDelivery, attempt_id)
+            attempt = session.get(AnalysisAttempt, attempt_id)
+            assert task is not None and task.status == "running"
+            assert task.delivery_operation_count == 2 and task.delivery_retry_count == 1
+            assert delivery is not None and delivery.operation_generation == 2
+            assert delivery.status == "sent"
+            assert attempt is not None and attempt.claim_count == 1
+
+
+def test_deletion_invalidates_an_inflight_delivery_and_its_late_message(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    with TestClient(create_app(test_settings, session_factory, store, run_recovery=False)) as client:
+        owner_id = _register(client, "analysis-delete-delivery-race")
+        video_id = _video(session_factory, store, owner_id)
+    submitted = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_publisher(_task_id: str, _attempt_id: str) -> None:
+        entered.set()
+        assert release.wait(10)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        publication = pool.submit(
+            coordinate_analysis_delivery,
+            session_factory,
+            submitted.task_id,
+            submitted.attempt_id,
+            blocked_publisher,
+        )
+        assert entered.wait(10)
+        assert delete_video(session_factory, store, owner_id, video_id) == 204
+        release.set()
+        assert publication.result(timeout=15) == "superseded"
+
+    lease = ExecutionLease.acquire(test_engine)
+    assert lease is not None
+    try:
+        assert _claim_attempt(
+            lease, submitted.task_id, submitted.attempt_id, "test-deleted-late-message"
+        ) is None
+    finally:
+        lease.release()
+    with session_factory() as session:
+        assert session.get(Video, video_id) is None
+        assert session.get(AnalysisTask, submitted.task_id) is None
+        assert session.get(TaskDelivery, submitted.attempt_id) is None
+        assert session.scalar(select(func.count(AnalysisExecution.id))) == 0
 
 
 def test_broker_error_cannot_overwrite_claimed_execution(
@@ -382,7 +575,7 @@ def test_broker_error_cannot_overwrite_claimed_execution(
         response = client.post(f"/videos/{video_id}/tasks", headers=mutate_headers(csrf(client)))
         assert response.status_code == 202
         assert response.json()["status"] == "running"
-        assert response.json()["delivery_status"] == "unknown"
+        assert response.json()["delivery_status"] == "pending"
         assert response.json()["execution_state"] == "stop_unconfirmed"
 
 
@@ -548,15 +741,31 @@ def test_global_execution_slot_blocks_a_competing_video(
         owner_id = _register(client, "analysis-global-slot")
         video_a = _video(session_factory, store, owner_id)
         video_b = _video(session_factory, store, owner_id)
+        video_c = _video(session_factory, store, owner_id)
     submitted_a = submit_analysis_task(session_factory, owner_id, video_a, test_settings)
-    submitted_b = submit_analysis_task(session_factory, owner_id, video_b, test_settings)
     first_lease = ExecutionLease.acquire(test_engine)
     assert first_lease is not None
-    assert (
-        _claim_attempt(first_lease, submitted_a.task_id, submitted_a.attempt_id, "test-worker-one")
-        is not None
-    )
+    claim_a = _claim_attempt(first_lease, submitted_a.task_id, submitted_a.attempt_id, "test-worker-one")
+    assert claim_a is not None
     first_lease.release()
+
+    # Other videos may obtain durable queue eligibility while the first execution owns the slot.
+    submitted_b = submit_analysis_task(session_factory, owner_id, video_b, test_settings)
+    submitted_c = submit_analysis_task(session_factory, owner_id, video_c, test_settings)
+    published: list[tuple[str, str]] = []
+    now = datetime.now(UTC) + timedelta(seconds=1)
+    for submitted in (submitted_b, submitted_c):
+        assert (
+            coordinate_analysis_delivery(
+                session_factory,
+                submitted.task_id,
+                submitted.attempt_id,
+                lambda task_id, attempt_id: published.append((task_id, attempt_id)),
+                now=now,
+            )
+            == "blocked"
+        )
+    assert published == []
 
     second_lease = ExecutionLease.acquire(test_engine)
     assert second_lease is not None
@@ -564,15 +773,519 @@ def test_global_execution_slot_blocks_a_competing_video(
         _claim_attempt(second_lease, submitted_b.task_id, submitted_b.attempt_id, "test-worker-two") is None
     )
     second_lease.release()
+    # Early ACK may consume B's message at the real analysis task entry point while A owns the slot.
+    assert transcribe_analysis(str(submitted_b.task_id), str(submitted_b.attempt_id)) == {
+        "status": "ignored_not_eligible"
+    }
     with session_factory() as session:
         task = session.get(AnalysisTask, submitted_b.task_id)
         assert task is not None and task.status == "queued"
+        assert task.delivery_wait_reason == "stop_confirmation_required"
+        assert task.delivery_retry_count == 0
+        assert task.delivery_deadline_at is None
+        queued_c = session.get(AnalysisTask, submitted_c.task_id)
+        assert queued_c is not None and queued_c.status == "queued"
+        assert queued_c.delivery_retry_count == 0
         assert (
             session.scalar(
                 select(func.count(AnalysisExecution.id)).where(AnalysisExecution.stop_confirmed_at.is_(None))
             )
             == 1
         )
+
+    release_lease = ExecutionLease.acquire(test_engine)
+    assert release_lease is not None
+    release_maker = sessionmaker(bind=release_lease.connection, autoflush=False, expire_on_commit=False)
+    analysis_worker._confirm_inline_test_stop(
+        release_maker,
+        release_lease,
+        claim_a,
+        cleanup_state="cleaned",
+        reason="controlled_execution_fixture",
+    )
+    release_lease.release()
+    status_b = task_response(session_factory, owner_id, video_b, submitted_b.task_id)
+    status_c = task_response(session_factory, owner_id, video_c, submitted_c.task_id)
+    assert status_b.delivery_wait_reason == "queued_for_delivery"
+    assert status_c.delivery_wait_reason == "queue_order_wait"
+    resumed: list[str] = []
+    resumed_at = now + timedelta(seconds=61)
+    cycle = coordinate_due_analysis_deliveries(
+        session_factory,
+        lambda task_id, _attempt_id: resumed.append(task_id),
+        now=resumed_at,
+    )
+    assert cycle.scanned == 2 and cycle.published == 1
+    with session_factory() as session:
+        queued = [session.get(AnalysisTask, item) for item in (submitted_b.task_id, submitted_c.task_id)]
+        tasks = [item for item in queued if item is not None]
+        assert len(tasks) == 2 and all(item.queue_entered_at is not None for item in tasks)
+        expected = [str(item.id) for item in sorted(tasks, key=lambda task: (task.queue_entered_at, task.id))]
+    assert resumed == expected[:1]
+
+    second_lease = ExecutionLease.acquire(test_engine)
+    assert second_lease is not None
+    # A later message arriving first still cannot steal the persisted queue position.
+    assert _claim_attempt(
+        second_lease, submitted_c.task_id, submitted_c.attempt_id, "test-worker-out-of-order"
+    ) is None
+    second_lease.release()
+    assert transcribe_analysis(str(submitted_c.task_id), str(submitted_c.attempt_id)) == {
+        "status": "ignored_not_eligible"
+    }
+    second_lease = ExecutionLease.acquire(test_engine)
+    assert second_lease is not None
+    claim_b = _claim_attempt(second_lease, submitted_b.task_id, submitted_b.attempt_id, "test-worker-two")
+    assert claim_b is not None
+    second_lease.release()
+    assert transcribe_analysis(str(submitted_c.task_id), str(submitted_c.attempt_id)) == {
+        "status": "ignored_not_eligible"
+    }
+    with session_factory() as session:
+        assert (
+            session.scalar(
+                select(func.count(AnalysisExecution.id)).where(AnalysisExecution.stop_confirmed_at.is_(None))
+            )
+            == 1
+        )
+
+    release_lease = ExecutionLease.acquire(test_engine)
+    assert release_lease is not None
+    release_maker = sessionmaker(bind=release_lease.connection, autoflush=False, expire_on_commit=False)
+    analysis_worker._confirm_inline_test_stop(
+        release_maker,
+        release_lease,
+        claim_b,
+        cleanup_state="cleaned",
+        reason="controlled_execution_fixture",
+    )
+    release_lease.release()
+    coordinate_due_analysis_deliveries(
+        session_factory,
+        lambda task_id, _attempt_id: resumed.append(task_id),
+        now=resumed_at + timedelta(seconds=61),
+    )
+    third_lease = ExecutionLease.acquire(test_engine)
+    assert third_lease is not None
+    claim_c = _claim_attempt(third_lease, submitted_c.task_id, submitted_c.attempt_id, "test-worker-three")
+    assert claim_c is not None
+    third_lease.release()
+
+
+def test_delivery_reservation_contends_on_the_worker_execution_gate(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    with TestClient(create_app(test_settings, session_factory, run_recovery=False)) as client:
+        owner_id = _register(client, "analysis-delivery-execution-gate")
+        video_id = _video(session_factory, store, owner_id)
+    submitted = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
+    now = datetime.now(UTC) + timedelta(seconds=1)
+    policy = DeliveryPolicy(interval_seconds=10, operation_timeout_seconds=10)
+    published: list[tuple[str, str]] = []
+
+    locker = test_engine.connect()
+    try:
+        assert locker.execute(
+            text("SELECT pg_try_advisory_lock(:lock_key)"),
+            {"lock_key": EXECUTION_ADVISORY_LOCK_KEY},
+        ).scalar_one()
+        locker.commit()
+        assert (
+            coordinate_analysis_delivery(
+                session_factory,
+                submitted.task_id,
+                submitted.attempt_id,
+                lambda task_id, attempt_id: published.append((task_id, attempt_id)),
+                now=now,
+                policy=policy,
+            )
+            == "blocked"
+        )
+        with session_factory() as session:
+            task = session.get(AnalysisTask, submitted.task_id)
+            delivery = session.get(TaskDelivery, submitted.attempt_id)
+            assert task is not None and task.delivery_wait_reason == "execution_slot_occupied"
+            assert task.delivery_retry_count == 0 and task.delivery_deadline_at is None
+            assert delivery is not None and delivery.operation_generation == 0
+        assert published == []
+    finally:
+        locker.execute(
+            text("SELECT pg_advisory_unlock(:lock_key)"),
+            {"lock_key": EXECUTION_ADVISORY_LOCK_KEY},
+        )
+        locker.commit()
+        locker.close()
+
+    assert (
+        coordinate_analysis_delivery(
+            session_factory,
+            submitted.task_id,
+            submitted.attempt_id,
+            lambda task_id, attempt_id: published.append((task_id, attempt_id)),
+            now=now + timedelta(seconds=11),
+            policy=policy,
+        )
+        == "sent"
+    )
+    assert published == [(str(submitted.task_id), str(submitted.attempt_id))]
+    with session_factory() as session:
+        task = session.get(AnalysisTask, submitted.task_id)
+        delivery = session.get(TaskDelivery, submitted.attempt_id)
+        assert task is not None and task.delivery_retry_count == 0 and task.delivery_operation_count == 1
+        assert delivery is not None and delivery.operation_generation == 1
+
+
+def test_delivery_scan_uses_stable_queue_order_not_message_order(
+    test_settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    with TestClient(create_app(test_settings, session_factory, store, run_recovery=False)) as client:
+        owner_id = _register(client, "analysis-delivery-order")
+        video_ids = [_video(session_factory, store, owner_id) for _ in range(3)]
+    submitted = [
+        submit_analysis_task(session_factory, owner_id, video_id, test_settings) for video_id in video_ids
+    ]
+    queue_time = datetime.now(UTC) + timedelta(seconds=1)
+    with session_factory.begin() as session:
+        for item in submitted:
+            task = session.get(AnalysisTask, item.task_id)
+            assert task is not None
+            task.queue_entered_at = queue_time
+            task.delivery_next_check_at = queue_time
+    expected_order = [str(item.task_id) for item in sorted(submitted, key=lambda item: item.task_id.int)]
+    later_submission = next(item for item in submitted if str(item.task_id) == expected_order[-1])
+    published: list[str] = []
+    published_out_of_order: list[str] = []
+    assert (
+        coordinate_analysis_delivery(
+            session_factory,
+            later_submission.task_id,
+            later_submission.attempt_id,
+            lambda task_id, _attempt_id: published_out_of_order.append(task_id),
+            now=queue_time,
+        )
+        == "queue_order_wait"
+    )
+    assert published_out_of_order == []
+
+    result = coordinate_due_analysis_deliveries(
+        session_factory,
+        lambda task_id, _attempt_id: published.append(task_id),
+        now=queue_time + timedelta(seconds=61),
+        policy=DeliveryPolicy(scan_limit=3),
+    )
+    assert result.scanned == 3
+    assert result.published == 1
+    assert published == expected_order[:1]
+    with session_factory() as session:
+        later_tasks = [session.get(AnalysisTask, item.task_id) for item in submitted]
+        assert all(
+            task is not None
+            and (
+                task.delivery_wait_reason == "delivery_claim_pending"
+                if str(task.id) == expected_order[0]
+                else task.delivery_wait_reason == "queue_order_wait"
+            )
+            for task in later_tasks
+        )
+
+
+def test_delivery_retries_are_idempotent_bounded_and_independent_of_execution_budget(
+    test_settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    with TestClient(create_app(test_settings, session_factory, store, run_recovery=False)) as client:
+        owner_id = _register(client, "analysis-delivery-budget")
+        video_id = _video(session_factory, store, owner_id)
+    delivery_settings = test_settings.model_copy(update={"analysis_delivery_retry_limit": 2})
+    submitted = submit_analysis_task(session_factory, owner_id, video_id, delivery_settings)
+    base = datetime.now(UTC) + timedelta(seconds=1)
+    policy = DeliveryPolicy(
+        retry_limit=2,
+        deadline_seconds=1000,
+        scan_limit=4,
+        interval_seconds=10,
+        operation_timeout_seconds=10,
+        backoff_base_seconds=10,
+        backoff_max_seconds=40,
+    )
+    publishes: list[tuple[str, str]] = []
+
+    def broker_unknown(task_id: str, attempt_id: str) -> None:
+        publishes.append((task_id, attempt_id))
+        raise OSError("injected unknown broker result")
+
+    first = coordinate_due_analysis_deliveries(session_factory, broker_unknown, now=base, policy=policy)
+    assert first.scanned == 1 and first.published == 1
+    assert (
+        coordinate_analysis_delivery(
+            session_factory,
+            submitted.task_id,
+            submitted.attempt_id,
+            broker_unknown,
+            now=base,
+            policy=policy,
+        )
+        == "not_due"
+    )
+    assert (
+        coordinate_due_analysis_deliveries(
+            session_factory, broker_unknown, now=base + timedelta(seconds=9), policy=policy
+        ).scanned
+        == 0
+    )
+    coordinate_due_analysis_deliveries(
+        session_factory, broker_unknown, now=base + timedelta(seconds=10), policy=policy
+    )
+    coordinate_due_analysis_deliveries(
+        session_factory, broker_unknown, now=base + timedelta(seconds=30), policy=policy
+    )
+    exhausted = coordinate_due_analysis_deliveries(
+        session_factory, broker_unknown, now=base + timedelta(seconds=70), policy=policy
+    )
+    assert exhausted.exhausted == 1
+    assert len(publishes) == 3
+
+    with session_factory() as session:
+        task = session.get(AnalysisTask, submitted.task_id)
+        attempt = session.get(AnalysisAttempt, submitted.attempt_id)
+        delivery = session.get(TaskDelivery, submitted.attempt_id)
+        assert task is not None and task.status == "failed"
+        assert task.failure_code == "ANALYSIS_DELIVERY_RETRIES_EXHAUSTED"
+        assert task.delivery_failure_code == "ANALYSIS_DELIVERY_RETRIES_EXHAUSTED"
+        assert task.delivery_retry_count == 2 and task.delivery_operation_count == 3
+        assert attempt is not None and attempt.status == "failed" and attempt.claim_count == 0
+        assert delivery is not None and delivery.status == "failed"
+        assert delivery.operation_generation == 3
+        assert task.current_attempt_id == submitted.attempt_id
+        assert session.scalar(select(func.count(SummaryRequest.id))) == 0
+
+    assert (
+        coordinate_due_analysis_deliveries(
+            session_factory, broker_unknown, now=base + timedelta(seconds=200), policy=policy
+        ).scanned
+        == 0
+    )
+    assert len(publishes) == 3
+
+
+def test_delivery_deadline_pauses_for_execution_slot_occupancy(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    with TestClient(create_app(test_settings, session_factory, store, run_recovery=False)) as client:
+        owner_id = _register(client, "analysis-delivery-deadline")
+        blocker_video = _video(session_factory, store, owner_id)
+        video_id = _video(session_factory, store, owner_id)
+    blocker = submit_analysis_task(session_factory, owner_id, blocker_video, test_settings)
+    submitted = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
+    policy = DeliveryPolicy(
+        retry_limit=3,
+        deadline_seconds=15,
+        scan_limit=4,
+        interval_seconds=10,
+        operation_timeout_seconds=10,
+        backoff_base_seconds=10,
+        backoff_max_seconds=60,
+    )
+    base = datetime.now(UTC) + timedelta(seconds=1)
+    blocked_lease = ExecutionLease.acquire(test_engine)
+    assert blocked_lease is not None
+    try:
+        blocker_claim = _claim_attempt(
+            blocked_lease, blocker.task_id, blocker.attempt_id, "deadline-blocker"
+        )
+    finally:
+        blocked_lease.release()
+    assert blocker_claim is not None
+    with session_factory.begin() as session:
+        execution = session.get(AnalysisExecution, blocker_claim.execution_id)
+        assert execution is not None
+        execution.started_at = base
+    assert (
+        coordinate_analysis_delivery(
+            session_factory, submitted.task_id, submitted.attempt_id, lambda *_: None, now=base, policy=policy
+        )
+        == "blocked"
+    )
+    with session_factory() as session:
+        task = session.get(AnalysisTask, submitted.task_id)
+        assert task is not None and task.delivery_deadline_at is None
+        assert task.delivery_retry_count == 0
+
+    # A scheduler outage must not count time already covered by the blocking execution.
+    with session_factory.begin() as session:
+        task = session.get(AnalysisTask, submitted.task_id)
+        assert task is not None
+        task.delivery_deadline_at = base + timedelta(seconds=5)
+    later = base + timedelta(days=2)
+    assert (
+        coordinate_analysis_delivery(
+            session_factory,
+            submitted.task_id,
+            submitted.attempt_id,
+            lambda *_: None,
+            now=later,
+            policy=policy,
+        )
+        == "blocked"
+    )
+    with session_factory() as session:
+        task = session.get(AnalysisTask, submitted.task_id)
+        assert task is not None and task.status == "queued"
+        assert task.delivery_retry_count == 0
+        assert task.delivery_failure_code is None
+        assert task.delivery_blocked_since == base
+
+    release_lease = ExecutionLease.acquire(test_engine)
+    assert release_lease is not None
+    release_maker = sessionmaker(bind=release_lease.connection, autoflush=False, expire_on_commit=False)
+    analysis_worker._confirm_inline_test_stop(
+        release_maker,
+        release_lease,
+        blocker_claim,
+        cleanup_state="cleaned",
+        reason="controlled_execution_fixture",
+    )
+    release_lease.release()
+    assert (
+        coordinate_analysis_delivery(
+            session_factory,
+            submitted.task_id,
+            submitted.attempt_id,
+            lambda *_: None,
+            now=later + timedelta(seconds=11),
+            policy=policy,
+        )
+        == "sent"
+    )
+    with session_factory() as session:
+        task = session.get(AnalysisTask, submitted.task_id)
+        assert task is not None and task.status == "queued"
+        assert task.delivery_retry_count == 0
+        assert task.delivery_deadline_at is not None
+        assert task.delivery_deadline_at > later + timedelta(seconds=11)
+
+
+def test_delivery_deadline_pauses_for_recorded_execution_block_and_expires_separately(
+    test_settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    with TestClient(create_app(test_settings, session_factory, store, run_recovery=False)) as client:
+        owner_id = _register(client, "analysis-delivery-deadline-pause")
+        video_id = _video(session_factory, store, owner_id)
+    delivery_settings = test_settings.model_copy(update={"analysis_delivery_retry_limit": 5})
+    submitted = submit_analysis_task(session_factory, owner_id, video_id, delivery_settings)
+    base = datetime.now(UTC) + timedelta(seconds=1)
+    policy = DeliveryPolicy(
+        retry_limit=5,
+        deadline_seconds=15,
+        scan_limit=4,
+        interval_seconds=10,
+        operation_timeout_seconds=10,
+        backoff_base_seconds=10,
+        backoff_max_seconds=60,
+    )
+
+    def unknown(_task_id: str, _attempt_id: str) -> None:
+        raise OSError("injected broker uncertainty")
+
+    assert (
+        coordinate_analysis_delivery(
+            session_factory, submitted.task_id, submitted.attempt_id, unknown, now=base, policy=policy
+        )
+        == "unknown"
+    )
+    with session_factory.begin() as session:
+        task = session.get(AnalysisTask, submitted.task_id)
+        assert task is not None
+        task.delivery_blocked_since = base + timedelta(seconds=5)
+        task.delivery_next_check_at = base + timedelta(seconds=20)
+
+    # The recorded pause shifts the fixed deadline forward before a due retry is accepted.
+    assert (
+        coordinate_analysis_delivery(
+            session_factory,
+            submitted.task_id,
+            submitted.attempt_id,
+            unknown,
+            now=base + timedelta(seconds=20),
+            policy=policy,
+        )
+        == "unknown"
+    )
+    with session_factory() as session:
+        task = session.get(AnalysisTask, submitted.task_id)
+        assert task is not None
+        assert task.delivery_deadline_at == base + timedelta(seconds=30)
+        assert task.delivery_retry_count == 1
+
+    terminal = coordinate_due_analysis_deliveries(
+        session_factory,
+        unknown,
+        now=base + timedelta(seconds=40),
+        policy=policy,
+    )
+    assert terminal.exhausted == 1
+    with session_factory() as session:
+        task = session.get(AnalysisTask, submitted.task_id)
+        assert task is not None and task.failure_code == "ANALYSIS_DELIVERY_DEADLINE_EXPIRED"
+        assert task.delivery_retry_count == 1 and task.delivery_retry_limit == 5
+
+
+def test_stale_delivery_result_cannot_overwrite_a_newer_generation(
+    test_settings: Settings,
+    session_factory: sessionmaker[Session],
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    with TestClient(create_app(test_settings, session_factory, store, run_recovery=False)) as client:
+        owner_id = _register(client, "analysis-delivery-generation")
+        video_id = _video(session_factory, store, owner_id)
+    submitted = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
+    base = datetime.now(UTC) + timedelta(seconds=1)
+    policy = DeliveryPolicy(operation_timeout_seconds=10, backoff_base_seconds=10)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def late_unknown(_task_id: str, _attempt_id: str) -> None:
+        entered.set()
+        assert release.wait(10)
+        raise OSError("late result from generation one")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(
+            coordinate_analysis_delivery,
+            session_factory,
+            submitted.task_id,
+            submitted.attempt_id,
+            late_unknown,
+            now=base,
+            policy=policy,
+        )
+        assert entered.wait(10)
+        second = coordinate_analysis_delivery(
+            session_factory,
+            submitted.task_id,
+            submitted.attempt_id,
+            lambda *_: None,
+            now=base + timedelta(seconds=11),
+            policy=policy,
+        )
+        assert second == "sent"
+        release.set()
+        assert first.result(timeout=10) == "superseded"
+
+    with session_factory() as session:
+        task = session.get(AnalysisTask, submitted.task_id)
+        delivery = session.get(TaskDelivery, submitted.attempt_id)
+        assert task is not None and task.delivery_retry_count == 1
+        assert delivery is not None and delivery.operation_generation == 2
+        assert delivery.status == "sent" and delivery.error_code is None
 
 
 def test_request_started_before_checkpoint_failure_prevents_reclaim(
@@ -929,17 +1642,9 @@ def test_recovery_rules_separate_delivery_age_from_stop_confirmation() -> None:
         "is_current_attempt": True,
         "now": now,
     }
-    for delivery_status in ("pending", "unknown", "failed"):
-        assert evaluate_recovery(delivery_status=delivery_status, **common).eligible
-
-    recent_sent = evaluate_recovery(delivery_status="sent", **common)
-    assert not recent_sent.eligible and recent_sent.error_code == "DELIVERY_NOT_STALE"
-    assert recent_sent.available_at == now + timedelta(minutes=5)
-    stale_sent = evaluate_recovery(
-        delivery_status="sent",
-        **{**common, "delivery_updated_at": now - timedelta(minutes=6)},
-    )
-    assert stale_sent.eligible
+    for delivery_status in ("pending", "unknown", "failed", "sent"):
+        queued = evaluate_recovery(delivery_status=delivery_status, **common)
+        assert not queued.eligible and queued.error_code == "DELIVERY_COORDINATION_ACTIVE"
 
     claimed = evaluate_recovery(
         **{
@@ -978,6 +1683,9 @@ def test_recovery_rules_separate_delivery_age_from_stop_confirmation() -> None:
     deleting = evaluate_recovery(**{**common, "video_status": "deleting", "delivery_status": "pending"})
     assert not deleting.eligible and deleting.error_code == "VIDEO_DELETION_IN_PROGRESS"
 
+    exhausted = evaluate_recovery(delivery_status="failed", delivery_budget_exhausted=True, **common)
+    assert not exhausted.eligible and exhausted.error_code == "ANALYSIS_DELIVERY_BUDGET_EXHAUSTED"
+
 
 def test_manual_recovery_is_idempotent_and_old_attempt_messages_are_rejected(
     test_settings: Settings,
@@ -1003,10 +1711,19 @@ def test_manual_recovery_is_idempotent_and_old_attempt_messages_are_rejected(
         assert original.status_code == 202
         task_id = uuid.UUID(original.json()["id"])
         parent_id = uuid.UUID(original.json()["attempt"]["id"])
+        deadline_before_recovery = datetime.now(UTC) + timedelta(hours=1)
         with session_factory.begin() as session:
+            task = session.get(AnalysisTask, task_id)
             delivery = session.get(TaskDelivery, parent_id)
+            assert task is not None and task.queue_entered_at is not None
             assert delivery is not None
-            delivery.updated_at = datetime.now(UTC) - timedelta(minutes=6)
+            original_queue_time = task.queue_entered_at
+            task.delivery_retry_count = 2
+            task.delivery_retry_limit = 8
+            task.delivery_operation_count = 4
+            task.delivery_deadline_at = deadline_before_recovery
+            delivery.operation_generation = 4
+        _mark_attempt_failed_stopped(session_factory, task_id, parent_id)
 
         url = f"/videos/{video_id}/tasks/{task_id}/recover"
         request = {"attempt_id": str(parent_id)}
@@ -1037,10 +1754,23 @@ def test_manual_recovery_is_idempotent_and_old_attempt_messages_are_rejected(
             )
             assert len(attempts) == 2
             assert attempts[0].status == "failed"
-            assert attempts[0].failure_code == "ATTEMPT_SUPERSEDED"
+            assert attempts[0].failure_code == "ASR_REQUEST_FAILED"
             assert attempts[1].parent_attempt_id == attempts[0].id
             assert attempts[1].config_sha256 == attempts[0].config_sha256
             assert attempts[1].work_directory_name != attempts[0].work_directory_name
+            recovered_task = session.get(AnalysisTask, task_id)
+            recovered_delivery = session.get(TaskDelivery, child_id)
+            assert recovered_task is not None
+            assert (
+                recovered_task.queue_entered_at is not None
+                and recovered_task.queue_entered_at > original_queue_time
+            )
+            assert recovered_task.delivery_retry_count == 3
+            assert recovered_task.delivery_retry_limit == 8
+            assert recovered_task.delivery_operation_count == 5
+            assert recovered_task.delivery_deadline_at is not None
+            assert recovered_task.delivery_deadline_at > deadline_before_recovery
+            assert recovered_delivery is not None and recovered_delivery.operation_generation == 1
 
     lease = ExecutionLease.acquire(test_engine)
     assert lease is not None
@@ -1057,6 +1787,7 @@ def test_recovery_rejects_source_metadata_that_no_longer_matches_the_frozen_snap
         owner_id = _register(client, "analysis-source-changed")
         video_id = _video(session_factory, client.app.state.store, owner_id)
     submitted = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
+    _mark_attempt_failed_stopped(session_factory, submitted.task_id, submitted.attempt_id)
     with session_factory.begin() as session:
         video = session.get(Video, video_id)
         assert video is not None
@@ -1069,7 +1800,7 @@ def test_recovery_rejects_source_metadata_that_no_longer_matches_the_frozen_snap
         task = session.get(AnalysisTask, submitted.task_id)
         attempt = session.get(AnalysisAttempt, submitted.attempt_id)
         assert task is not None and task.current_attempt_id == submitted.attempt_id
-        assert attempt is not None and attempt.status == "queued"
+        assert attempt is not None and attempt.status == "failed"
 
 
 def test_recovery_and_video_deletion_serialize_on_the_video_row(
@@ -2034,9 +2765,7 @@ def test_stop_confirmation_binds_identity_is_idempotent_and_preserves_request_bu
     test_engine: Any,
     session_factory: sessionmaker[Session],
 ) -> None:
-    claim, _, _ = _claim_bound_execution(
-        test_settings, test_engine, session_factory, "transaction"
-    )
+    claim, _, _ = _claim_bound_execution(test_settings, test_engine, session_factory, "transaction")
     identity = analysis_worker._execution_identity(claim)
     with session_factory.begin() as session:
         execution = session.get(AnalysisExecution, claim.execution_id)
@@ -2087,9 +2816,12 @@ def test_stop_confirmation_binds_identity_is_idempotent_and_preserves_request_bu
         assert task is not None and task.status == "failed" and task.summary_status == "failed"
         assert attempt is not None and attempt.status == "failed" and attempt.cleanup_state == "pending"
         assert request is not None and request.status == "failed"
-        assert session.scalar(
-            select(func.count(SummaryRequest.id)).where(SummaryRequest.task_id == claim.task_id)
-        ) == 1
+        assert (
+            session.scalar(
+                select(func.count(SummaryRequest.id)).where(SummaryRequest.task_id == claim.task_id)
+            )
+            == 1
+        )
 
 
 def test_confirmation_database_failure_keeps_the_execution_slot(
@@ -2117,9 +2849,12 @@ def test_confirmation_database_failure_keeps_the_execution_slot(
         execution = session.get(AnalysisExecution, claim.execution_id)
         assert execution is not None and execution.stop_confirmed_at is None
         assert execution.stop_evidence_sha256 is None
-        assert session.scalar(
-            select(func.count(AnalysisExecution.id)).where(AnalysisExecution.stop_confirmed_at.is_(None))
-        ) == 1
+        assert (
+            session.scalar(
+                select(func.count(AnalysisExecution.id)).where(AnalysisExecution.stop_confirmed_at.is_(None))
+            )
+            == 1
+        )
 
 
 def test_late_confirmation_for_old_execution_cannot_release_new_execution_slot(
@@ -2127,9 +2862,7 @@ def test_late_confirmation_for_old_execution_cannot_release_new_execution_slot(
     test_engine: Any,
     session_factory: sessionmaker[Session],
 ) -> None:
-    old_claim, _, _ = _claim_bound_execution(
-        test_settings, test_engine, session_factory, "old"
-    )
+    old_claim, _, _ = _claim_bound_execution(test_settings, test_engine, session_factory, "old")
     old_identity = analysis_worker._execution_identity(old_claim)
     with session_factory.begin() as session:
         execution = session.get(AnalysisExecution, old_claim.execution_id)
@@ -2189,16 +2922,12 @@ def test_late_confirmation_for_old_execution_cannot_release_new_execution_slot(
         analysis_worker._execution_identity(new_claim),
         execution_id=old_claim.execution_id,
     )
-    wrong_execution_evidence = worker_stop_evidence(
-        wrong_execution_identity, session_stopped=True
-    )
+    wrong_execution_evidence = worker_stop_evidence(wrong_execution_identity, session_stopped=True)
     assert confirm_stopped_execution(session_factory, wrong_execution_evidence) == "rejected"
     assert confirm_stopped_execution(session_factory, old_evidence) == "already_confirmed"
     with session_factory() as session:
         unconfirmed = list(
-            session.scalars(
-                select(AnalysisExecution.id).where(AnalysisExecution.stop_confirmed_at.is_(None))
-            )
+            session.scalars(select(AnalysisExecution.id).where(AnalysisExecution.stop_confirmed_at.is_(None)))
         )
         assert unconfirmed == [new_claim.execution_id]
         new_execution = session.get(AnalysisExecution, new_claim.execution_id)

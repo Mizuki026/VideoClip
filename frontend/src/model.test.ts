@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { errorMessage, formatBytes, formatDuration, shouldPollTask, stageLabel, taskStatusLabel } from './model';
+import { deliveryWaitLabel, errorMessage, formatBytes, formatDuration, shouldPollTask, stageLabel, taskStatusLabel } from './model';
 import type { AnalysisTask } from './types';
 
 function task(overrides: Partial<AnalysisTask> = {}): AnalysisTask {
@@ -12,6 +12,14 @@ function task(overrides: Partial<AnalysisTask> = {}): AnalysisTask {
     delivery_status: 'pending',
     delivery_updated_at: '2026-10-02T00:00:00Z',
     delivery_error_code: null,
+    delivery_operation_generation: 0,
+    queue_entered_at: '2026-10-02T00:00:00Z',
+    delivery_next_check_at: null,
+    delivery_retry_count: 0,
+    delivery_retry_limit: 8,
+    delivery_deadline_at: null,
+    delivery_wait_reason: 'queued_for_delivery',
+    delivery_failure_code: null,
     completed_segments: 0,
     expected_segments: 0,
     transcript_complete: false,
@@ -65,6 +73,8 @@ describe('presentation rules for backend facts', () => {
     expect(errorMessage('ATTEMPT_CLEANUP_NOT_ELIGIBLE')).toContain('尚未确认');
     expect(errorMessage('STORAGE_OPERATION_FAILED')).toContain('原视频');
     expect(errorMessage(null)).toBeNull();
+    expect(errorMessage('ANALYSIS_DELIVERY_RETRIES_EXHAUSTED')).toContain('投递补偿次数已耗尽');
+    expect(deliveryWaitLabel('stop_confirmation_required')).toContain('停止确认阻断');
   });
 
   it('maps known API states and formats media metadata without inventing percentages', () => {

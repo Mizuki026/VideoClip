@@ -189,6 +189,13 @@ class AnalysisTask(Base):
             name="ck_analysis_tasks_summary_status",
         ),
         Index("ix_analysis_tasks_owner_created", "owner_id", "created_at"),
+        Index(
+            "ix_analysis_tasks_delivery_due",
+            "queue_entered_at",
+            "delivery_next_check_at",
+            "id",
+            postgresql_where=text("status = 'queued' AND queue_entered_at IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -212,6 +219,16 @@ class AnalysisTask(Base):
     stage: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
     summary_status: Mapped[str] = mapped_column(String(24), nullable=False, default="not_started")
     failure_code: Mapped[str | None] = mapped_column(String(64))
+    # NULL fields deliberately keep pre-Stage-4 history outside automatic coordination.
+    queue_entered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivery_next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivery_retry_count: Mapped[int | None] = mapped_column(Integer)
+    delivery_retry_limit: Mapped[int | None] = mapped_column(Integer)
+    delivery_operation_count: Mapped[int | None] = mapped_column(Integer)
+    delivery_deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivery_blocked_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivery_wait_reason: Mapped[str | None] = mapped_column(String(64))
+    delivery_failure_code: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -284,6 +301,7 @@ class TaskDelivery(Base):
     publish_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_code: Mapped[str | None] = mapped_column(String(64))
+    operation_generation: Mapped[int | None] = mapped_column(Integer)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )

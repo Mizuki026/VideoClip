@@ -92,6 +92,27 @@ class Settings(BaseSettings):
     max_asr_response_bytes: int = Field(default=1_048_576, ge=1, le=4_194_304, alias="MAX_RESPONSE_BYTES")
     max_media_diagnostic_bytes: int = Field(default=8192, ge=512, le=65_536, alias="MAX_DIAGNOSTIC_BYTES")
     celery_broker_url: str = Field(default="redis://127.0.0.1:6379/0", alias="CELERY_BROKER_URL")
+    analysis_delivery_retry_limit: int = Field(
+        default=8, ge=1, le=32, alias="ANALYSIS_DELIVERY_RETRY_LIMIT"
+    )
+    analysis_delivery_deadline_seconds: int = Field(
+        default=86_400, ge=60, le=604_800, alias="ANALYSIS_DELIVERY_DEADLINE_SECONDS"
+    )
+    analysis_delivery_scan_limit: int = Field(
+        default=4, ge=1, le=8, alias="ANALYSIS_DELIVERY_SCAN_LIMIT"
+    )
+    analysis_delivery_interval_seconds: int = Field(
+        default=60, ge=60, le=3600, alias="ANALYSIS_DELIVERY_INTERVAL_SECONDS"
+    )
+    analysis_delivery_operation_timeout_seconds: int = Field(
+        default=60, ge=30, le=600, alias="ANALYSIS_DELIVERY_OPERATION_TIMEOUT_SECONDS"
+    )
+    analysis_delivery_backoff_base_seconds: int = Field(
+        default=60, ge=1, le=3600, alias="ANALYSIS_DELIVERY_BACKOFF_BASE_SECONDS"
+    )
+    analysis_delivery_backoff_max_seconds: int = Field(
+        default=900, ge=60, le=86_400, alias="ANALYSIS_DELIVERY_BACKOFF_MAX_SECONDS"
+    )
     worker_id: str = Field(default="videoclip-worker", alias="WORKER_ID")
     db_host: str = Field(default="127.0.0.1", alias="DB_HOST")
     db_port: int = Field(default=55442, ge=1, le=65535, alias="DB_PORT")
@@ -122,6 +143,10 @@ class Settings(BaseSettings):
             raise ValueError("SILICONFLOW_BASE_URL must be an HTTPS base URL without a trailing slash")
         if self.audio_sample_format != "s16le":
             raise ValueError("AUDIO_SAMPLE_FORMAT must be s16le")
+        if self.analysis_delivery_backoff_max_seconds < self.analysis_delivery_backoff_base_seconds:
+            raise ValueError(
+                "ANALYSIS_DELIVERY_BACKOFF_MAX_SECONDS must be at least the configured base"
+            )
         return self
 
     @property

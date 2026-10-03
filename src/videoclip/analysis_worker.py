@@ -31,6 +31,11 @@ from videoclip.analysis_supervisor import (
     register_execution_with_supervisor,
 )
 from videoclip.db import create_database_engine
+from videoclip.execution_gate import (
+    EXECUTION_ADVISORY_LOCK_KEY,
+    find_next_queued_task,
+    find_unconfirmed_execution,
+)
 from videoclip.models import (
     AnalysisAttempt,
     AnalysisExecution,
@@ -62,7 +67,7 @@ from videoclip.summarization import (
 )
 
 logger = logging.getLogger("videoclip.analysis_worker")
-ADVISORY_LOCK_KEY = 0x566964656F436C69
+ADVISORY_LOCK_KEY = EXECUTION_ADVISORY_LOCK_KEY
 PCM_SAMPLE_WIDTH = 2
 CHECK_INTERVAL_SECONDS = 1.0
 
@@ -309,12 +314,9 @@ def _claim_attempt(
             or attempt.task_id != task.id
         ):
             return None
-        if (
-            session.scalar(
-                select(AnalysisExecution.id).where(AnalysisExecution.stop_confirmed_at.is_(None)).limit(1)
-            )
-            is not None
-        ):
+        if find_unconfirmed_execution(session) is not None:
+            return None
+        if find_next_queued_task(session) != task.id:
             return None
         execution_id = uuid.uuid4()
         execution = AnalysisExecution(
@@ -334,9 +336,14 @@ def _claim_attempt(
         session.add(execution)
         attempt.claim_count = 1
         attempt.execution_id = execution_id
-        attempt.first_claimed_at = datetime.now(UTC)
+        now = datetime.now(UTC)
+        attempt.first_claimed_at = now
         attempt.status = "running"
         task.status = "running"
+        task.delivery_next_check_at = None
+        task.delivery_wait_reason = None
+        if task.delivery_deadline_at is not None:
+            task.delivery_blocked_since = now
         task.stage = "summarizing" if attempt.execution_mode == "summary_only" else "validating_source"
         if attempt.execution_mode == "summary_only":
             task.summary_status = "running"

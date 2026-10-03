@@ -400,6 +400,10 @@ def delete_video(
                 task.status = "failed"
                 task.stage = "failed"
                 task.failure_code = "VIDEO_DELETION_REQUESTED"
+                task.queue_entered_at = None
+                task.delivery_next_check_at = None
+                task.delivery_blocked_since = None
+                task.delivery_wait_reason = None
                 task_attempts = list(
                     session.scalars(
                         select(AnalysisAttempt)
