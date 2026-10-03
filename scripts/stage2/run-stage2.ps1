@@ -8,7 +8,7 @@ if (-not (Test-Path -LiteralPath $environmentFile)) {
 
 Push-Location $repoRoot
 try {
-    & docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile build api worker
+    & docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile build api worker maintenance-worker beat
     if ($LASTEXITCODE -ne 0) { throw "Stage 2 image build failed: $LASTEXITCODE" }
     & docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile up -d postgres redis
     if ($LASTEXITCODE -ne 0) { throw "Stage 2 database and Redis startup failed: $LASTEXITCODE" }
@@ -27,7 +27,7 @@ try {
 
     & docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile run --rm api alembic upgrade head
     if ($LASTEXITCODE -ne 0) { throw "Stage 2 database migration failed: $LASTEXITCODE" }
-    & docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile up -d api worker
+    & docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile up -d api worker maintenance-worker beat
     if ($LASTEXITCODE -ne 0) { throw "Stage 2 API or Worker startup failed: $LASTEXITCODE" }
 
     $deadline = [DateTime]::UtcNow.AddMinutes(3)
@@ -42,6 +42,18 @@ try {
 
     $workerIds = @(& docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile ps -q worker)
     if ($LASTEXITCODE -ne 0 -or $workerIds.Count -ne 1) { throw 'Stage 2 must run exactly one Worker container.' }
+    $maintenanceIds = @(& docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile ps -q maintenance-worker)
+    if ($LASTEXITCODE -ne 0 -or $maintenanceIds.Count -ne 1) { throw 'Stage 2 must run exactly one maintenance Worker container.' }
+    $beatIds = @(& docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile ps -q beat)
+    if ($LASTEXITCODE -ne 0 -or $beatIds.Count -ne 1) { throw 'Stage 2 must run exactly one Celery Beat container.' }
+    $analysisCommand = (& docker inspect --format '{{json .Config.Cmd}}' $workerIds[0]).Trim()
+    $maintenanceCommand = (& docker inspect --format '{{json .Config.Cmd}}' $maintenanceIds[0]).Trim()
+    if ($analysisCommand -notmatch '"--queues=analysis"' -or $analysisCommand -notmatch '"--concurrency=1"') {
+        throw 'The analysis Worker must consume only the analysis queue with concurrency one.'
+    }
+    if ($maintenanceCommand -notmatch '"--queues=maintenance"' -or $maintenanceCommand -notmatch '"--concurrency=1"') {
+        throw 'The maintenance Worker must consume only the maintenance queue with concurrency one.'
+    }
     & docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile ps
 }
 finally {

@@ -131,7 +131,7 @@ services:
     secrets:
       - postgres_password
     command:
-      ["celery", "-A", "videoclip.celery_app:celery_app", "worker", "--loglevel=INFO", "--concurrency=1", "--prefetch-multiplier=1", "--hostname=stage2@%h"]
+      ["celery", "-A", "videoclip.celery_app:celery_app", "worker", "--queues=analysis", "--loglevel=INFO", "--concurrency=1", "--prefetch-multiplier=1", "--hostname=stage2-analysis@%h"]
     volumes:
       - type: bind
         source: ${MVP_STAGE1_DATA_DIR:?set MVP_STAGE1_DATA_DIR to the private E drive business directory}/app
@@ -140,6 +140,82 @@ services:
     pids_limit: 128
     restart: "no"
     stop_grace_period: 10860s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "2"
+
+  maintenance-worker:
+    build:
+      context: .
+      dockerfile: backend.Dockerfile
+    image: ${MVP_IMAGE_NAME:-videoclip-mvp-stage1-api:local}
+    pull_policy: never
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - path: ${MVP_STAGE1_ENV_FILE:?set MVP_STAGE1_ENV_FILE to the private stage-1 .env}
+        required: true
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB:-videoclip_mvp_stage1}
+      DB_USER: ${POSTGRES_USER:-videoclip_stage1}
+      DB_PASSWORD_FILE: /run/secrets/postgres_password
+      APP_DATA_ROOT: /appdata
+      FFMPEG_PATH: /usr/bin/ffmpeg
+      FFPROBE_PATH: /usr/bin/ffprobe
+      CELERY_BROKER_URL: redis://redis:6379/0
+      UPLOAD_RECLAIM_BATCH_SIZE: ${UPLOAD_RECLAIM_BATCH_SIZE:-4}
+      UPLOAD_RECLAIM_INTERVAL_SECONDS: ${UPLOAD_RECLAIM_INTERVAL_SECONDS:-60}
+    secrets:
+      - postgres_password
+    command:
+      ["celery", "-A", "videoclip.celery_app:celery_app", "worker", "--queues=maintenance", "--loglevel=INFO", "--concurrency=1", "--prefetch-multiplier=1", "--hostname=stage2-maintenance@%h"]
+    volumes:
+      - type: bind
+        source: ${MVP_STAGE1_DATA_DIR:?set MVP_STAGE1_DATA_DIR to the private E drive business directory}/app
+        target: /appdata
+    mem_limit: 384m
+    pids_limit: 64
+    restart: "no"
+    stop_grace_period: 180s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "2"
+
+  beat:
+    build:
+      context: .
+      dockerfile: backend.Dockerfile
+    image: ${MVP_IMAGE_NAME:-videoclip-mvp-stage1-api:local}
+    pull_policy: never
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - path: ${MVP_STAGE1_ENV_FILE:?set MVP_STAGE1_ENV_FILE to the private stage-1 .env}
+        required: true
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      UPLOAD_RECLAIM_BATCH_SIZE: ${UPLOAD_RECLAIM_BATCH_SIZE:-4}
+      UPLOAD_RECLAIM_INTERVAL_SECONDS: ${UPLOAD_RECLAIM_INTERVAL_SECONDS:-60}
+    command:
+      ["celery", "-A", "videoclip.celery_app:celery_app", "beat", "--loglevel=INFO", "--schedule=/appdata/maintenance-beat-schedule"]
+    volumes:
+      - type: bind
+        source: ${MVP_STAGE1_DATA_DIR:?set MVP_STAGE1_DATA_DIR to the private E drive business directory}/app
+        target: /appdata
+    mem_limit: 192m
+    pids_limit: 64
+    restart: "no"
+    stop_grace_period: 15s
     logging:
       driver: json-file
       options:

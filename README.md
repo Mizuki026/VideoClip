@@ -9,7 +9,7 @@
 - Windows PowerShell、已启动的 Docker Engine 与 Compose。
 - Node.js 24+、npm 11+。前端依赖由 `frontend/package-lock.json` 锁定。
 - Stage 2 私密配置在 `data/mvp-stage-2/.env`，PostgreSQL 密码在同目录的 `secrets/` 下；两者不应提交到 Git。若 Stage 2 配置尚不存在，需先按第 0 窗口流程准备本地 `data/mvp-stage-0/.env`，确认账户模型可用后运行 `scripts/stage2/prepare-stage2.ps1`。若配置已经存在，保留它，不要重新生成数据库凭据。
-- 选择你有权使用的课程视频。媒体时长必须大于 0 且不超过 20 分钟；当前不限制上传字节数，也不承诺业务数据目录总量上限。当前浏览器页面仍调用普通上传，中断后需重新上传整个文件；Stage 1 后端已提供可续传分片 API，但页面接入留待第 2 窗口。
+- 选择你有权使用的课程视频。媒体时长必须大于 0 且不超过 20 分钟；当前不限制上传字节数，也不承诺业务数据目录总量上限。浏览器默认使用分片续传：中断后刷新页面并重新选择原文件，页面会重新计算摘要并从服务端确认偏移续传；普通上传接口仍保留供旧调用方使用。
 
 真实模型调用使用本机私密配置中的 SiliconFlow 凭据和模型。零价格以用户账户配置为依据；运行前请自行核对账户模型可用性，项目不会读取账单或账户余额。
 
@@ -17,11 +17,11 @@ Stage 1 与 Stage 2 使用独立数据库、端口和 E 盘数据目录。演示
 
 ## 架构与数据流
 
-React 页面由 Vite 提供服务，浏览器只访问同源 `/api`；FastAPI 负责 Cookie / CSRF 鉴权、原始视频上传、状态查询和手动恢复。视频文件保存在 E 盘目录，经鉴权媒体接口和 HTTP Range 提供播放；PostgreSQL 保存账户、task / attempt、冻结配置、转写检查点和唯一发布的总结。任务经 Redis / Celery 投递给一个并发为 1 的 Worker；Worker 调用 FFmpeg 提取并切分音频，调用 ASR 后先持久化每段检查点，再调用 LLM。总结只有通过结构、来源、原文和时间范围校验后才发布。失败后由用户按状态页确认停止并手动恢复；匹配的转写检查点会复用。
+React 页面由 Vite 提供服务，浏览器只访问同源 `/api`；FastAPI 负责 Cookie / CSRF 鉴权、普通及分片视频上传、状态查询和手动恢复。视频文件保存在 E 盘目录，经鉴权媒体接口和 HTTP Range 提供播放；PostgreSQL 保存账户、task / attempt、冻结配置、转写检查点和唯一发布的总结。分析任务投递到 `analysis` 队列，由并发为 1 的分析 Worker 执行。Celery Beat 仅周期投递临时上传回收任务到 `maintenance` 队列，独立维护 Worker 只调用既有回收业务入口；这不提供分析任务自动恢复。分析 Worker 调用 FFmpeg 提取并切分音频，调用 ASR 后先持久化每段检查点，再调用 LLM。总结只有通过结构、来源、原文和时间范围校验后才发布。失败后由用户按状态页确认停止并手动恢复；匹配的转写检查点会复用。
 
 ## 本地演示
 
-从仓库根目录启动 Stage 2。该脚本构建/复用项目镜像、应用迁移、启动 PostgreSQL、Redis、API 和一个 Worker，并检查健康状态与 Worker 数量：
+从仓库根目录启动 Stage 2。该脚本构建/复用项目镜像、应用迁移、启动 PostgreSQL、Redis、API、一个分析 Worker、一个维护 Worker 和单实例 Beat，并检查健康状态、队列和并发配置：
 
 ```powershell
 .\scripts\stage2\run-stage2.ps1
@@ -38,7 +38,7 @@ npm run dev
 打开 [http://127.0.0.1:5174](http://127.0.0.1:5174)，按以下顺序演示：
 
 1. 在注册 / 登录页创建本地账户并登录。
-2. 在视频列表页上传授权课程视频，开始分析并查看处理进度。
+2. 在视频列表页上传授权课程视频。中断后刷新并重新选择原文件即可从服务端已确认的分片续传；确认上传后再开始分析并查看处理进度。
 3. 在视频详情页查看转写和已发布总结。点击至少两处不同引用，确认播放器跳到相应片段并继续播放。
 4. 在详情页删除视频记录；删除完成后，媒体、转写和总结接口不再提供该记录内容。
 
@@ -50,7 +50,7 @@ npm run dev
 .\scripts\stage2\stop-stage2.ps1
 ```
 
-该脚本先停止 Stage 2 Worker，并检查未确认 execution；如果发现未确认记录，会保留数据库和 Redis 并拒绝继续停止。只有状态页明确显示本次 Stage 2 execution 未确认停止时，才使用当前任务返回的真实 execution UUID 执行 `scripts/stage2/stop-and-confirm-worker.ps1 -ExecutionId <UUID>`，再按页面提示恢复。不要用 PID 存活状态代替停止确认。
+该脚本先停止 Beat 和维护 Worker，再停止 Stage 2 分析 Worker并检查未确认 execution；如果发现未确认记录，会保留数据库和 Redis 并拒绝继续停止。只有状态页明确显示本次 Stage 2 execution 未确认停止时，才使用当前任务返回的真实 execution UUID 执行 `scripts/stage2/stop-and-confirm-worker.ps1 -ExecutionId <UUID>`，再按页面提示恢复。不要用 PID 存活状态代替停止确认。
 
 ## 检查与真实浏览器验收
 
@@ -63,7 +63,18 @@ npm test
 npm run build
 ```
 
-真实端到端场景需要授权样片、已运行且配置正确的 Stage 2、可用的真实模型凭据。Playwright 会自行启动构建预览服务器并占用 5174；运行前先停止 `npm run dev` 或其他占用该端口的本地服务器。以下命令会上传真实样片、调用 ASR/LLM、在成功后重启 Stage 2 API/Worker，并清理测试账户及视频：
+浏览器续传验收不调用模型。使用有权访问的授权视频、已运行且配置正确的 Stage 2；Playwright 会启动构建预览服务器并占用 5174，运行前先停止 `npm run dev` 或其他占用该端口的本地服务器。每次运行指定新的输出目录：
+
+```powershell
+Set-Location frontend
+npm run build
+$env:MVP_RESUMABLE_VIDEO = (Resolve-Path '..\video\agent-skill介绍.mp4').Path
+$env:MVP_PLAYWRIGHT_OUTPUT_DIR = Join-Path '..\data\mvp-stage-2\acceptance' ('playwright-' + [guid]::NewGuid().ToString('N'))
+npm run e2e -- e2e/resumable-upload.spec.ts
+Remove-Item Env:MVP_RESUMABLE_VIDEO, Env:MVP_PLAYWRIGHT_OUTPUT_DIR
+```
+
+模型端到端场景另需授权样片、可用的真实模型凭据。以下命令会调用 ASR/LLM、在成功后重启 Stage 2 API/Worker，并清理测试账户及视频：
 
 ```powershell
 npm run build
@@ -94,10 +105,10 @@ docker compose --env-file data/mvp-stage-2/.env -p videoclip-mvp-stage2 -f compo
 
 ## 当前边界
 
-- 一个 Stage 2 Worker 同时执行一个分析任务；投递和执行异常需依据数据库中的事实人工恢复。
+- 一个 Stage 2 分析 Worker 同时执行一个分析任务；Beat 与维护 Worker 只执行临时上传回收，不领取分析任务。投递和执行异常仍需依据数据库中的事实人工恢复。
 - 总结校验失败、输出截断或请求超时不会发布半成品。输出结构或引用校验可按冻结规则做有限修复；真实截断、网络超时等终态失败需停止确认后手动恢复。每个 task 的总结请求总数最多 3 次。
-- 当前已实测的授权样本采用 H.264/AAC 且时间轴零起点；带延迟音轨或不能可靠映射的媒体会被拒绝。分片续传后端已通过 Stage 1 第 1 窗口验收，但尚未接入浏览器；不提供通用转码、自动接管、画面理解、移动端或线上部署。
+- 当前已实测的授权样本采用 H.264/AAC 且时间轴零起点；带延迟音轨或不能可靠映射的媒体会被拒绝。浏览器分片续传与 24 小时临时会话回收已按第 2 窗口验收；不提供通用转码、分析自动接管、画面理解、移动端或线上部署。
 - 20 分钟是媒体时长上限；完整 20 分钟视频尚未作为真实模型样本实测。上传字节数和业务数据目录总量均没有运行期硬上限。
 - 本地配置中的零费率不是账单回执；实际费用和剩余额度需在服务商账户中核对。
 
-第 0 至第 6 窗口的实际验收证据、历史故障和限制见[第六窗口验收记录](.scratch/mvp-stage-6/validation.md)。最终版分片上传后端的接口规格与第 1 窗口验收记录见[规格](.scratch/final-stage-1/spec.md)和[验收记录](.scratch/final-stage-1/validation.md)；浏览器续传与周期回收调度仍待第 2 窗口。
+第 0 至第 6 窗口的实际验收证据、历史故障和限制见[第六窗口验收记录](.scratch/mvp-stage-6/validation.md)。最终版分片上传后端第 1 窗口与浏览器续传/临时上传周期回收第 2 窗口的规格和验收证据见[第 1 窗口记录](.scratch/final-stage-1/validation.md)及[第 2 窗口规格](.scratch/final-stage-2/spec.md)、[验收记录](.scratch/final-stage-2/validation.md)。

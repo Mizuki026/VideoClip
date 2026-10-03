@@ -6,6 +6,12 @@ if (-not (Test-Path -LiteralPath $environmentFile)) { throw 'Stage 2 private env
 
 Push-Location $repoRoot
 try {
+    & docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile stop beat
+    if ($LASTEXITCODE -ne 0) { throw 'Stage 2 Beat stop failed; the remaining services were left running.' }
+
+    & docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile stop maintenance-worker
+    if ($LASTEXITCODE -ne 0) { throw 'Stage 2 maintenance Worker stop failed; database and Redis were left running.' }
+
     & docker compose --env-file $environmentFile -p videoclip-mvp-stage2 -f $composeFile stop worker
     if ($LASTEXITCODE -ne 0) { throw 'Stage 2 Worker stop failed; database and Redis were left running.' }
 
