@@ -194,11 +194,15 @@ Celery 消息同时携带 task UUID 和不可变 attempt UUID；Worker 只领取
 
 执行互斥采用部署内固定键的 PostgreSQL 会话级 advisory lock，覆盖分析执行期至本地请求、文件生产和子进程停止确认，使用专用连接持有，不与检查点短事务共用或随提交释放。键不随视频或 attempt 改变，以约束整个部署单分析执行；数据库中停止未确认的执行记录同时阻止再次领取。持锁连接不能带锁返回连接池，规则见 [PostgreSQL 锁说明](https://www.postgresql.org/docs/current/explicit-locking.html)。
 
-领取时在短事务生成执行标识并登记 Worker 实例身份、进程启动身份和执行状态。每次阶段开始及副作用前检查执行资格；数据库连接或执行锁丢失后停止新调用和文件生产，取消本地请求，终止并回收所属媒体进程组。锁释放仅表示数据库会话结束，不推断操作系统进程或供应商请求已结束。
+领取前，Celery 分析 Worker 子进程必须建立独立 Linux session 并读取容器 ID、Worker 实例 UUID、boot ID、PID、进程启动 ticks 和 session ID。领取事务把这些身份与唯一 `execution_id`、task 和 attempt 一起提交；事务返回后，Worker 必须向同容器监督器登记并得到回执，登记失败时在开始 FFmpeg、ASR、LLM 或文件副作用前退出。数据库绑定提交后、监督登记前崩溃会留下未确认占位，由人工处理；监督登记后、首个副作用前崩溃则由监督器验证空 session 后确认。PID、主机名与 PostgreSQL backend PID 均不是独立执行身份。
 
-正常停止由原执行者确认本地请求、写入者及子进程已结束，再按原执行标识记录 `stopped`。删除使任务失效后，旧执行者仍可提交对应执行记录的停止回执，但不能再提交分析结果或恢复发布资格。文件清理和新执行都要求对应旧执行已停止；模型供应商已经收到的请求无法保证撤回，其迟到结果不得发布。
+分析 Worker 容器由 `videoclip.analysis_supervisor` 作为 PID 1 运行；它启用 Linux child subreaper，再以并发为 1、预取为 1、每个 Celery 子进程只执行一个任务的模式启动 Worker。每个受控执行者及 FFmpeg、`asr_client`、`llm_client` 位于绑定 session 内，各自可使用独立 process group。监督器遍历 `/proc` 中整个 session，先 TERM、后 KILL，并等待没有存活成员后才用绑定身份构造停止证据。父执行者退出、Celery 结果、TERM/KILL 已发送、数据库锁释放或 PID 缺失都不直接构成确认。任务成功、业务失败、请求超时或受控强杀最终都经过同一监督确认；确认、任务结果终态与 attempt 文件清理分别记录，不修改请求预算。
 
-丢锁、Worker 崩溃或强制超时后，未取得停止回执就保持占位，提示“需停止本项目 Worker 后恢复”。`scripts/stage2/stop-and-confirm-worker.ps1 -ExecutionId <实际 UUID>` 只接受单个 Stage 2 Worker 容器及一条对应未确认执行；容器以 `docker compose stop --timeout 0 worker` 停止并核实退出后，脚本才登记数据库证据。之后可单独重启该项目 Worker 并恢复或清理；不操作其他 Docker 项目，也不从 API 挂载 Docker socket。新实例不会仅凭取得锁、PID 缺失或重启自动接管旧执行。
+监督器死亡、容器/宿主机强停、Linux `/proc` 不可读、PID/start ticks/session/boot ID 不匹配或无法证明受控边界完整时，执行保持未确认，API 使用 `execution_state=stop_unconfirmed` 和 `STOP_CONFIRMATION_REQUIRED` 门禁；人工恢复与危险工作目录清理都被阻止。历史 execution 的新身份列保持 NULL，既不伪造绑定，也不追溯标记停止。当前受支持范围是本机 Linux Worker 容器中加入绑定 session 的进程；主动逃逸到新 session 的恶意程序不在承诺范围。停止证据不撤销供应商已经收到的请求或返还费用。
+
+确认写入是单独的生命周期事务：核对 execution、attempt、当前身份绑定及 evidence hash 后，只改动对应 attempt / task 尚未终态的状态，保留已发布结果和取消状态；精确重复证据幂等，旧代次不能释放新执行占位。若本地停止完成但数据库写入失败，监督器仅对同一证据做有界重试，之后保留未确认执行并要求人工处理；没有停止证据不会重试分析、创建 attempt 或恢复服务。确认后才尝试清理对应 attempt 文件，清理失败保留独立清理状态。
+
+人工入口 `scripts/stage2/stop-and-confirm-worker.ps1 -ExecutionId <实际 UUID>` 只接受具有新身份绑定的 Stage 2 execution，核对唯一 Worker 的 generation 和精确容器 ID，必要时只启动 Stage 2 PostgreSQL/API，再对该 Worker 容器零宽限停止并核实同一容器状态为 exited，最后调用统一生命周期操作登记容器退出证据。不会仅凭调用者声明、PID、锁释放或“容器曾经重启”确认；旧身份缺失时停止。`run-stage2.ps1` 在迁移/替换前检查未确认 execution、运行任务和 analysis 队列为空。脚本只操作 Stage 2 Compose 项目，不调整 Celery ACK 策略，也不挂载 Docker socket。
 
 ### 5.6 有界执行与取消
 
@@ -206,7 +210,7 @@ Celery 消息同时携带 task UUID 和不可变 attempt UUID；Worker 只领取
 
 第 1 阶段实测后锁定各阶段期限、停止宽限期与响应上限。领取时根据剩余片段数、媒体预算和最多 3 次总结请求计算有限的任务执行总期限，排队时间不计入该期限；等待心跳或下一数据块不能无限延长总期限。
 
-媒体进程在独立进程组运行。取消或超时先停止新增工作，关闭本地 HTTP 请求，在宽限期内终止所属进程组，必要时强制终止并等待退出；未确认退出则禁止清理或新执行。Celery 强制时限只能作为最后保护，触发后按执行者未知处理，不能把子进程自动替换当作安全恢复。Worker 必须在片段、模型调用及阶段交接处响应删除 / 失效条件；测试用缩短的期限证明挂起场景能退出。
+媒体与模型请求子进程在 execution 独立 Linux session 内运行，并各自进入 process group。取消或超时先停止新增工作，关闭本地 HTTP 请求，在宽限期内终止对应 group；执行者退出后，由 PID 1 监督器以 session 为界检查并清理可能残留的全部后代。未证明 session 为空时禁止清理或新执行。Celery 强制时限只是最后保护，触发后仍由 supervisor 等待受控 session 停止；监督器或容器同时失效则转人工，不把子进程自动替换当作安全恢复。Worker 必须在片段、模型调用及阶段交接处响应删除 / 失效条件；超时与真实残留进程的故障验收见[最终版第 3 窗口记录](../../.scratch/final-stage-3/validation.md)。
 
 ### 5.7 原视频时间轴
 
