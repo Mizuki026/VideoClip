@@ -2,8 +2,10 @@ import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
 import { expect, test } from '@playwright/test';
+import { shouldCleanupAcceptanceData } from './acceptance-data';
 
 const sourceVideo = process.env.MVP_ACCEPTANCE_VIDEO;
+const expectedPromptVersion = process.env.MVP_ACCEPTANCE_PROMPT_VERSION ?? 'stage0-summary-v5';
 const uuidPattern = /[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/gi;
 const repoRoot = resolve(process.cwd(), '..');
 const generatedAccounts = new Map<string, string>();
@@ -35,17 +37,30 @@ function stage2Command(...args: string[]): string {
 
 function readSummaryRequestAudit(taskId: string) {
   if (!/^[0-9a-f-]{36}$/i.test(taskId)) throw new Error('Invalid task identifier for acceptance audit.');
-  const sql = `SELECT concat_ws('|', count(*)::text, coalesce(round(sum(elapsed_seconds)::numeric, 3)::text, '0'), coalesce(string_agg(status, ',' ORDER BY started_at), ''), coalesce(max(model), ''), coalesce(max(prompt_version), ''), coalesce(string_agg(error_code, ',' ORDER BY request_number) FILTER (WHERE status = 'failed'), '')) FROM summary_requests WHERE task_id = '${taskId}'::uuid`;
+  const sql = `SELECT concat_ws('|', count(*)::text, coalesce(round(sum(elapsed_seconds)::numeric, 3)::text, '0'), coalesce(string_agg(status, ',' ORDER BY started_at), ''), coalesce(max(model), ''), coalesce(max(prompt_version), ''), coalesce(string_agg(error_code, ',' ORDER BY started_at) FILTER (WHERE status = 'failed'), ''), coalesce(string_agg(concat_ws(':', request_number::text, status, coalesce(error_code, '-'), coalesce(round(elapsed_seconds::numeric, 3)::text, 'unknown'), coalesce(finish_reason, '-'), coalesce(response_bytes::text, '-'), coalesce(usage->>'prompt_tokens', '-'), coalesce(usage->>'completion_tokens', '-')), ',' ORDER BY started_at), '')) FROM summary_requests WHERE task_id = '${taskId}'::uuid`;
   const output = stage2Command(
     'exec', '-T', 'postgres', 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-qAt',
     '-U', 'videoclip_stage2', '-d', 'videoclip_mvp_stage2', '-c', sql,
   );
-  const [count, elapsed, statuses, model, promptVersion, failureCodes] = output.split('|');
+  const [count, elapsed, statuses, model, promptVersion, failureCodes, requestDetails] = output.split('|');
   return {
     count: Number(count),
     elapsedSeconds: Number(elapsed),
     statuses: statuses ? statuses.split(',') : [],
     failureCodes: failureCodes ? failureCodes.split(',') : [],
+    requestDetails: requestDetails ? requestDetails.split(',').map((entry) => {
+      const [number, status, errorCode, requestElapsed, finishReason, responseBytes, promptTokens, completionTokens] = entry.split(':');
+      return {
+        number: Number(number),
+        status,
+        errorCode: errorCode === '-' ? null : errorCode,
+        elapsedSeconds: Number(requestElapsed),
+        finishReason: finishReason === '-' ? null : finishReason,
+        responseBytes: responseBytes === '-' ? null : Number(responseBytes),
+        promptTokens: promptTokens === '-' ? null : Number(promptTokens),
+        completionTokens: completionTokens === '-' ? null : Number(completionTokens),
+      };
+    }) : [],
     model,
     promptVersion,
   };
@@ -126,8 +141,12 @@ async function cleanupGeneratedAccount(page: import('@playwright/test').Page, us
   });
 }
 
-test.afterEach(async ({ page, baseURL }) => {
+test.afterEach(async ({ page, baseURL }, testInfo) => {
   if (!baseURL) return;
+  if (!shouldCleanupAcceptanceData(testInfo.status)) {
+    console.error('stage6_browser_failure_data_retained=1');
+    return;
+  }
   for (const [username, password] of generatedAccounts) {
     await page.goto(baseURL);
     await cleanupGeneratedAccount(page, username, password);
@@ -171,7 +190,7 @@ async function loginAccount(page: import('@playwright/test').Page, username: str
   await expect(page.getByRole('heading', { name: '课程视频', exact: true })).toBeVisible({ timeout: 20_000 });
 }
 
-test('same-origin registration, raw upload, real processing, playback, account isolation, and deletion', async ({ page, baseURL }) => {
+test('same-origin registration, raw upload, real processing, playback, account isolation, and deletion', async ({ page, baseURL }, testInfo) => {
   test.skip(!sourceVideo, 'Set MVP_ACCEPTANCE_VIDEO to the authorized course sample for the real browser flow.');
   test.setTimeout(1_800_000);
   expect(baseURL).toBe('http://127.0.0.1:5174');
@@ -211,7 +230,7 @@ test('same-origin registration, raw upload, real processing, playback, account i
 
   await page.goto('/');
   await expect(page.getByRole('heading', { name: '欢迎回来' })).toBeVisible();
-  await page.screenshot({ path: 'test-results/stage5-anonymous-login.png' });
+  await page.screenshot({ path: testInfo.outputPath('anonymous-login.png') });
   await createAccount(page, primaryUser, password);
   await expect(page.getByText(primaryUser)).toBeVisible();
   const csrfRejection = await page.evaluate(async () => {
@@ -220,10 +239,12 @@ test('same-origin registration, raw upload, real processing, playback, account i
     return { rejected: rejected.status, session: session.status };
   });
   expect(csrfRejection).toEqual({ rejected: 403, session: 200 });
+  const uploadStartedAt = Date.now();
   const uploadResponsePromise = page.waitForResponse((response) => response.url().endsWith('/api/videos') && response.request().method() === 'POST');
   await page.getByLabel('视频文件').setInputFiles(sourceVideo!);
   await page.getByRole('button', { name: '上传视频' }).click();
   const uploadResponse = await uploadResponsePromise;
+  const uploadElapsedSeconds = (Date.now() - uploadStartedAt) / 1000;
   expect(uploadResponse.status()).toBe(201);
   const uploadHeaders = await uploadResponse.request().allHeaders();
   expect(uploadHeaders['content-type'] ?? '').not.toContain('multipart/form-data');
@@ -242,6 +263,7 @@ test('same-origin registration, raw upload, real processing, playback, account i
   expect(uploadResult.video.analysis_task_id ?? null).toBeNull();
   await expect(page.getByRole('heading', { name: uploadResult.video.display_name })).toBeVisible({ timeout: 20_000 });
 
+  const analysisStartedAt = Date.now();
   const taskResponsePromise = page.waitForResponse((response) => response.url().includes('/api/videos/') && response.url().endsWith('/tasks') && response.request().method() === 'POST');
   await page.getByRole('button', { name: '开始分析' }).click();
   const taskResponse = await taskResponsePromise;
@@ -315,7 +337,7 @@ test('same-origin registration, raw upload, real processing, playback, account i
     expect(recoveredSummaryAttempts).toBeGreaterThan(0);
   }
   expect(summaryAudit.model).toBe('Qwen/Qwen3.5-4B');
-  expect(summaryAudit.promptVersion).toBe('stage0-summary-v4');
+  expect(summaryAudit.promptVersion).toBe(expectedPromptVersion);
   if (recoveredSummaryAttempts > 0) {
     expect(finalTask.asr_request_count).toBe(0);
     expect(finalTask.reused_segments).toBe(finalTask.expected_segments);
@@ -370,13 +392,17 @@ test('same-origin registration, raw upload, real processing, playback, account i
   expect(taskAfterReload.completed_segments).toBe(taskAfterReload.expected_segments);
   expect(taskAfterReload.execution_stop_confirmed).toBe(true);
   console.log(`stage6_browser_audit=${JSON.stringify({
+    uploadElapsedSeconds: Number(uploadElapsedSeconds.toFixed(3)),
+    analysisElapsedSeconds: Number(((Date.now() - analysisStartedAt) / 1000).toFixed(3)),
     asrRequests: taskAfterReload.asr_request_count,
     asrElapsedSeconds: Number(taskAfterReload.asr_elapsed_seconds.toFixed(3)),
     completedSegments: taskAfterReload.completed_segments,
+    expectedSegments: taskAfterReload.expected_segments,
     summaryRequests: summaryAudit.count,
     summaryElapsedSeconds: summaryAudit.elapsedSeconds,
     summaryStatuses: summaryAudit.statuses,
     summaryFailureCodes: summaryAudit.failureCodes,
+    summaryRequestDetails: summaryAudit.requestDetails,
     model: summaryAudit.model,
     promptVersion: summaryAudit.promptVersion,
     recoveredSummaryAttempts,

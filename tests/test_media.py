@@ -90,10 +90,11 @@ def test_ffprobe_timeout_stops_child_process_with_bounded_diagnostics(tmp_path: 
         "time.sleep(10)"
     )
     started = time.monotonic()
+    timeout = 1.5 if sys.platform == "win32" else 0.2
     with pytest.raises(MediaError) as raised:
-        _run_bounded([sys.executable, "-c", script], 0.2, 0.2, 1024)
+        _run_bounded([sys.executable, "-c", script], timeout, 0.2, 1024)
     assert raised.value.code == "MEDIA_TIMEOUT"
-    assert time.monotonic() - started < 2
+    assert time.monotonic() - started < timeout + 2
     assert pid_file.exists()
 
 

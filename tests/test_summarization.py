@@ -9,6 +9,7 @@ import pytest
 
 from videoclip.llm_client import LlmCallError, request_completion
 from videoclip.summarization import (
+    QUOTE_NORMALIZATION_VERSION,
     SUMMARY_LLM_FINGERPRINT_VERSION,
     SummaryContract,
     SummaryFailure,
@@ -18,6 +19,7 @@ from videoclip.summarization import (
     is_repairable_summary_failure,
     normalize_quote,
     resolve_summary_contract,
+    response_schema_sha256,
     summary_request_fingerprint,
     template_sha256,
     validate_context_budget,
@@ -265,10 +267,55 @@ def test_prompt_budget_and_request_fingerprint_include_contract_and_repair_feedb
     assert first != repaired
     assert len(first) == 64 and SUMMARY_LLM_FINGERPRINT_VERSION
     assert template_sha256("stage0-summary-v4", "summary-v1") == contract.template_sha256
+    assert contract.template_sha256 == "2d3fc767670fce33a83bbfa93209cd1c0087ee7f50581ede1a7f613ff1354949"
     assert correction_for_failure("SUMMARY_INVALID_SCHEMA").startswith("SUMMARY_INVALID_SCHEMA:")
     assert is_repairable_summary_failure("LLM_OUTPUT_TRUNCATED")
     assert is_repairable_summary_failure("SUMMARY_INVALID_JSON")
     assert not is_repairable_summary_failure("LLM_RATE_LIMITED")
+
+
+def test_versioned_summary_contract_preserves_v4_and_accepts_bounded_v5_output_budget() -> None:
+    legacy = resolve_summary_contract(_legacy_snapshot())
+    assert legacy.max_output_tokens == 3072
+    assert legacy.legacy_compatibility is True
+
+    snapshot = _legacy_snapshot()
+    snapshot["summary"]["max_output_tokens"] = 6144
+    snapshot["summary"]["request"] = {
+        "contract_version": "summary-request-v1",
+        "base_url": "https://api.siliconflow.cn/v1",
+        "temperature": 0.2,
+        "enable_thinking": False,
+        "timeouts": {"total": 300, "connect": 15, "read": 240, "write": 45, "pool": 15},
+        "max_response_bytes": 1_048_576,
+        "max_diagnostic_bytes": 8192,
+        "max_requests": 3,
+        "context_overhead_tokens": 64,
+        "template_sha256": template_sha256("stage0-summary-v4", "summary-v1"),
+        "response_schema_sha256": response_schema_sha256(),
+        "quote_normalization_version": QUOTE_NORMALIZATION_VERSION,
+    }
+
+    contract = resolve_summary_contract(snapshot)
+    assert contract.max_output_tokens == 6144
+    assert contract.legacy_compatibility is False
+    prompt = build_summary_prompt(_segments(), contract.prompt_version)
+    assert validate_context_budget(prompt, contract) < contract.context_tokens
+
+    new_task = _legacy_snapshot()
+    new_task["summary"]["prompt_version"] = "stage0-summary-v5"
+    new_task["summary"]["max_output_tokens"] = 8192
+    new_task["summary"]["request"] = {
+        **snapshot["summary"]["request"],
+        "template_sha256": template_sha256("stage0-summary-v5", "summary-v1"),
+    }
+    bounded_contract = resolve_summary_contract(new_task)
+    bounded_prompt = build_summary_prompt(_segments(), bounded_contract.prompt_version)
+    assert bounded_contract.max_output_tokens == 8192
+    assert bounded_contract.prompt_version == "stage0-summary-v5"
+    assert "固定返回 3 个章节和 3 条知识要点" in bounded_prompt
+    assert "每条知识要点不超过 80 个汉字" in bounded_prompt
+    assert validate_context_budget(bounded_prompt, bounded_contract) < bounded_contract.context_tokens
 
 
 def _request() -> dict[str, Any]:

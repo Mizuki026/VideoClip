@@ -48,10 +48,10 @@ class Settings(BaseSettings):
     asr_secret_reference: str = Field(default="environment:SILICONFLOW_API_KEY", alias="ASR_SECRET_REFERENCE")
     asr_request_parameters: dict[str, str] = Field(default_factory=dict, alias="ASR_REQUEST_PARAMETERS")
     llm_model: str = Field(default="Qwen/Qwen3.5-4B", alias="SILICONFLOW_LLM_MODEL")
-    summary_prompt_version: str = Field(default="stage0-summary-v4", alias="PROMPT_VERSION")
+    summary_prompt_version: str = Field(default="stage0-summary-v5", alias="PROMPT_VERSION")
     summary_schema_version: str = Field(default="summary-v1", alias="SUMMARY_SCHEMA_VERSION")
     llm_context_tokens: int = Field(default=256_000, ge=1, alias="LLM_CONTEXT_TOKENS")
-    llm_max_output_tokens: int = Field(default=3072, ge=1, alias="LLM_MAX_OUTPUT_TOKENS")
+    llm_max_output_tokens: int = Field(default=8192, ge=1, alias="LLM_MAX_OUTPUT_TOKENS")
     llm_temperature: float = Field(default=0.2, ge=0, le=2, alias="LLM_TEMPERATURE")
     llm_enable_thinking: bool = Field(default=False, alias="LLM_ENABLE_THINKING")
     llm_http_total_timeout_seconds: float = Field(

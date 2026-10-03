@@ -9,7 +9,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
-PROMPT_VERSION = "stage0-summary-v4"
+LEGACY_PROMPT_VERSION = "stage0-summary-v4"
+PROMPT_VERSION = "stage0-summary-v5"
 SUMMARY_SCHEMA_VERSION = "summary-v1"
 SUMMARY_REQUEST_CONTRACT_VERSION = "summary-request-v1"
 SUMMARY_TEMPLATE_HASH_VERSION = "summary-template-v1"
@@ -87,7 +88,7 @@ SUMMARY_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
     },
 }
 
-_PROMPT_INSTRUCTIONS = (
+_PROMPT_INSTRUCTIONS_V4 = (
     "你是中文技术课程助教。只依据完整转写整理章节和知识要点，不补充视频中未讲内容。"
     "返回 3–6 个简洁章节和 3–8 条简洁知识要点。每项只给 1 条最直接的引用。"
     "严格返回键为 chapters 与 key_points 的 JSON 对象；章节字段只能是 title 与 evidence，"
@@ -97,6 +98,18 @@ _PROMPT_INSTRUCTIONS = (
     "不要输出 quote 或时间；程序会从所选片段中提取最相关的连续原文作为 quote，"
     "并按片段推导时间。"
 )
+_PROMPT_INSTRUCTIONS_V5 = (
+    "你是中文技术课程助教。只依据完整转写整理章节和知识要点，不补充视频中未讲内容。"
+    "固定返回 3 个章节和 3 条知识要点；章节标题不超过 24 个汉字，每条知识要点不超过 80 个汉字。"
+    "严格返回键为 chapters 与 key_points 的 JSON 对象；章节字段只能是 title 与 evidence，"
+    "知识要点字段只能是 text 与 evidence。每项 evidence 必须是单元素数组，元素只能有整数 segment_id。"
+    "每项只选择一个来自完整转写的最直接有效 segment_id。不要输出 quote 或时间；程序会提取引用原文和时间。"
+    "不要输出解释、Markdown、额外字段或重复内容。"
+)
+_PROMPT_INSTRUCTIONS_BY_VERSION = {
+    LEGACY_PROMPT_VERSION: _PROMPT_INSTRUCTIONS_V4,
+    PROMPT_VERSION: _PROMPT_INSTRUCTIONS_V5,
+}
 _REPAIR_INSTRUCTIONS = (
     "请返回完整且严格符合指定 JSON 结构的对象。每条内容只引用一个有效 segment_id，"
     "不要输出 quote 或时间，不要增加任何字段。"
@@ -135,14 +148,15 @@ def canonical_sha256(value: Any) -> str:
 
 
 def _template_document(prompt_version: str, schema_version: str) -> dict[str, Any]:
-    if prompt_version != PROMPT_VERSION or schema_version != SUMMARY_SCHEMA_VERSION:
+    instructions = _PROMPT_INSTRUCTIONS_BY_VERSION.get(prompt_version)
+    if instructions is None or schema_version != SUMMARY_SCHEMA_VERSION:
         raise SummaryFailure("SUMMARY_TEMPLATE_UNSUPPORTED")
     return {
         "version": SUMMARY_TEMPLATE_HASH_VERSION,
         "prompt_version": prompt_version,
         "schema_version": schema_version,
         "system_prompt": SYSTEM_PROMPT,
-        "instructions": _PROMPT_INSTRUCTIONS,
+        "instructions": instructions,
         "repair_instructions": _REPAIR_INSTRUCTIONS,
         "example": SUMMARY_SCHEMA,
         "response_schema": SUMMARY_RESPONSE_JSON_SCHEMA,
@@ -208,7 +222,7 @@ def resolve_summary_contract(snapshot: Mapping[str, Any]) -> SummaryContract:
         diagnostic_limit = limits.get("diagnostic_max_bytes")
         if (
             snapshot.get("version") != "analysis-config-v1"
-            or summary.get("prompt_version") != PROMPT_VERSION
+            or summary.get("prompt_version") != LEGACY_PROMPT_VERSION
             or summary.get("schema_version") != SUMMARY_SCHEMA_VERSION
             or context_tokens != 256_000
             or max_output_tokens != 3072
@@ -481,7 +495,8 @@ def validate_transcript_manifest(
 
 
 def build_summary_prompt(segments: Sequence[Mapping[str, Any]], prompt_version: str) -> str:
-    if prompt_version != PROMPT_VERSION:
+    instructions = _PROMPT_INSTRUCTIONS_BY_VERSION.get(prompt_version)
+    if instructions is None:
         raise SummaryFailure("SUMMARY_TEMPLATE_UNSUPPORTED")
     transcript = "\n".join(
         f"[{int(segment['segment_number'])}] {float(segment['audio_start_seconds']):.3f}-"
@@ -490,7 +505,7 @@ def build_summary_prompt(segments: Sequence[Mapping[str, Any]], prompt_version: 
     )
     return (
         f"提示词版本：{prompt_version}\n"
-        + _PROMPT_INSTRUCTIONS
+        + instructions
         + f"\n目标结构示例：{json.dumps(SUMMARY_SCHEMA, ensure_ascii=False)}\n完整转写：\n{transcript}"
     )
 
