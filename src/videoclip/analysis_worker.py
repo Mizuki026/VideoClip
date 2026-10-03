@@ -1433,10 +1433,7 @@ def _summarize(
                 elapsed_seconds=float(metadata["elapsed_seconds"]),
                 metadata=metadata,
             )
-            correction_code = error_code
-            if request_number < contract.max_requests:
-                continue
-            raise AnalysisFailure("SUMMARY_REPAIR_EXHAUSTED")
+            raise AnalysisFailure(error_code)
         if finish_reason != "stop":
             error_code = "LLM_FINISH_REASON_UNSUPPORTED"
             _record_summary_failure(

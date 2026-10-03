@@ -1727,7 +1727,7 @@ def test_stopped_summary_continuation_publishes_once_without_asr(
             assert stranger.get(f"/videos/{video_id}/summary").status_code == 404
 
 
-def test_truncated_summary_is_bounded_and_manual_recovery_reuses_transcript(
+def test_truncated_summary_requires_manual_recovery_and_reuses_transcript(
     test_settings: Settings,
     test_engine: Any,
     session_factory: sessionmaker[Session],
@@ -1758,7 +1758,7 @@ def test_truncated_summary_is_bounded_and_manual_recovery_reuses_transcript(
             "_transcribe",
             lambda *_args, **_kwargs: pytest.fail("summary recovery must not call ASR"),
         )
-        _mock_llm_process(monkeypatch, [("{", "length")])
+        _mock_llm_process(monkeypatch, [("{", "length"), ("{", "length"), (_summary_model_output(), "stop")])
         assert transcribe_analysis(str(task_id), str(first_summary_attempt_id)) == {"status": "failed"}
         assert client.get(f"/videos/{video_id}/summary").status_code == 409
 
@@ -1768,8 +1768,11 @@ def test_truncated_summary_is_bounded_and_manual_recovery_reuses_transcript(
                     select(SummaryRequest).where(SummaryRequest.attempt_id == first_summary_attempt_id)
                 )
             )
-            assert len(first_requests) == 3
-            assert all(item.status == "failed" and item.finish_reason == "length" for item in first_requests)
+            assert len(first_requests) == 1
+            assert first_requests[0].status == "failed"
+            assert first_requests[0].finish_reason == "length"
+            assert first_requests[0].error_code == "LLM_OUTPUT_TRUNCATED"
+            assert session.get(AnalysisTask, task_id).failure_code == "LLM_OUTPUT_TRUNCATED"
             assert (
                 session.scalar(select(AnalysisSummary.id).where(AnalysisSummary.task_id == task_id)) is None
             )
@@ -1783,30 +1786,64 @@ def test_truncated_summary_is_bounded_and_manual_recovery_reuses_transcript(
         retry_id = uuid.UUID(recovered.json()["attempt"]["id"])
         assert recovered.json()["attempt"]["execution_mode"] == "summary_only"
         assert recovered.json()["reused_segments"] == 3
-        monkeypatch.setattr(
-            analysis_worker,
-            "_run_process",
-            lambda *_args, **_kwargs: pytest.fail(
-                "task-wide request limit must block a fourth provider call"
-            ),
-        )
         assert transcribe_analysis(str(task_id), str(retry_id)) == {"status": "failed"}
         assert client.get(f"/videos/{video_id}/summary").status_code == 409
+
         with session_factory() as session:
-            requests = list(session.scalars(select(SummaryRequest).where(SummaryRequest.task_id == task_id)))
+            second_requests = list(
+                session.scalars(select(SummaryRequest).where(SummaryRequest.attempt_id == retry_id))
+            )
+            assert len(second_requests) == 1
+            assert second_requests[0].request_number == 1
+            assert second_requests[0].status == "failed"
+            assert second_requests[0].error_code == "LLM_OUTPUT_TRUNCATED"
+
+        recovered_again = client.post(
+            f"/videos/{video_id}/tasks/{task_id}/recover",
+            json={"attempt_id": str(retry_id)},
+            headers=headers,
+        )
+        assert recovered_again.status_code == 202, recovered_again.text
+        final_attempt_id = uuid.UUID(recovered_again.json()["attempt"]["id"])
+        assert recovered_again.json()["attempt"]["execution_mode"] == "summary_only"
+        assert recovered_again.json()["reused_segments"] == 3
+        assert transcribe_analysis(str(task_id), str(final_attempt_id)) == {"status": "succeeded"}
+        assert client.get(f"/videos/{video_id}/summary").status_code == 200
+
+        with session_factory() as session:
+            requests = list(
+                session.scalars(
+                    select(SummaryRequest)
+                    .where(SummaryRequest.task_id == task_id)
+                    .order_by(SummaryRequest.started_at)
+                )
+            )
             attempts = list(
-                session.scalars(select(AnalysisAttempt).where(AnalysisAttempt.task_id == task_id))
+                session.scalars(
+                    select(AnalysisAttempt)
+                    .where(AnalysisAttempt.task_id == task_id)
+                    .order_by(AnalysisAttempt.created_at)
+                )
             )
             assert len(requests) == 3
-            assert len(attempts) == 3
+            assert [item.request_number for item in requests] == [1, 1, 1]
+            assert [item.status for item in requests] == ["failed", "failed", "succeeded"]
+            assert [item.finish_reason for item in requests] == ["length", "length", "stop"]
+            assert [item.error_code for item in requests] == [
+                "LLM_OUTPUT_TRUNCATED",
+                "LLM_OUTPUT_TRUNCATED",
+                None,
+            ]
+            assert len(attempts) == 4
             assert attempts[0].status == "awaiting_summary"
             assert attempts[1].status == "failed"
             assert attempts[2].status == "failed"
+            assert attempts[3].status == "succeeded"
             assert all(attempt.execution_mode == "summary_only" for attempt in attempts[1:])
-            assert session.get(AnalysisTask, task_id).failure_code == "SUMMARY_REPAIR_EXHAUSTED"
-            assert (
-                session.scalar(select(AnalysisSummary.id).where(AnalysisSummary.task_id == task_id)) is None
-            )
+            task = session.get(AnalysisTask, task_id)
+            assert task.status == "succeeded" and task.summary_status == "succeeded"
+            summary = session.scalar(select(AnalysisSummary).where(AnalysisSummary.task_id == task_id))
+            assert summary is not None
 
 
 def test_publish_database_failure_is_not_visible_and_recovery_reuses_transcript(

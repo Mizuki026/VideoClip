@@ -35,16 +35,17 @@ function stage2Command(...args: string[]): string {
 
 function readSummaryRequestAudit(taskId: string) {
   if (!/^[0-9a-f-]{36}$/i.test(taskId)) throw new Error('Invalid task identifier for acceptance audit.');
-  const sql = `SELECT concat_ws('|', count(*)::text, coalesce(round(sum(elapsed_seconds)::numeric, 3)::text, '0'), coalesce(string_agg(status, ',' ORDER BY started_at), ''), coalesce(max(model), ''), coalesce(max(prompt_version), '')) FROM summary_requests WHERE task_id = '${taskId}'::uuid`;
+  const sql = `SELECT concat_ws('|', count(*)::text, coalesce(round(sum(elapsed_seconds)::numeric, 3)::text, '0'), coalesce(string_agg(status, ',' ORDER BY started_at), ''), coalesce(max(model), ''), coalesce(max(prompt_version), ''), coalesce(string_agg(error_code, ',' ORDER BY request_number) FILTER (WHERE status = 'failed'), '')) FROM summary_requests WHERE task_id = '${taskId}'::uuid`;
   const output = stage2Command(
     'exec', '-T', 'postgres', 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-qAt',
     '-U', 'videoclip_stage2', '-d', 'videoclip_mvp_stage2', '-c', sql,
   );
-  const [count, elapsed, statuses, model, promptVersion] = output.split('|');
+  const [count, elapsed, statuses, model, promptVersion, failureCodes] = output.split('|');
   return {
     count: Number(count),
     elapsedSeconds: Number(elapsed),
     statuses: statuses ? statuses.split(',') : [],
+    failureCodes: failureCodes ? failureCodes.split(',') : [],
     model,
     promptVersion,
   };
@@ -253,14 +254,15 @@ test('same-origin registration, raw upload, real processing, playback, account i
     const current = await response.json() as { status: string; summary_status: string; execution_state: string };
     return `${current.status}:${current.summary_status}:${current.execution_state}`;
   }, { id: videoId, taskId: task.id }), { timeout: 1_200_000, intervals: [2000, 3000, 5000] })
-    .toMatch(/^(awaiting_summary:waiting:stopped|succeeded:succeeded:stopped)$/);
+    .toMatch(/^(awaiting_summary:waiting:stopped|failed:failed:stopped|succeeded:succeeded:stopped)$/);
   const checkpoint = await page.evaluate(async ({ id, taskId }) => {
     const response = await fetch(`/api/videos/${id}/tasks/${taskId}`, { cache: 'no-store' });
     return { status: response.status, body: await response.json() };
-  }, { id: videoId, taskId: task.id }) as { status: number; body: { status: string; execution_state: string; execution_stop_confirmed: boolean; completed_segments: number; expected_segments: number } };
+  }, { id: videoId, taskId: task.id }) as { status: number; body: { status: string; summary_status: string; execution_state: string; execution_stop_confirmed: boolean; completed_segments: number; expected_segments: number } };
   expect(checkpoint.status).toBe(200);
   expect(checkpoint.body.execution_stop_confirmed).toBe(true);
-  expect(['awaiting_summary', 'succeeded']).toContain(checkpoint.body.status);
+  expect(['awaiting_summary', 'failed', 'succeeded']).toContain(checkpoint.body.status);
+  if (checkpoint.body.status === 'failed') expect(checkpoint.body.summary_status).toBe('failed');
   expect(checkpoint.body.completed_segments).toBe(checkpoint.body.expected_segments);
   await expect(page.locator('.transcript-row').first()).toBeVisible();
   const summaryDeadline = Date.now() + 18 * 60_000;
@@ -309,6 +311,9 @@ test('same-origin registration, raw upload, real processing, playback, account i
   expect(summaryAudit.count).toBeGreaterThan(0);
   expect(summaryAudit.count).toBeLessThanOrEqual(3);
   expect(summaryAudit.statuses.at(-1)).toBe('succeeded');
+  if (summaryAudit.failureCodes.some((code) => ['LLM_OUTPUT_TRUNCATED', 'LLM_PHASE_TIMEOUT', 'LLM_TOTAL_TIMEOUT'].includes(code))) {
+    expect(recoveredSummaryAttempts).toBeGreaterThan(0);
+  }
   expect(summaryAudit.model).toBe('Qwen/Qwen3.5-4B');
   expect(summaryAudit.promptVersion).toBe('stage0-summary-v4');
   if (recoveredSummaryAttempts > 0) {
@@ -371,6 +376,7 @@ test('same-origin registration, raw upload, real processing, playback, account i
     summaryRequests: summaryAudit.count,
     summaryElapsedSeconds: summaryAudit.elapsedSeconds,
     summaryStatuses: summaryAudit.statuses,
+    summaryFailureCodes: summaryAudit.failureCodes,
     model: summaryAudit.model,
     promptVersion: summaryAudit.promptVersion,
     recoveredSummaryAttempts,
