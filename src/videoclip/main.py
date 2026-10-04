@@ -291,9 +291,7 @@ def create_app(
     def publish_task(task_id: str, attempt_id: str) -> object:
         if task_publisher is not None:
             return task_publisher(task_id, attempt_id)
-        return celery_app.send_task(
-            "videoclip.transcribe_analysis", args=[task_id, attempt_id], retry=False
-        )
+        return celery_app.send_task("videoclip.transcribe_analysis", args=[task_id, attempt_id], retry=False)
 
     delivery_policy = DeliveryPolicy.from_settings(resolved_settings)
 
@@ -549,16 +547,12 @@ def create_app(
         return UploadResponse(video=_video_detail(video))
 
     @app.delete("/uploads/{upload_id}")
-    def abandon_resumable_upload(
-        upload_id: uuid.UUID, request: Request, response: Response
-    ) -> Response:
+    def abandon_resumable_upload(upload_id: uuid.UUID, request: Request, response: Response) -> Response:
         current = _current_auth(request, resolved_factory)
         _require_csrf(request, resolved_settings, resolved_factory, current)
         assert current is not None
         user, _ = current
-        response_status, code = abandon_upload_session(
-            resolved_factory, resolved_store, user.id, upload_id
-        )
+        response_status, code = abandon_upload_session(resolved_factory, resolved_store, user.id, upload_id)
         response.status_code = response_status
         response.headers["Cache-Control"] = "no-store"
         if code is not None:
@@ -668,6 +662,7 @@ def create_app(
             task_id,
             payload.attempt_id,
             policy=delivery_policy,
+            settings=resolved_settings,
         )
         coordinate_delivery(recovered.task_id, recovered.attempt_id)
         return task_response(
@@ -700,6 +695,7 @@ def create_app(
             task_id,
             payload.attempt_id,
             policy=delivery_policy,
+            settings=resolved_settings,
         )
         coordinate_delivery(continued.task_id, continued.attempt_id)
         return task_response(

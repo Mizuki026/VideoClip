@@ -38,6 +38,7 @@ from videoclip.analysis_delivery import (
     coordinate_analysis_delivery,
     coordinate_due_analysis_deliveries,
 )
+from videoclip.analysis_lifecycle import coordinate_due_analysis_recoveries, create_followup_attempt
 from videoclip.analysis_supervisor import BoundaryUnknown, WorkerBoundary
 from videoclip.analysis_worker import (
     ASR_REQUEST_FINGERPRINT_VERSION,
@@ -63,6 +64,7 @@ from videoclip.models import (
     AnalysisExecution,
     AnalysisSummary,
     AnalysisTask,
+    SharedModelCooldown,
     SummaryRequest,
     TaskDelivery,
     TranscriptSegment,
@@ -144,7 +146,11 @@ def _register(client: TestClient, username: str) -> uuid.UUID:
 
 
 def _mark_attempt_failed_stopped(
-    factory: sessionmaker[Session], task_id: uuid.UUID, attempt_id: uuid.UUID
+    factory: sessionmaker[Session],
+    task_id: uuid.UUID,
+    attempt_id: uuid.UUID,
+    *,
+    failure_code: str = "ASR_REQUEST_FAILED",
 ) -> None:
     now = datetime.now(UTC)
     with factory.begin() as session:
@@ -156,8 +162,14 @@ def _mark_attempt_failed_stopped(
             attempt_id=attempt.id,
             worker_id="test-confirmed-worker",
             backend_pid=1,
-            stop_confirmed_at=now,
-            stop_confirmation_source="test_operator_evidence",
+            worker_instance_id=uuid.uuid4(),
+            worker_container_id="a" * 64,
+            process_scope=PROCESS_SCOPE,
+            boundary_pid=111,
+            boundary_start_ticks=222,
+            boundary_session_id=111,
+            boundary_boot_id="test-boot-id",
+            supervisor_registered_at=now - timedelta(seconds=1),
         )
         session.add(execution)
         session.flush()
@@ -165,14 +177,22 @@ def _mark_attempt_failed_stopped(
         attempt.execution_id = execution.id
         attempt.first_claimed_at = now - timedelta(seconds=1)
         attempt.status = "failed"
-        attempt.failure_code = "ASR_REQUEST_FAILED"
-        attempt.stop_confirmed_at = now
+        attempt.failure_code = failure_code
         attempt.finished_at = now
         task.status = "failed"
         task.stage = "failed"
-        task.failure_code = "ASR_REQUEST_FAILED"
+        task.failure_code = failure_code
         if task.delivery_deadline_at is not None:
             task.delivery_blocked_since = attempt.first_claimed_at
+    with factory() as session:
+        execution = session.scalar(
+            select(AnalysisExecution).where(AnalysisExecution.attempt_id == attempt_id)
+        )
+        identity = stop_confirmation.identity_from_execution(execution) if execution is not None else None
+        session.commit()
+    assert identity is not None
+    evidence = worker_stop_evidence(identity, session_stopped=True)
+    assert confirm_stopped_execution(factory, evidence) == "confirmed"
 
 
 def test_submit_freezes_configuration_and_is_idempotent(
@@ -453,9 +473,7 @@ def test_http_submission_and_due_scanner_race_is_generation_safe(
             raise OSError("injected uncertain first send")
 
     store = MediaStore(test_settings.app_data_root)
-    app = create_app(
-        test_settings, session_factory, store, run_recovery=False, task_publisher=publisher
-    )
+    app = create_app(test_settings, session_factory, store, run_recovery=False, task_publisher=publisher)
     with TestClient(app) as client:
         owner_id = _register(client, "analysis-http-scanner-race")
         video_id = _video(session_factory, store, owner_id)
@@ -533,9 +551,10 @@ def test_deletion_invalidates_an_inflight_delivery_and_its_late_message(
     lease = ExecutionLease.acquire(test_engine)
     assert lease is not None
     try:
-        assert _claim_attempt(
-            lease, submitted.task_id, submitted.attempt_id, "test-deleted-late-message"
-        ) is None
+        assert (
+            _claim_attempt(lease, submitted.task_id, submitted.attempt_id, "test-deleted-late-message")
+            is None
+        )
     finally:
         lease.release()
     with session_factory() as session:
@@ -826,9 +845,10 @@ def test_global_execution_slot_blocks_a_competing_video(
     second_lease = ExecutionLease.acquire(test_engine)
     assert second_lease is not None
     # A later message arriving first still cannot steal the persisted queue position.
-    assert _claim_attempt(
-        second_lease, submitted_c.task_id, submitted_c.attempt_id, "test-worker-out-of-order"
-    ) is None
+    assert (
+        _claim_attempt(second_lease, submitted_c.task_id, submitted_c.attempt_id, "test-worker-out-of-order")
+        is None
+    )
     second_lease.release()
     assert transcribe_analysis(str(submitted_c.task_id), str(submitted_c.attempt_id)) == {
         "status": "ignored_not_eligible"
@@ -1097,9 +1117,7 @@ def test_delivery_deadline_pauses_for_execution_slot_occupancy(
     blocked_lease = ExecutionLease.acquire(test_engine)
     assert blocked_lease is not None
     try:
-        blocker_claim = _claim_attempt(
-            blocked_lease, blocker.task_id, blocker.attempt_id, "deadline-blocker"
-        )
+        blocker_claim = _claim_attempt(blocked_lease, blocker.task_id, blocker.attempt_id, "deadline-blocker")
     finally:
         blocked_lease.release()
     assert blocker_claim is not None
@@ -2155,13 +2173,18 @@ def test_recovery_copies_only_matching_committed_checkpoints(
         assert parent is not None and task is not None and execution is not None
         parent.status = "failed"
         parent.failure_code = "ASR_REQUEST_FAILED"
-        parent.stop_confirmed_at = stopped_at
         parent.manifest_fingerprint = manifest_fingerprint
         task.status = "failed"
         task.stage = "failed"
         task.failure_code = "ASR_REQUEST_FAILED"
-        execution.stop_confirmed_at = stopped_at
-        execution.stop_confirmation_source = "test_operator_evidence"
+        execution.worker_instance_id = uuid.uuid4()
+        execution.worker_container_id = "b" * 64
+        execution.process_scope = PROCESS_SCOPE
+        execution.boundary_pid = 333
+        execution.boundary_start_ticks = 444
+        execution.boundary_session_id = 333
+        execution.boundary_boot_id = "test-checkpoint-boot"
+        execution.supervisor_registered_at = stopped_at - timedelta(seconds=1)
         for index, row in enumerate(fingerprint_rows[:2]):
             session.add(
                 TranscriptSegment(
@@ -2196,6 +2219,18 @@ def test_recovery_copies_only_matching_committed_checkpoints(
                 request_count=1,
             )
         )
+    with session_factory() as session:
+        execution = session.get(AnalysisExecution, first_claim.execution_id)
+        identity = stop_confirmation.identity_from_execution(execution) if execution is not None else None
+        session.commit()
+    assert identity is not None
+    assert (
+        confirm_stopped_execution(
+            session_factory,
+            worker_stop_evidence(identity, session_stopped=True),
+        )
+        == "confirmed"
+    )
     first_lease.release()
 
     recovered = recover_analysis_attempt(
@@ -2235,6 +2270,329 @@ def test_recovery_copies_only_matching_committed_checkpoints(
         assert child_segments[0].audio_sha256 == fingerprint_rows[0]["audio_sha256"]
         assert child_segments[0].request_fingerprint == fingerprint_rows[0]["request_fingerprint"]
     second_lease.release()
+
+
+def test_automatic_recovery_uses_two_task_level_slots_then_stops(
+    test_settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    with TestClient(create_app(test_settings, session_factory, store, run_recovery=False)) as client:
+        owner_id = _register(client, "analysis-auto-recovery-budget")
+        video_id = _video(session_factory, store, owner_id)
+    submitted = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
+
+    for expected_count in (1, 2):
+        _mark_attempt_failed_stopped(
+            session_factory,
+            submitted.task_id,
+            submitted.attempt_id,
+            failure_code="ASR_TIMEOUT",
+        )
+        cycle = coordinate_due_analysis_recoveries(
+            session_factory,
+            settings=test_settings,
+            now=datetime.now(UTC) + timedelta(seconds=1),
+        )
+        assert cycle.resumed == 1
+        with session_factory() as session:
+            task = session.get(AnalysisTask, submitted.task_id)
+            attempts = list(
+                session.scalars(
+                    select(AnalysisAttempt)
+                    .where(AnalysisAttempt.task_id == submitted.task_id)
+                    .order_by(AnalysisAttempt.attempt_number)
+                )
+            )
+            assert task is not None
+            assert task.auto_recovery_count == expected_count
+            assert len(attempts) == expected_count + 1
+            current_attempt_id = task.current_attempt_id
+            parent_attempt_id = attempts[-2].id
+            session.commit()
+        if expected_count == 1:
+            # A repeated scan and an explicit/manual race both return the child already created.
+            repeated = coordinate_due_analysis_recoveries(
+                session_factory,
+                settings=test_settings,
+                now=datetime.now(UTC) + timedelta(seconds=2),
+            )
+            assert repeated.resumed == 0
+            manual = recover_analysis_attempt(
+                session_factory,
+                owner_id,
+                video_id,
+                submitted.task_id,
+                parent_attempt_id,
+                settings=test_settings,
+            )
+            assert manual.attempt_id == current_attempt_id
+            assert not manual.created
+        submitted = type(submitted)(submitted.task_id, current_attempt_id, created=False)
+
+    _mark_attempt_failed_stopped(
+        session_factory,
+        submitted.task_id,
+        submitted.attempt_id,
+        failure_code="ASR_TIMEOUT",
+    )
+    exhausted = coordinate_due_analysis_recoveries(
+        session_factory,
+        settings=test_settings,
+        now=datetime.now(UTC) + timedelta(seconds=3),
+    )
+    assert exhausted.resumed == 0
+    assert exhausted.exhausted == 1
+    with session_factory() as session:
+        task = session.get(AnalysisTask, submitted.task_id)
+        attempts = session.scalar(
+            select(func.count())
+            .select_from(AnalysisAttempt)
+            .where(AnalysisAttempt.task_id == submitted.task_id)
+        )
+        assert task is not None
+        assert task.auto_recovery_count == 2
+        assert task.delivery_wait_reason == "automatic_recovery_exhausted"
+        assert task.delivery_next_check_at is None
+        assert attempts == 3
+
+
+def test_automatic_recovery_waits_for_shared_cooldown_without_charging_budget(
+    test_settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    with TestClient(create_app(test_settings, session_factory, store, run_recovery=False)) as client:
+        owner_id = _register(client, "analysis-cooldown-wait")
+        video_id = _video(session_factory, store, owner_id)
+    submitted = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
+    _mark_attempt_failed_stopped(
+        session_factory,
+        submitted.task_id,
+        submitted.attempt_id,
+        failure_code="ASR_RATE_LIMITED",
+    )
+    now = datetime.now(UTC) + timedelta(seconds=1)
+    cooldown_until = now + timedelta(seconds=45)
+    with session_factory.begin() as session:
+        session.add(
+            SharedModelCooldown(
+                provider="siliconflow",
+                account_reference=test_settings.siliconflow_account_reference,
+                model=test_settings.asr_model,
+                cooldown_until=cooldown_until,
+                consecutive_rate_limits=1,
+                last_rate_limited_at=now,
+            )
+        )
+    first_scan = coordinate_due_analysis_recoveries(
+        session_factory,
+        settings=test_settings,
+        now=now,
+    )
+    assert first_scan.resumed == 0 and first_scan.waiting == 1
+    with session_factory() as session:
+        task = session.get(AnalysisTask, submitted.task_id)
+        assert task is not None
+        assert task.status == "waiting_model"
+        assert task.model_wait_origin == "automatic_recovery"
+        assert task.auto_recovery_count == 0
+        assert task.model_wait_until == cooldown_until
+        assert task.delivery_next_check_at == cooldown_until
+        session.commit()
+
+    next_check = cooldown_until + timedelta(seconds=1)
+    with session_factory.begin() as session:
+        cooldown = session.scalar(select(SharedModelCooldown))
+        task = session.get(AnalysisTask, submitted.task_id)
+        assert cooldown is not None and task is not None
+        cooldown.cooldown_until = next_check - timedelta(seconds=1)
+        task.delivery_next_check_at = cooldown_until
+    resumed = coordinate_due_analysis_recoveries(
+        session_factory,
+        settings=test_settings,
+        now=next_check,
+    )
+    assert resumed.resumed == 1
+    with session_factory() as session:
+        task = session.get(AnalysisTask, submitted.task_id)
+        assert task is not None
+        assert task.status == "queued"
+        assert task.auto_recovery_count == 1
+        assert task.model_wait_reason is None
+        assert task.model_wait_total_seconds is not None and task.model_wait_total_seconds >= 45
+
+
+def test_automatic_recovery_can_use_the_last_summary_request_and_stops_at_three(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    with TestClient(create_app(test_settings, session_factory, store, run_recovery=False)) as client:
+        owner_id = _register(client, "analysis-auto-summary-budget")
+        video_ids = [
+            _video(session_factory, store, owner_id),
+            _video(session_factory, store, owner_id),
+        ]
+
+    def prepare_failed_summary_task(video_id: uuid.UUID, request_count: int) -> tuple[uuid.UUID, uuid.UUID]:
+        task_id, attempt_id = _seed_stopped_complete_transcript(
+            session_factory, owner_id, video_id, test_settings
+        )
+        request_started_at = datetime.now(UTC)
+        with session_factory.begin() as session:
+            task = session.get(AnalysisTask, task_id)
+            attempt = session.get(AnalysisAttempt, attempt_id)
+            assert task is not None and attempt is not None and attempt.execution_id is not None
+            task.status = "failed"
+            task.stage = "failed"
+            task.summary_status = "failed"
+            task.failure_code = "LLM_UPSTREAM_ERROR"
+            task.delivery_wait_reason = "automatic_recovery_pending"
+            task.delivery_next_check_at = request_started_at
+            attempt.status = "failed"
+            attempt.failure_code = "LLM_UPSTREAM_ERROR"
+            for request_number in range(1, request_count + 1):
+                session.add(
+                    SummaryRequest(
+                        task_id=task_id,
+                        attempt_id=attempt_id,
+                        execution_id=attempt.execution_id,
+                        request_number=request_number,
+                        request_fingerprint=hashlib.sha256(
+                            f"request-{task_id}-{request_number}".encode()
+                        ).hexdigest(),
+                        status="failed",
+                        provider="test-local",
+                        model="test-local",
+                        prompt_version="stage5-test",
+                        started_at=request_started_at,
+                        finished_at=request_started_at,
+                        error_code="LLM_UPSTREAM_ERROR",
+                    )
+                )
+        return task_id, attempt_id
+
+    task_id, parent_id = prepare_failed_summary_task(video_ids[0], request_count=2)
+    cycle = coordinate_due_analysis_recoveries(
+        session_factory,
+        settings=test_settings,
+        now=datetime.now(UTC) + timedelta(seconds=1),
+    )
+    assert cycle.resumed == 1
+    with session_factory() as session:
+        task = session.get(AnalysisTask, task_id)
+        child = session.scalar(select(AnalysisAttempt).where(AnalysisAttempt.parent_attempt_id == parent_id))
+        assert task is not None and child is not None
+        assert child.execution_mode == "summary_only"
+        assert task.auto_recovery_count == 1
+        request_count = session.scalar(
+            select(func.count(SummaryRequest.id)).where(SummaryRequest.task_id == task_id)
+        )
+        assert request_count == 2
+        child_id = child.id
+        session.commit()
+
+    monkeypatch.setattr(analysis_worker, "get_settings", lambda: test_settings)
+    monkeypatch.setattr(analysis_worker, "_get_or_make_worker_components", lambda _: (test_engine, store))
+    monkeypatch.setattr(
+        analysis_worker,
+        "_transcribe",
+        lambda *_args, **_kwargs: pytest.fail("summary-only automatic recovery must not call ASR"),
+    )
+    _mock_llm_process(monkeypatch, [(_summary_model_output(), "stop")])
+    assert transcribe_analysis(str(task_id), str(child_id)) == {"status": "succeeded"}
+    with session_factory() as session:
+        request_count = session.scalar(
+            select(func.count(SummaryRequest.id)).where(SummaryRequest.task_id == task_id)
+        )
+        assert request_count == 3
+        task = session.get(AnalysisTask, task_id)
+        assert task is not None and task.status == "succeeded"
+
+    exhausted_task_id, exhausted_parent_id = prepare_failed_summary_task(video_ids[1], request_count=3)
+    exhausted = coordinate_due_analysis_recoveries(
+        session_factory,
+        settings=test_settings,
+        now=datetime.now(UTC) + timedelta(seconds=2),
+    )
+    assert exhausted.resumed == 0 and exhausted.exhausted == 1
+    with session_factory() as session:
+        task = session.get(AnalysisTask, exhausted_task_id)
+        child_count = session.scalar(
+            select(func.count(AnalysisAttempt.id)).where(
+                AnalysisAttempt.task_id == exhausted_task_id,
+                AnalysisAttempt.parent_attempt_id == exhausted_parent_id,
+            )
+        )
+        assert task is not None
+        assert task.auto_recovery_count == 0
+        assert task.delivery_wait_reason == "summary_request_budget_exhausted"
+        assert task.failure_code == "LLM_UPSTREAM_ERROR"
+        assert child_count == 0
+
+
+def test_nonautomatic_wait_continuation_does_not_consume_recovery_budget(
+    test_settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    with TestClient(create_app(test_settings, session_factory, store, run_recovery=False)) as client:
+        owner_id = _register(client, "analysis-normal-wait")
+        video_id = _video(session_factory, store, owner_id)
+    submitted = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
+    _mark_attempt_failed_stopped(
+        session_factory,
+        submitted.task_id,
+        submitted.attempt_id,
+        failure_code="ASR_RATE_LIMITED",
+    )
+    wait_until = datetime.now(UTC) + timedelta(seconds=30)
+    wait_started = wait_until - timedelta(seconds=20)
+    with session_factory.begin() as session:
+        task = session.get(AnalysisTask, submitted.task_id)
+        attempt = session.get(AnalysisAttempt, submitted.attempt_id)
+        assert task is not None and attempt is not None
+        delivery_budget_before = (
+            task.delivery_retry_count,
+            task.delivery_retry_limit,
+            task.delivery_operation_count,
+            task.delivery_deadline_at,
+        )
+        task.status = "waiting_model"
+        task.stage = "waiting_asr"
+        task.model_wait_reason = "MODEL_COOLDOWN"
+        task.model_wait_origin = "continuation"
+        task.model_wait_stage = "transcribing"
+        task.model_wait_started_at = wait_started
+        task.model_wait_until = wait_until
+        task.delivery_wait_reason = "shared_model_cooldown"
+        task.delivery_next_check_at = wait_until
+        task.queue_entered_at = None
+        if task.delivery_deadline_at is not None and task.delivery_blocked_since is None:
+            task.delivery_blocked_since = wait_started
+        attempt.status = "waiting_model"
+    result = create_followup_attempt(
+        session_factory,
+        task_id=submitted.task_id,
+        video_id=video_id,
+        parent_attempt_id=submitted.attempt_id,
+        mode="wait_resume",
+        settings=test_settings,
+        now=wait_until + timedelta(seconds=1),
+    )
+    assert result.queued
+    with session_factory() as session:
+        task = session.get(AnalysisTask, submitted.task_id)
+        assert task is not None
+        assert task.auto_recovery_count == 0
+        assert task.status == "queued"
+        assert (
+            task.delivery_retry_count,
+            task.delivery_retry_limit,
+            task.delivery_operation_count,
+        ) == delivery_budget_before[:3]
+        if delivery_budget_before[3] is not None:
+            assert task.delivery_deadline_at == delivery_budget_before[3] + timedelta(seconds=21)
 
 
 def test_celery_delivery_and_acknowledgement_settings_are_explicit() -> None:
@@ -2310,6 +2668,7 @@ def _seed_stopped_complete_transcript(
     )
     stopped_at = datetime.now(UTC)
     execution_id = uuid.uuid4()
+    boundary_pid = 200_001
     with factory.begin() as session:
         task = session.get(AnalysisTask, submitted.task_id)
         attempt = session.get(AnalysisAttempt, submitted.attempt_id)
@@ -2330,11 +2689,29 @@ def _seed_stopped_complete_transcript(
                 attempt_id=attempt.id,
                 worker_id="test-confirmed-stopped",
                 backend_pid=1,
-                stop_confirmed_at=stopped_at,
-                stop_confirmation_source="test_operator_evidence",
+                worker_instance_id=uuid.uuid4(),
+                worker_container_id="c" * 64,
+                process_scope=PROCESS_SCOPE,
+                boundary_pid=boundary_pid,
+                boundary_start_ticks=987_321,
+                boundary_session_id=boundary_pid,
+                boundary_boot_id="test-summary-boot",
+                supervisor_registered_at=stopped_at - timedelta(seconds=1),
             )
         )
         session.add_all(transcript_rows)
+    with factory() as session:
+        execution = session.get(AnalysisExecution, execution_id)
+        identity = stop_confirmation.identity_from_execution(execution) if execution is not None else None
+        session.commit()
+    assert identity is not None
+    assert (
+        confirm_stopped_execution(
+            factory,
+            worker_stop_evidence(identity, session_stopped=True),
+        )
+        == "confirmed"
+    )
     return submitted.task_id, submitted.attempt_id
 
 

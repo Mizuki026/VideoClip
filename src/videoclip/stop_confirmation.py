@@ -199,7 +199,11 @@ def confirm_stopped_execution(
             task.status = "failed"
             task.stage = "failed"
             task.failure_code = task.failure_code or "WORKER_EXECUTION_INTERRUPTED"
+            task.delivery_wait_reason = "automatic_recovery_pending"
+            task.delivery_next_check_at = now
             task.updated_at = now
+        if attempt.status == "failed" and attempt.finished_at is None:
+            attempt.finished_at = now
         if task.summary_status == "running":
             task.summary_status = "failed"
         unfinished_requests = list(
@@ -229,9 +233,7 @@ def confirm_operator_container_stop(
     container_exited: bool,
 ) -> Literal["confirmed", "already_confirmed", "rejected"]:
     with factory() as session:
-        execution = session.scalar(
-            select(AnalysisExecution).where(AnalysisExecution.id == execution_id)
-        )
+        execution = session.scalar(select(AnalysisExecution).where(AnalysisExecution.id == execution_id))
         identity = identity_from_execution(execution) if execution is not None else None
         session.commit()
     if identity is None or identity.worker_instance_id != worker_instance_id:

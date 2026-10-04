@@ -939,7 +939,7 @@ function AnalysisPanel({ task, csrf, busy, onStart, onRecover, onSummarize, onCl
   summaryBlocked: boolean;
 }) {
   const unavailable = !csrf || busy !== null;
-  const canContinueSummary = Boolean(task && task.status === 'awaiting_summary' && task.summary_status === 'waiting' && task.execution_state === 'stopped' && !summaryBlocked);
+  const canContinueSummary = Boolean(task && task.status === 'awaiting_summary' && task.summary_status === 'waiting' && task.execution_state === 'stopped' && !summaryBlocked && !task.summary_requests_exhausted);
   const canRecover = Boolean(task?.recovery_eligible);
   const canCleanup = task?.attempt.cleanup_state === 'failed';
   return (
@@ -953,10 +953,19 @@ function AnalysisPanel({ task, csrf, busy, onStart, onRecover, onSummarize, onCl
           <div className="progress-facts"><div><strong>{task.expected_segments === 0 ? '—' : `${task.completed_segments} / ${task.expected_segments}`}</strong><span>已完成片段</span></div><div><strong>{task.delivery_status === 'sent' ? '已发送，等待领取' : task.delivery_status === 'pending' ? '等待投递确认' : task.delivery_status === 'unknown' ? '发送结果不确定' : task.delivery_status === 'failed' ? '投递失败' : '状态未知'}</strong><span>队列投递</span></div></div>
           {task.delivery_wait_reason && <StatusRow label="排队协调" value={deliveryWaitLabel(task.delivery_wait_reason) ?? '等待后端检查'} />}
           {task.delivery_next_check_at && <StatusRow label="下次协调检查" value={formatDate(task.delivery_next_check_at)} />}
+          {task.model_wait_reason && <StatusRow label="模型等待阶段" value={task.model_wait_stage === 'summarizing' ? '总结请求' : task.model_wait_stage === 'transcribing' ? 'ASR 转写请求' : '等待后端确认阶段'} />}
+          {task.model_wait_until && <StatusRow label="预计下次检查" value={`${formatDate(task.model_wait_until)}（检查时间，不代表届时可用）`} />}
+          {task.model_wait_seconds_used !== null && task.model_wait_total_limit_seconds !== null && <StatusRow label="累计模型等待" value={`${formatDuration(task.model_wait_seconds_used)} / ${formatDuration(task.model_wait_total_limit_seconds)}`} />}
+          {task.model_wait_single_deadline_at && <StatusRow label="本次等待上限时间" value={formatDate(task.model_wait_single_deadline_at)} />}
           {task.delivery_retry_count !== null && task.delivery_retry_limit !== null && <StatusRow label="已接受的补投" value={`${task.delivery_retry_count} / ${task.delivery_retry_limit}`} />}
+          {task.auto_recovery_count !== null && task.auto_recovery_limit !== null && <StatusRow label="执行失败自动恢复" value={`${task.auto_recovery_count} / ${task.auto_recovery_limit}`} />}
+          <StatusRow label="总结请求预算" value={`${task.summary_requests_used} / ${task.summary_requests_limit}${task.summary_requests_exhausted ? '（已耗尽）' : ''}`} />
+          {task.auto_recovery_budget_exhausted && <p className="recovery-hint">自动恢复次数已耗尽；可用总结或补投预算仍分别按各自计数。</p>}
+          {task.summary_requests_exhausted && <p className="recovery-hint">总结请求已耗尽；已验证转写会保留。</p>}
           {task.delivery_failure_code && <p className="inline-error">{errorMessage(task.delivery_failure_code)}</p>}
           {task.delivery_error_code && <p className="inline-error">{errorMessage(task.delivery_error_code)}</p>}
           {task.failure_code && <p className="inline-error">{errorMessage(task.failure_code) ?? `处理原因：${task.failure_code}`}</p>}
+          {task.model_wait_error_code && <p className="inline-error">{errorMessage(task.model_wait_error_code) ?? `等待原因：${task.model_wait_error_code}`}</p>}
           {task.summary_status === 'running' && <p className="summary-running"><span className="spinner spinner-small" />正在生成总结，结果尚未发布。</p>}
           {task.status === 'awaiting_summary' && task.summary_status === 'waiting' && <div className="awaiting-box"><strong>转写已完成</strong><p>{transcriptComplete ? '所有已保存片段已由后端确认。' : '后端正在确认完整转写来源。'}</p></div>}
           <StatusRow label="执行者停止事实" value={task.execution_state === 'not_started' ? '未领取' : task.execution_state === 'stopped' ? '后端已确认停止' : '停止尚未确认'} />

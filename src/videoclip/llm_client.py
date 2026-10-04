@@ -5,6 +5,7 @@ import json
 import os
 import re
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,9 +15,13 @@ from videoclip.summarization import SUMMARY_RESPONSE_JSON_SCHEMA
 
 
 class LlmCallError(RuntimeError):
-    def __init__(self, code: str) -> None:
+    def __init__(
+        self, code: str, *, retry_after: str | None = None, response_received_at: str | None = None
+    ) -> None:
         super().__init__(code)
         self.code = code
+        self.retry_after = retry_after
+        self.response_received_at = response_received_at
 
 
 def _status_code(status: int) -> str:
@@ -37,6 +42,18 @@ def _status_code(status: int) -> str:
     if status >= 500:
         return "LLM_UPSTREAM_ERROR"
     return "LLM_REQUEST_REJECTED"
+
+
+def _retry_after_header(response: httpx.Response) -> str | None:
+    value = response.headers.get("retry-after")
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 128
+        or any(ord(character) < 32 or ord(character) > 126 for character in value)
+    ):
+        return None
+    return value.strip()
 
 
 def _read_response(response: httpx.Response, maximum: int, deadline: float) -> bytes:
@@ -132,7 +149,14 @@ def request_completion(
                 json=payload,
             ) as response:
                 if response.status_code >= 400:
-                    raise LlmCallError(_status_code(response.status_code))
+                    code = _status_code(response.status_code)
+                    if response.status_code == 429:
+                        raise LlmCallError(
+                            code,
+                            retry_after=_retry_after_header(response),
+                            response_received_at=datetime.now(UTC).isoformat(),
+                        )
+                    raise LlmCallError(code)
                 body = _read_response(response, maximum, deadline)
                 try:
                     document = json.loads(body)
@@ -194,6 +218,11 @@ def main() -> int:
         result = request_completion(request)
     except LlmCallError as exc:
         result = {"error_code": exc.code}
+        if exc.code == "LLM_RATE_LIMITED":
+            if exc.retry_after is not None:
+                result["retry_after"] = exc.retry_after
+            if exc.response_received_at is not None:
+                result["response_received_at"] = exc.response_received_at
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         result = {"error_code": "LLM_CONFIGURATION_INVALID"}
     try:

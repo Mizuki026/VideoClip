@@ -159,11 +159,15 @@ def current_delivery_wait_reason(
     next_task_id = find_next_queued_task(session)
     if next_task_id is not None and next_task_id != task.id:
         return "queue_order_wait"
-    if task.delivery_wait_reason not in {
-        "execution_slot_occupied",
-        "stop_confirmation_required",
-        "queue_order_wait",
-    } and task.delivery_wait_reason is not None:
+    if (
+        task.delivery_wait_reason
+        not in {
+            "execution_slot_occupied",
+            "stop_confirmation_required",
+            "queue_order_wait",
+        }
+        and task.delivery_wait_reason is not None
+    ):
         return task.delivery_wait_reason
     if delivery.operation_generation in {None, 0}:
         return "queued_for_delivery"
@@ -490,9 +494,21 @@ def initialize_legacy_delivery_budget(task: AnalysisTask, now: datetime, policy:
     task.delivery_failure_code = None
 
 
+def _has_delivery_budget(task: AnalysisTask) -> bool:
+    """Queue eligibility may be cleared while a durable wait keeps its budget."""
+    return all(
+        value is not None
+        for value in (
+            task.delivery_retry_count,
+            task.delivery_retry_limit,
+            task.delivery_operation_count,
+        )
+    )
+
+
 def prepare_task_for_new_attempt(task: AnalysisTask, now: datetime, policy: DeliveryPolicy) -> str | None:
     """Re-enter queue order without clearing a Stage-4 budget or deadline."""
-    if task.queue_entered_at is None:
+    if not _has_delivery_budget(task):
         initialize_legacy_delivery_budget(task, now, policy)
     else:
         _resume_budget_clock(task, now)

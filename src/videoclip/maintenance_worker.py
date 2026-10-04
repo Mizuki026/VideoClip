@@ -12,10 +12,11 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session, sessionmaker
 
 from videoclip.analysis_delivery import DeliveryPolicy, coordinate_due_analysis_deliveries
+from videoclip.analysis_lifecycle import coordinate_due_analysis_recoveries
 from videoclip.celery_app import BROKER_URL, celery_app
 from videoclip.db import create_database_engine, create_session_factory
 from videoclip.resumable_uploads import reclaim_expired_uploads
-from videoclip.settings import get_settings
+from videoclip.settings import Settings, get_settings
 from videoclip.storage import MediaStore
 
 logger = logging.getLogger("videoclip.maintenance")
@@ -153,7 +154,10 @@ def _reclaim_with_database_lock(
 
 
 def _coordinate_with_database_lock(
-    factory: sessionmaker[Session], connection: Connection, policy: DeliveryPolicy
+    factory: sessionmaker[Session],
+    connection: Connection,
+    policy: DeliveryPolicy,
+    settings: Settings | None = None,
 ) -> dict[str, int | str]:
     acquired = bool(
         connection.execute(
@@ -163,6 +167,16 @@ def _coordinate_with_database_lock(
     if not acquired:
         return {"status": "overlap_skipped", "scanned": 0, "published": 0, "blocked": 0, "exhausted": 0}
     try:
+        recovery = (
+            coordinate_due_analysis_recoveries(
+                factory,
+                settings=settings,
+                delivery_policy=policy,
+                limit=min(4, policy.scan_limit),
+            )
+            if settings is not None
+            else None
+        )
         result = coordinate_due_analysis_deliveries(
             factory,
             lambda task_id, attempt_id: celery_app.send_task(
@@ -170,13 +184,24 @@ def _coordinate_with_database_lock(
             ),
             policy=policy,
         )
-        return {
+        result_values: dict[str, int | str] = {
             "status": "completed",
             "scanned": result.scanned,
             "published": result.published,
             "blocked": result.blocked,
             "exhausted": result.exhausted,
         }
+        if recovery is not None:
+            result_values.update(
+                {
+                    "recovery_scanned": recovery.scanned,
+                    "recovery_resumed": recovery.resumed,
+                    "recovery_waiting": recovery.waiting,
+                    "recovery_blocked": recovery.blocked,
+                    "recovery_exhausted": recovery.exhausted,
+                }
+            )
+        return result_values
     finally:
         connection.execute(
             text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": DELIVERY_ADVISORY_LOCK_ID}
@@ -234,14 +259,23 @@ def coordinate_analysis_deliveries_task(_schedule_lock_token: str | None = None)
     policy = DeliveryPolicy.from_settings(settings)
     try:
         with engine.connect() as connection:
-            result = _coordinate_with_database_lock(create_session_factory(engine), connection, policy)
+            result = _coordinate_with_database_lock(
+                create_session_factory(engine), connection, policy, settings
+            )
         logger.info(
-            "analysis_delivery_cycle_finished status=%s scanned=%s published=%s blocked=%s exhausted=%s",
+            "analysis_delivery_cycle_finished status=%s scanned=%s published=%s blocked=%s exhausted=%s "
+            "recovery_scanned=%s recovery_resumed=%s recovery_waiting=%s recovery_blocked=%s "
+            "recovery_exhausted=%s",
             result["status"],
             result["scanned"],
             result["published"],
             result["blocked"],
             result["exhausted"],
+            result.get("recovery_scanned", 0),
+            result.get("recovery_resumed", 0),
+            result.get("recovery_waiting", 0),
+            result.get("recovery_blocked", 0),
+            result.get("recovery_exhausted", 0),
         )
         return result
     except Exception:

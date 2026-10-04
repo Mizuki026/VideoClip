@@ -176,12 +176,13 @@ class AnalysisTask(Base):
     __table_args__ = (
         UniqueConstraint("video_id", name="uq_analysis_tasks_video"),
         CheckConstraint(
-            "status IN ('queued', 'running', 'awaiting_summary', 'failed', 'succeeded')",
+            "status IN ('queued', 'running', 'waiting_model', 'awaiting_summary', 'failed', 'succeeded')",
             name="ck_analysis_tasks_status",
         ),
         CheckConstraint(
             "stage IN ('queued', 'validating_source', 'extracting_audio', 'preparing_manifest', "
-            "'transcribing', 'awaiting_summary', 'queued_summary', 'summarizing', 'failed', 'succeeded')",
+            "'transcribing', 'waiting_asr', 'waiting_summary', 'awaiting_summary', 'queued_summary', "
+            "'summarizing', 'failed', 'succeeded')",
             name="ck_analysis_tasks_stage",
         ),
         CheckConstraint(
@@ -195,6 +196,33 @@ class AnalysisTask(Base):
             "delivery_next_check_at",
             "id",
             postgresql_where=text("status = 'queued' AND queue_entered_at IS NOT NULL"),
+        ),
+        Index(
+            "ix_analysis_tasks_model_wait_due",
+            "delivery_next_check_at",
+            "id",
+            postgresql_where=text("status = 'waiting_model' AND delivery_next_check_at IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "auto_recovery_count IS NULL OR auto_recovery_count >= 0",
+            name="ck_analysis_tasks_auto_recovery_count_nonnegative",
+        ),
+        CheckConstraint(
+            "auto_recovery_limit IS NULL OR auto_recovery_limit > 0",
+            name="ck_analysis_tasks_auto_recovery_limit_positive",
+        ),
+        CheckConstraint(
+            "auto_recovery_count IS NULL OR auto_recovery_limit IS NULL "
+            "OR auto_recovery_count <= auto_recovery_limit",
+            name="ck_analysis_tasks_auto_recoveries_within_limit",
+        ),
+        CheckConstraint(
+            "model_wait_total_seconds IS NULL OR model_wait_total_seconds >= 0",
+            name="ck_analysis_tasks_model_wait_total_nonnegative",
+        ),
+        CheckConstraint(
+            "model_wait_total_limit_seconds IS NULL OR model_wait_total_limit_seconds > 0",
+            name="ck_analysis_tasks_model_wait_total_limit_positive",
         ),
     )
 
@@ -229,6 +257,22 @@ class AnalysisTask(Base):
     delivery_blocked_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     delivery_wait_reason: Mapped[str | None] = mapped_column(String(64))
     delivery_failure_code: Mapped[str | None] = mapped_column(String(64))
+    # Stage 5 is explicit: nullable legacy fields are not an automatic-recovery grant.
+    auto_recovery_count: Mapped[int | None] = mapped_column(Integer)
+    auto_recovery_limit: Mapped[int | None] = mapped_column(Integer)
+    stage5_enrolled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    model_wait_total_seconds: Mapped[int | None] = mapped_column(Integer)
+    model_wait_total_limit_seconds: Mapped[int | None] = mapped_column(Integer)
+    model_wait_reason: Mapped[str | None] = mapped_column(String(64))
+    model_wait_error_code: Mapped[str | None] = mapped_column(String(64))
+    model_wait_provider: Mapped[str | None] = mapped_column(String(32))
+    model_wait_account_reference: Mapped[str | None] = mapped_column(String(64))
+    model_wait_model: Mapped[str | None] = mapped_column(String(128))
+    model_wait_stage: Mapped[str | None] = mapped_column(String(24))
+    model_wait_origin: Mapped[str | None] = mapped_column(String(32))
+    model_wait_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    model_wait_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    model_wait_single_deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -242,7 +286,7 @@ class AnalysisAttempt(Base):
         CheckConstraint("attempt_number > 0", name="ck_analysis_attempts_number_positive"),
         CheckConstraint("claim_count IN (0, 1)", name="ck_analysis_attempts_claim_once"),
         CheckConstraint(
-            "status IN ('queued', 'running', 'awaiting_summary', 'failed', 'succeeded')",
+            "status IN ('queued', 'running', 'waiting_model', 'awaiting_summary', 'failed', 'succeeded')",
             name="ck_analysis_attempts_status",
         ),
         CheckConstraint(
@@ -460,3 +504,23 @@ class SummaryRequest(Base):
     response_bytes: Mapped[int | None] = mapped_column(Integer)
     error_code: Mapped[str | None] = mapped_column(String(64))
     validation_error_code: Mapped[str | None] = mapped_column(String(64))
+    correction_error_code: Mapped[str | None] = mapped_column(String(64))
+
+
+class SharedModelCooldown(Base):
+    __tablename__ = "shared_model_cooldowns"
+    __table_args__ = (
+        UniqueConstraint("provider", "account_reference", "model", name="uq_shared_model_cooldown_identity"),
+        CheckConstraint("consecutive_rate_limits >= 0", name="ck_shared_model_cooldown_count_nonnegative"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    account_reference: Mapped[str] = mapped_column(String(64), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    cooldown_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consecutive_rate_limits: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_rate_limited_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

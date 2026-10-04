@@ -3,6 +3,7 @@ import type { AnalysisTask } from './types';
 const taskLabels: Record<string, string> = {
   queued: '等待处理',
   running: '正在处理',
+  waiting_model: '等待模型冷却',
   awaiting_summary: '转写已完成，等待总结',
   failed: '处理失败',
   succeeded: '分析完成',
@@ -14,6 +15,8 @@ const stageLabels: Record<string, string> = {
   extracting_audio: '正在提取音频',
   preparing_manifest: '正在准备片段',
   transcribing: '正在转写',
+  waiting_asr: '等待 ASR 冷却',
+  waiting_summary: '等待总结模型冷却',
   awaiting_summary: '转写完成',
   queued_summary: '等待生成总结',
   summarizing: '正在生成总结',
@@ -32,6 +35,16 @@ const errorLabels: Record<string, string> = {
   ANALYSIS_DELIVERY_DEADLINE_EXPIRED: '分析任务投递等待已超出期限，需要人工处理。',
   ANALYSIS_DELIVERY_BUDGET_UNAVAILABLE: '分析任务投递预算不可用，需要人工检查。',
   ANALYSIS_DELIVERY_BUDGET_EXHAUSTED: '分析任务投递预算已耗尽，需要人工处理。',
+  MODEL_WAIT_SINGLE_LIMIT_EXCEEDED: '模型要求等待时间超过单次等待上限，已转人工处理。',
+  MODEL_WAIT_TOTAL_LIMIT_EXCEEDED: '模型累计等待时间已达到上限，已转人工处理。',
+  SUMMARY_REQUEST_BUDGET_EXHAUSTED: '总结请求预算已耗尽，转写仍保留，不能继续请求总结。',
+  AUTOMATIC_RECOVERY_EXHAUSTED: '自动恢复次数已耗尽，需要人工处理。',
+  MANUAL_RECOVERY_NOT_RECOMMENDED: '此错误不适合自动重跑，请检查来源、配置或媒体后再处理。',
+  LLM_AUTHENTICATION_FAILED: '总结模型鉴权失败。请核对模型账户和密钥配置后再恢复。',
+  LLM_MODEL_UNAVAILABLE: '冻结的总结模型当前不可用。请核对模型配置后再恢复。',
+  LLM_REQUEST_REJECTED: '总结请求被模型服务拒绝。请检查请求配置后再恢复。',
+  MODEL_COOLDOWN_PERSIST_FAILED: '共享冷却状态未能持久化，已阻止自动重试。',
+  MODEL_COOLDOWN: '共享模型额度正在冷却。',
   BROKER_CONFIRMATION_UNKNOWN: '队列发送结果暂未确认；后台会按持久化计划复查。',
   BROKER_PAYLOAD_REJECTED: '队列拒绝了发送内容；后台会在独立补偿预算内重试。',
   ATTEMPT_NOT_CURRENT: '该次处理已被后续尝试替代，请刷新页面。',
@@ -53,6 +66,13 @@ const deliveryWaitLabels: Record<string, string> = {
   execution_slot_occupied: '分析执行位被其他任务占用',
   stop_confirmation_required: '停止确认阻断，新执行者不会启动',
   delivery_budget_exhausted: '投递补偿预算或期限已耗尽',
+  shared_model_cooldown: '同一共享模型额度正在冷却，等待后会重新核对',
+  automatic_recovery_pending: '执行失败已确认停止，等待受控恢复协调',
+  automatic_recovery_exhausted: '自动恢复次数已耗尽',
+  model_wait_manual_required: '模型等待超过限制，需要人工处理',
+  summary_request_budget_exhausted: '总结请求预算已耗尽',
+  source_configuration_incompatible: '视频来源或冻结配置校验失败',
+  transcript_checkpoint_invalid: '历史转写检查点校验失败',
 };
 
 export function taskStatusLabel(status: string): string {
@@ -74,7 +94,7 @@ export function deliveryWaitLabel(reason: string | null): string | null {
 }
 
 export function shouldPollTask(task: AnalysisTask): boolean {
-  return task.status === 'queued' || task.status === 'running' || task.summary_status === 'running';
+  return task.status === 'queued' || task.status === 'running' || task.status === 'waiting_model' || task.summary_status === 'running';
 }
 
 export function formatDuration(seconds: number): string {

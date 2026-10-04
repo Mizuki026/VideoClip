@@ -20,6 +20,19 @@ function task(overrides: Partial<AnalysisTask> = {}): AnalysisTask {
     delivery_deadline_at: null,
     delivery_wait_reason: 'queued_for_delivery',
     delivery_failure_code: null,
+    model_wait_reason: null,
+    model_wait_error_code: null,
+    model_wait_stage: null,
+    model_wait_until: null,
+    model_wait_single_deadline_at: null,
+    model_wait_seconds_used: 0,
+    model_wait_total_limit_seconds: 259200,
+    auto_recovery_count: 0,
+    auto_recovery_limit: 2,
+    auto_recovery_budget_exhausted: false,
+    summary_requests_used: 0,
+    summary_requests_limit: 3,
+    summary_requests_exhausted: false,
     completed_segments: 0,
     expected_segments: 0,
     transcript_complete: false,
@@ -72,6 +85,7 @@ describe('presentation rules for backend facts', () => {
     expect(errorMessage('ATTEMPT_TEMP_CLEANUP_FAILED')).toContain('临时文件清理失败');
     expect(errorMessage('ATTEMPT_CLEANUP_NOT_ELIGIBLE')).toContain('尚未确认');
     expect(errorMessage('STORAGE_OPERATION_FAILED')).toContain('原视频');
+    expect(errorMessage('LLM_AUTHENTICATION_FAILED')).toContain('鉴权失败');
     expect(errorMessage(null)).toBeNull();
     expect(errorMessage('ANALYSIS_DELIVERY_RETRIES_EXHAUSTED')).toContain('投递补偿次数已耗尽');
     expect(deliveryWaitLabel('stop_confirmation_required')).toContain('停止确认阻断');

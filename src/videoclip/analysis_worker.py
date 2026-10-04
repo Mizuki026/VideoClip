@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import random
 import signal
 import socket
 import subprocess
@@ -30,11 +31,20 @@ from videoclip.analysis_supervisor import (
     establish_execution_boundary,
     register_execution_with_supervisor,
 )
+from videoclip.analysis_wait import enter_model_wait, require_manual_wait, wait_budget_error
 from videoclip.db import create_database_engine
 from videoclip.execution_gate import (
     EXECUTION_ADVISORY_LOCK_KEY,
     find_next_queued_task,
     find_unconfirmed_execution,
+)
+from videoclip.model_cooling import (
+    CooldownPolicy,
+    ModelIdentity,
+    current_cooldown_until,
+    extend_shared_cooldown,
+    model_identity_from_config,
+    record_model_success,
 )
 from videoclip.models import (
     AnalysisAttempt,
@@ -73,9 +83,50 @@ CHECK_INTERVAL_SECONDS = 1.0
 
 
 class AnalysisFailure(RuntimeError):
-    def __init__(self, code: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        retry_after: str | None = None,
+        response_received_at: datetime | None = None,
+    ) -> None:
         super().__init__(code)
         self.code = code
+        self.retry_after = retry_after
+        self.response_received_at = response_received_at
+
+
+class ModelCooldownWait(RuntimeError):
+    """The persisted preflight gate blocked a call before request reservation."""
+
+
+def _cooldown_policy(settings: Settings) -> CooldownPolicy:
+    return CooldownPolicy(
+        backoff_base_seconds=settings.model_cooldown_backoff_base_seconds,
+        backoff_max_seconds=settings.model_cooldown_backoff_max_seconds,
+    )
+
+
+def _response_received_at(payload: dict[str, Any]) -> datetime | None:
+    value = payload.get("response_received_at")
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
+
+
+def _rate_limit_identity(claim: ClaimedAttempt, code: str, settings: Settings) -> ModelIdentity:
+    field = "asr" if code.startswith("ASR_") else "summary"
+    section = claim.snapshot.get(field)
+    if not isinstance(section, dict):
+        raise AnalysisFailure("MODEL_COOLDOWN_IDENTITY_INVALID")
+    return model_identity_from_config(
+        section,
+        default_account_reference=settings.siliconflow_account_reference,
+    )
 
 
 class StopUnconfirmed(AnalysisFailure):
@@ -493,6 +544,7 @@ def _run_process(
     lease: ExecutionLease,
     claim: ClaimedAttempt,
     attempt_deadline: float,
+    timeout_error_code: str = "LOCAL_PROCESS_TIMEOUT",
 ) -> None:
     if timeout_seconds <= 0:
         raise AnalysisFailure("ATTEMPT_TIMEOUT")
@@ -526,7 +578,7 @@ def _run_process(
                 raise AnalysisFailure("ATTEMPT_TIMEOUT")
             if now - started >= timeout_seconds:
                 _stop_process_group(process, grace_seconds)
-                raise AnalysisFailure("LOCAL_PROCESS_TIMEOUT")
+                raise AnalysisFailure(timeout_error_code)
             if now >= next_check:
                 _progress_check(maker, lease, claim)
                 next_check = now + CHECK_INTERVAL_SECONDS
@@ -750,25 +802,80 @@ def _hash_path(path: Path) -> str:
 
 
 def _start_segment_request(
-    maker: sessionmaker[Session], lease: ExecutionLease, claim: ClaimedAttempt, segment_number: int
+    maker: sessionmaker[Session],
+    lease: ExecutionLease,
+    claim: ClaimedAttempt,
+    segment_number: int,
+    *,
+    settings: Settings | None = None,
+    now: datetime | None = None,
 ) -> TranscriptSegment:
     lease.assert_alive()
+    timestamp = now or datetime.now(UTC)
+    should_wait = False
     with db_transaction(maker) as session:
-        _, attempt, _, _ = _lock_execution_rows(session, claim)
-        segment = session.scalar(
-            select(TranscriptSegment)
-            .where(
-                TranscriptSegment.attempt_id == attempt.id,
-                TranscriptSegment.segment_number == segment_number,
+        task, attempt, _, _ = _lock_execution_rows(session, claim)
+        asr_config = claim.snapshot.get("asr")
+        if not isinstance(asr_config, dict):
+            raise AnalysisFailure("CONFIG_SNAPSHOT_INVALID")
+        if settings is not None:
+            try:
+                identity = model_identity_from_config(
+                    asr_config,
+                    default_account_reference=settings.siliconflow_account_reference,
+                )
+            except ValueError as exc:
+                raise AnalysisFailure("MODEL_COOLDOWN_IDENTITY_INVALID") from exc
+            cooldown_until = current_cooldown_until(session, identity)
+            if cooldown_until is not None and cooldown_until > timestamp:
+                wait_error = wait_budget_error(
+                    task=task,
+                    now=timestamp,
+                    cooldown_until=cooldown_until,
+                    single_limit_seconds=settings.model_wait_single_limit_seconds,
+                    total_limit_seconds=(
+                        task.model_wait_total_limit_seconds or settings.model_wait_total_limit_seconds
+                    ),
+                )
+                if wait_error is not None:
+                    require_manual_wait(task, attempt, wait_error)
+                else:
+                    enter_model_wait(
+                        session,
+                        task,
+                        attempt,
+                        identity=identity,
+                        stage="transcribing",
+                        origin="continuation",
+                        cooldown_until=cooldown_until,
+                        now=timestamp,
+                        single_limit_seconds=settings.model_wait_single_limit_seconds,
+                        total_limit_seconds=(
+                            task.model_wait_total_limit_seconds or settings.model_wait_total_limit_seconds
+                        ),
+                    )
+                should_wait = True
+        if should_wait:
+            segment = None
+        else:
+            segment = session.scalar(
+                select(TranscriptSegment)
+                .where(
+                    TranscriptSegment.attempt_id == attempt.id,
+                    TranscriptSegment.segment_number == segment_number,
+                )
+                .with_for_update()
             )
-            .with_for_update()
-        )
-        if segment is None or segment.status != "expected" or segment.request_count != 0:
-            raise AnalysisFailure("TRANSCRIPT_CHECKPOINT_NOT_ELIGIBLE")
-        segment.request_count = 1
-        segment.request_started_at = datetime.now(UTC)
-        session.flush()
-        return segment
+            if segment is None or segment.status != "expected" or segment.request_count != 0:
+                raise AnalysisFailure("TRANSCRIPT_CHECKPOINT_NOT_ELIGIBLE")
+            segment.request_count = 1
+            segment.request_started_at = timestamp
+            session.flush()
+    if should_wait:
+        raise ModelCooldownWait("shared model cooldown blocked the ASR request")
+    if segment is None:
+        raise AnalysisFailure("TRANSCRIPT_CHECKPOINT_NOT_ELIGIBLE")
+    return segment
 
 
 def _persist_transcript(
@@ -826,6 +933,8 @@ def _fail_task(maker: sessionmaker[Session], lease: ExecutionLease, claim: Claim
         task.status = "failed"
         task.stage = "failed"
         task.failure_code = task.failure_code or code[:64]
+        task.delivery_next_check_at = datetime.now(UTC)
+        task.delivery_wait_reason = "automatic_recovery_pending"
         if task.summary_status == "running" or claim.execution_mode == "summary_only":
             task.summary_status = "failed"
             unfinished_requests = list(
@@ -968,7 +1077,16 @@ def _read_asr_result(path: Path, return_code: int, max_bytes: int) -> tuple[str,
         raise AnalysisFailure("ASR_INVALID_RESPONSE") from exc
     code = payload.get("error_code") if isinstance(payload, dict) else None
     if isinstance(code, str):
-        raise AnalysisFailure(code[:64])
+        if len(code) > 64 or not code.replace("_", "").isalnum():
+            raise AnalysisFailure("ASR_INVALID_RESPONSE")
+        retry_after = payload.get("retry_after") if code == "ASR_RATE_LIMITED" else None
+        if not isinstance(retry_after, str) or len(retry_after) > 128:
+            retry_after = None
+        raise AnalysisFailure(
+            code,
+            retry_after=retry_after,
+            response_received_at=_response_received_at(payload) if code == "ASR_RATE_LIMITED" else None,
+        )
     if return_code != 0:
         raise AnalysisFailure("ASR_REQUEST_FAILED")
     if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
@@ -1067,7 +1185,7 @@ def _transcribe(
             continue
         if time.monotonic() >= attempt_deadline:
             raise AnalysisFailure("ATTEMPT_TIMEOUT")
-        _start_segment_request(maker, lease, claim, entry.segment_number)
+        segment_request = _start_segment_request(maker, lease, claim, entry.segment_number, settings=settings)
         response_path = directory / f"response-{entry.segment_number:04d}.json"
         request_timeout = min(float(limits["http_total_seconds"]), attempt_deadline - time.monotonic())
         _run_process(
@@ -1100,9 +1218,19 @@ def _transcribe(
             lease=lease,
             claim=claim,
             attempt_deadline=attempt_deadline,
+            timeout_error_code="ASR_TIMEOUT",
         )
         result_text, metadata = _read_asr_result(response_path, 0, int(limits["response_max_bytes"]))
         _persist_transcript(maker, lease, claim, entry.segment_number, result_text, metadata)
+        identity = model_identity_from_config(
+            asr_config,
+            default_account_reference=settings.siliconflow_account_reference,
+        )
+        record_model_success(
+            maker,
+            identity,
+            request_started_at=segment_request.request_started_at or datetime.now(UTC),
+        )
         response_path.unlink(missing_ok=True)
     _mark_awaiting_summary(maker, lease, claim)
 
@@ -1156,37 +1284,89 @@ def _start_summary_request(
     claim: ClaimedAttempt,
     contract: Any,
     request_fingerprint: str,
+    *,
+    settings: Settings,
+    correction_error_code: str | None,
+    now: datetime | None = None,
 ) -> SummaryRequest:
     lease.assert_alive()
+    timestamp = now or datetime.now(UTC)
+    should_wait = False
+    record: SummaryRequest | None = None
     with db_transaction(maker) as session:
         task, attempt, _, execution = _lock_execution_rows(session, claim)
         if task.summary_status != "running" or task.stage != "summarizing":
             raise AnalysisFailure("SUMMARY_EXECUTION_NOT_ELIGIBLE")
-        attempt_request_count = session.scalar(
-            select(func.count(SummaryRequest.id)).where(SummaryRequest.attempt_id == attempt.id)
-        )
-        task_request_count = session.scalar(
-            select(func.count(SummaryRequest.id)).where(SummaryRequest.task_id == task.id)
-        )
-        request_number = int(attempt_request_count or 0) + 1
-        if int(task_request_count or 0) >= contract.max_requests:
-            raise AnalysisFailure("SUMMARY_REPAIR_EXHAUSTED")
-        record = SummaryRequest(
-            task_id=task.id,
-            attempt_id=attempt.id,
-            execution_id=execution.id,
-            request_number=request_number,
-            request_fingerprint=request_fingerprint,
-            status="started",
-            provider=contract.provider,
-            model=contract.model,
-            prompt_version=contract.prompt_version,
-            started_at=datetime.now(UTC),
-        )
-        session.add(record)
-        session.flush()
-        session.expunge(record)
-        return record
+        summary_config = claim.snapshot.get("summary")
+        if not isinstance(summary_config, dict):
+            raise AnalysisFailure("SUMMARY_CONFIGURATION_INCOMPATIBLE")
+        try:
+            identity = model_identity_from_config(
+                summary_config,
+                default_account_reference=settings.siliconflow_account_reference,
+            )
+        except ValueError as exc:
+            raise AnalysisFailure("MODEL_COOLDOWN_IDENTITY_INVALID") from exc
+        cooldown_until = current_cooldown_until(session, identity)
+        if cooldown_until is not None and cooldown_until > timestamp:
+            wait_error = wait_budget_error(
+                task=task,
+                now=timestamp,
+                cooldown_until=cooldown_until,
+                single_limit_seconds=settings.model_wait_single_limit_seconds,
+                total_limit_seconds=(
+                    task.model_wait_total_limit_seconds or settings.model_wait_total_limit_seconds
+                ),
+            )
+            if wait_error is not None:
+                require_manual_wait(task, attempt, wait_error)
+            else:
+                enter_model_wait(
+                    session,
+                    task,
+                    attempt,
+                    identity=identity,
+                    stage="summarizing",
+                    origin="continuation",
+                    cooldown_until=cooldown_until,
+                    now=timestamp,
+                    single_limit_seconds=settings.model_wait_single_limit_seconds,
+                    total_limit_seconds=(
+                        task.model_wait_total_limit_seconds or settings.model_wait_total_limit_seconds
+                    ),
+                )
+            should_wait = True
+        if not should_wait:
+            attempt_request_count = session.scalar(
+                select(func.count(SummaryRequest.id)).where(SummaryRequest.attempt_id == attempt.id)
+            )
+            task_request_count = session.scalar(
+                select(func.count(SummaryRequest.id)).where(SummaryRequest.task_id == task.id)
+            )
+            request_number = int(attempt_request_count or 0) + 1
+            if int(task_request_count or 0) >= contract.max_requests:
+                raise AnalysisFailure("SUMMARY_REPAIR_EXHAUSTED")
+            record = SummaryRequest(
+                task_id=task.id,
+                attempt_id=attempt.id,
+                execution_id=execution.id,
+                request_number=request_number,
+                request_fingerprint=request_fingerprint,
+                status="started",
+                provider=contract.provider,
+                model=contract.model,
+                prompt_version=contract.prompt_version,
+                started_at=timestamp,
+                correction_error_code=correction_error_code,
+            )
+            session.add(record)
+            session.flush()
+            session.expunge(record)
+    if should_wait:
+        raise ModelCooldownWait("shared model cooldown blocked the summary request")
+    if record is None:
+        raise AnalysisFailure("SUMMARY_REQUEST_AUDIT_INVALID")
+    return record
 
 
 def _record_summary_response(
@@ -1235,6 +1415,8 @@ def _record_summary_failure(
         record.status = "failed"
         record.error_code = error_code[:64]
         record.validation_error_code = validation_error_code[:64] if validation_error_code else None
+        if validation_error_code and is_repairable_summary_failure(validation_error_code):
+            record.correction_error_code = validation_error_code[:64]
         record.finished_at = datetime.now(UTC)
         record.elapsed_seconds = max(0.0, float(elapsed_seconds))
         if metadata is not None:
@@ -1345,7 +1527,14 @@ def _read_llm_result(path: Path, maximum_bytes: int) -> tuple[str, dict[str, Any
     if isinstance(code, str):
         if len(code) > 64 or not code.replace("_", "").isalnum():
             raise AnalysisFailure("LLM_INVALID_RESPONSE")
-        raise AnalysisFailure(code)
+        retry_after = payload.get("retry_after") if code == "LLM_RATE_LIMITED" else None
+        if not isinstance(retry_after, str) or len(retry_after) > 128:
+            retry_after = None
+        raise AnalysisFailure(
+            code,
+            retry_after=retry_after,
+            response_received_at=_response_received_at(payload) if code == "LLM_RATE_LIMITED" else None,
+        )
     if (
         not isinstance(payload, dict)
         or not isinstance(payload.get("content"), str)
@@ -1375,6 +1564,7 @@ def _summarize(
     claim: ClaimedAttempt,
     store: MediaStore,
     attempt_deadline: float,
+    settings: Settings,
 ) -> None:
     _set_stage(maker, lease, claim, "summarizing")
     try:
@@ -1405,6 +1595,18 @@ def _summarize(
     except SummaryFailure as exc:
         raise AnalysisFailure(exc.code) from exc
     correction_code: str | None = None
+    with maker() as session:
+        previous_request = session.scalar(
+            select(SummaryRequest)
+            .where(SummaryRequest.task_id == claim.task_id)
+            .order_by(SummaryRequest.started_at.desc(), SummaryRequest.id.desc())
+            .limit(1)
+        )
+        if previous_request is not None and is_repairable_summary_failure(
+            previous_request.correction_error_code or ""
+        ):
+            correction_code = previous_request.correction_error_code
+        session.commit()
     for request_number in range(1, contract.max_requests + 1):
         remaining = attempt_deadline - time.monotonic()
         if remaining <= 0:
@@ -1414,7 +1616,15 @@ def _summarize(
             transcript_fingerprint=transcript_fingerprint,
             correction_code=correction_code,
         )
-        request_record = _start_summary_request(maker, lease, claim, contract, request_fingerprint)
+        request_record = _start_summary_request(
+            maker,
+            lease,
+            claim,
+            contract,
+            request_fingerprint,
+            settings=settings,
+            correction_error_code=correction_code,
+        )
         request_path = directory / f"summary-request-{request_record.request_number:02d}.json"
         response_path = directory / f"summary-response-{request_record.request_number:02d}.json"
         request_total = min(contract.timeouts["total"], remaining)
@@ -1475,6 +1685,7 @@ def _summarize(
                 lease=lease,
                 claim=claim,
                 attempt_deadline=attempt_deadline,
+                timeout_error_code="LLM_TOTAL_TIMEOUT",
             )
             raw, metadata = _read_llm_result(response_path, contract.max_response_bytes)
         except AnalysisFailure as exc:
@@ -1494,12 +1705,27 @@ def _summarize(
                 error_code,
                 elapsed_seconds=time.monotonic() - started,
             )
-            raise AnalysisFailure(error_code) from exc
+            raise AnalysisFailure(
+                error_code,
+                retry_after=exc.retry_after,
+                response_received_at=exc.response_received_at,
+            ) from exc
         finally:
             request_path.unlink(missing_ok=True)
             response_path.unlink(missing_ok=True)
 
         _record_summary_response(maker, lease, claim, request_record.id, metadata)
+        summary_config = claim.snapshot.get("summary")
+        if not isinstance(summary_config, dict):
+            raise AnalysisFailure("SUMMARY_CONFIGURATION_INCOMPATIBLE")
+        try:
+            identity = model_identity_from_config(
+                summary_config,
+                default_account_reference=settings.siliconflow_account_reference,
+            )
+        except ValueError as exc:
+            raise AnalysisFailure("MODEL_COOLDOWN_IDENTITY_INVALID") from exc
+        record_model_success(maker, identity, request_started_at=request_record.started_at)
         finish_reason = metadata.get("finish_reason")
         if finish_reason == "length":
             error_code = "LLM_OUTPUT_TRUNCATED"
@@ -1647,8 +1873,10 @@ def transcribe_analysis(task_id_value: str, attempt_id_value: str | None = None)
         try:
             if claim.execution_mode != "summary_only":
                 _transcribe(maker, lease, claim, settings, store, attempt_deadline)
-            _summarize(maker, lease, claim, store, attempt_deadline)
+            _summarize(maker, lease, claim, store, attempt_deadline, settings)
             terminal_reason = "summary_published"
+        except ModelCooldownWait:
+            terminal_reason = "model_cooldown_wait"
         except StopUnconfirmed:
             logger.error(
                 "analysis_stop_unconfirmed task_id=%s attempt_id=%s", task_id.hex, claim.attempt_id.hex
@@ -1657,6 +1885,32 @@ def transcribe_analysis(task_id_value: str, attempt_id_value: str | None = None)
         except AnalysisFailure as exc:
             failure_code = exc.code
             terminal_reason = exc.code
+            if exc.code in {"ASR_RATE_LIMITED", "LLM_RATE_LIMITED"}:
+                try:
+                    identity = _rate_limit_identity(claim, exc.code, settings)
+                    update = extend_shared_cooldown(
+                        maker,
+                        identity,
+                        now=datetime.now(UTC),
+                        retry_after=exc.retry_after,
+                        response_received_at=exc.response_received_at,
+                        random_fraction=random.random(),
+                        policy=_cooldown_policy(settings),
+                    )
+                    logger.info(
+                        "shared_model_cooldown_extended provider=%s account_reference=%s model=%s "
+                        "until=%s consecutive=%s retry_after=%s",
+                        identity.provider,
+                        identity.account_reference,
+                        identity.model,
+                        update.cooldown_until.isoformat(),
+                        update.consecutive_rate_limits,
+                        update.retry_after_accepted,
+                    )
+                except Exception:
+                    failure_code = "MODEL_COOLDOWN_PERSIST_FAILED"
+                    terminal_reason = failure_code
+                    logger.error("shared_model_cooldown_write_failed task_id=%s", task_id.hex)
         except (OSError, SQLAlchemyError):
             failure_code = "ANALYSIS_STORAGE_OR_DATABASE_FAILED"
             terminal_reason = failure_code

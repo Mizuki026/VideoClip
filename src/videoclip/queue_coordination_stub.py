@@ -4,6 +4,7 @@ import argparse
 import json
 import ssl
 import threading
+import time
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -35,6 +36,7 @@ class StubState:
         self.asr_requests = 0
         self.llm_requests = 0
         self.blocked_asr = 0
+        self.plans: dict[str, list[dict[str, Any]]] = {"asr": [], "llm": []}
 
     def record(self, event: str, **values: Any) -> None:
         self.event_path.parent.mkdir(parents=True, exist_ok=True)
@@ -57,6 +59,58 @@ class StubState:
                 "first_asr_entered": self.first_asr_entered.is_set(),
                 "released": self.release.is_set(),
             }
+
+    def next_response(self, kind: str) -> dict[str, Any]:
+        with self.lock:
+            queue = self.plans[kind]
+            return (
+                queue.pop(0)
+                if queue
+                else {"status": 200, "delay_seconds": 0, "retry_after": None, "hold": False}
+            )
+
+    def set_plan(self, value: object) -> bool:
+        if not isinstance(value, dict):
+            return False
+        plan: dict[str, list[dict[str, Any]]] = {}
+        for kind in ("asr", "llm"):
+            entries = value.get(kind, [])
+            if not isinstance(entries, list):
+                return False
+            normalized: list[dict[str, Any]] = []
+            for entry in entries:
+                item = {"status": entry} if type(entry) is int else entry
+                if (
+                    not isinstance(item, dict)
+                    or type(item.get("status")) is not int
+                    or not 100 <= item["status"] <= 599
+                ):
+                    return False
+                delay = item.get("delay_seconds", 0)
+                retry_after = item.get("retry_after")
+                hold = item.get("hold", False)
+                if not isinstance(delay, int | float) or isinstance(delay, bool) or delay < 0 or delay > 600:
+                    return False
+                if type(hold) is not bool:
+                    return False
+                if retry_after is not None and (
+                    not isinstance(retry_after, str)
+                    or len(retry_after) > 128
+                    or any(ord(character) < 32 or ord(character) > 126 for character in retry_after)
+                ):
+                    return False
+                normalized.append(
+                    {
+                        "status": item["status"],
+                        "delay_seconds": delay,
+                        "retry_after": retry_after,
+                        "hold": hold,
+                    }
+                )
+            plan[kind] = normalized
+        with self.lock:
+            self.plans = plan
+        return True
 
 
 def _send_json(handler: BaseHTTPRequestHandler, payload: dict[str, Any]) -> None:
@@ -91,6 +145,19 @@ def _handler_for(state: StubState) -> type[BaseHTTPRequestHandler]:
                 state.record("asr_gate_released")
                 _send_json(self, {"released": True})
                 return
+            if path == "/__control/plan":
+                content_length = self.headers.get("Content-Length", "0")
+                if not content_length.isdecimal() or int(content_length) > 65_536:
+                    self.send_error(413)
+                    return
+                try:
+                    plan = json.loads(self.rfile.read(int(content_length)))
+                except json.JSONDecodeError:
+                    self.send_error(400)
+                    return
+                accepted = state.set_plan(plan)
+                _send_json(self, {"accepted": accepted})
+                return
             content_length = self.headers.get("Content-Length", "0")
             if not content_length.isdecimal() or int(content_length) > 8_388_608:
                 self.send_error(413)
@@ -107,7 +174,21 @@ def _handler_for(state: StubState) -> type[BaseHTTPRequestHandler]:
                 if should_hold:
                     state.first_asr_entered.set()
                     state.release.wait(timeout=600)
-                _send_json(self, {"text": TRANSCRIPT})
+                response = state.next_response("asr")
+                if response.get("hold") is True:
+                    state.first_asr_entered.set()
+                    state.blocked_asr += 1
+                    state.record("asr_gate_held", request=request_number)
+                    state.release.wait(timeout=600)
+                time.sleep(float(response["delay_seconds"]))
+                status = int(response["status"])
+                state.record("asr_response", request=request_number, status=status)
+                if status >= 400:
+                    self._send(
+                        status, {"error": {"message": "controlled local substitute failure"}}, response
+                    )
+                else:
+                    self._send(status, {"text": TRANSCRIPT}, response)
                 return
             if path.endswith("/chat/completions"):
                 try:
@@ -122,6 +203,15 @@ def _handler_for(state: StubState) -> type[BaseHTTPRequestHandler]:
                     state.llm_requests += 1
                     request_number = state.llm_requests
                 state.record("llm_request", request=request_number, bytes=len(body))
+                response = state.next_response("llm")
+                time.sleep(float(response["delay_seconds"]))
+                status = int(response["status"])
+                state.record("llm_response", request=request_number, status=status)
+                if status >= 400:
+                    self._send(
+                        status, {"error": {"message": "controlled local substitute failure"}}, response
+                    )
+                    return
                 payload = {
                     "model": request["model"],
                     "choices": [
@@ -135,9 +225,20 @@ def _handler_for(state: StubState) -> type[BaseHTTPRequestHandler]:
                     ],
                     "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
                 }
-                _send_json(self, payload)
+                self._send(status, payload, response)
                 return
             self.send_error(404)
+
+        def _send(self, status: int, payload: dict[str, Any], plan: dict[str, Any]) -> None:
+            encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            retry_after = plan.get("retry_after")
+            if status == 429 and isinstance(retry_after, str):
+                self.send_header("Retry-After", retry_after)
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
 
     return Handler
 

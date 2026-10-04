@@ -5,6 +5,72 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+AUTOMATIC_RECOVERY_FAILURES = frozenset(
+    {
+        "WORKER_EXECUTION_INTERRUPTED",
+        "ASR_TIMEOUT",
+        "ASR_TRANSPORT_ERROR",
+        "ASR_UPSTREAM_TIMEOUT",
+        "ASR_UPSTREAM_ERROR",
+        "ASR_MODEL_OVERLOADED",
+        "ASR_RATE_LIMITED",
+        "LLM_TOTAL_TIMEOUT",
+        "LLM_PHASE_TIMEOUT",
+        "LLM_UPSTREAM_TIMEOUT",
+        "LLM_NETWORK_ERROR",
+        "LLM_UPSTREAM_ERROR",
+        "LLM_MODEL_OVERLOADED",
+        "LLM_RATE_LIMITED",
+    }
+)
+
+MANUAL_RECOVERY_BLOCKED_FAILURES = frozenset(
+    {
+        "ASR_AUTHENTICATION_FAILED",
+        "ASR_ACCESS_FORBIDDEN",
+        "ASR_MODEL_UNAVAILABLE",
+        "ASR_REQUEST_REJECTED",
+        "ASR_SECRET_UNAVAILABLE",
+        "ASR_CONFIGURATION_INVALID",
+        "LLM_AUTHENTICATION_FAILED",
+        "LLM_ACCESS_FORBIDDEN",
+        "LLM_MODEL_UNAVAILABLE",
+        "LLM_MODEL_INCOMPATIBLE",
+        "LLM_MODEL_MISMATCH",
+        "LLM_REQUEST_REJECTED",
+        "LLM_SECRET_UNAVAILABLE",
+        "LLM_CONFIGURATION_INVALID",
+        "MODEL_COOLDOWN_IDENTITY_INVALID",
+        "MODEL_COOLDOWN_PERSIST_FAILED",
+        "VIDEO_SOURCE_UNAVAILABLE",
+        "VIDEO_SOURCE_CHANGED",
+        "VIDEO_UNAVAILABLE",
+        "EXTRACTED_AUDIO_INVALID",
+        "AUDIO_DURATION_MISMATCH",
+        "TRANSCRIPT_SOURCE_MISMATCH",
+        "TRANSCRIPT_MANIFEST_INCOMPLETE",
+        "SOURCE_CONFIGURATION_INCOMPATIBLE",
+        "CONFIG_SNAPSHOT_INVALID",
+        "CONFIG_VERSION_UNSUPPORTED",
+        "SUMMARY_CONFIGURATION_INCOMPATIBLE",
+        "SUMMARY_CONFIGURATION_UNSUPPORTED",
+        "SUMMARY_OUTPUT_INVALID",
+        "SUMMARY_REPAIR_EXHAUSTED",
+    }
+)
+
+
+def is_automatically_recoverable_failure(error_code: str | None) -> bool:
+    return error_code in AUTOMATIC_RECOVERY_FAILURES
+
+
+def is_manual_recovery_blocked(error_code: str | None) -> bool:
+    return error_code in MANUAL_RECOVERY_BLOCKED_FAILURES
+
+
+def automatic_recovery_budget_available(count: int | None, limit: int | None) -> bool:
+    return count is not None and limit is not None and 0 <= count < limit
+
 
 @dataclass(frozen=True)
 class RecoveryEligibility:

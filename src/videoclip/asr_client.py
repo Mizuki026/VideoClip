@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -11,9 +12,13 @@ import httpx
 
 
 class AsrCallError(RuntimeError):
-    def __init__(self, code: str) -> None:
+    def __init__(
+        self, code: str, *, retry_after: str | None = None, response_received_at: str | None = None
+    ) -> None:
         super().__init__(code)
         self.code = code
+        self.retry_after = retry_after
+        self.response_received_at = response_received_at
 
 
 def _read_response(response: httpx.Response, maximum: int, deadline: float) -> bytes:
@@ -31,6 +36,11 @@ def _read_response(response: httpx.Response, maximum: int, deadline: float) -> b
 
 
 def _status_code(status: int) -> str:
+    if status >= 500:
+        return {
+            503: "ASR_MODEL_OVERLOADED",
+            504: "ASR_UPSTREAM_TIMEOUT",
+        }.get(status, "ASR_UPSTREAM_ERROR")
     return {
         400: "ASR_REQUEST_REJECTED",
         401: "ASR_AUTHENTICATION_FAILED",
@@ -38,9 +48,19 @@ def _status_code(status: int) -> str:
         404: "ASR_MODEL_UNAVAILABLE",
         408: "ASR_UPSTREAM_TIMEOUT",
         429: "ASR_RATE_LIMITED",
-        503: "ASR_MODEL_OVERLOADED",
-        504: "ASR_UPSTREAM_TIMEOUT",
-    }.get(status, f"ASR_HTTP_{status}")
+    }.get(status, "ASR_REQUEST_REJECTED")
+
+
+def _retry_after_header(response: httpx.Response) -> str | None:
+    value = response.headers.get("retry-after")
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 128
+        or any(ord(character) < 32 or ord(character) > 126 for character in value)
+    ):
+        return None
+    return value.strip()
 
 
 def transcribe(
@@ -81,7 +101,14 @@ def transcribe(
                     files={"file": (audio_path.name, audio_file, "audio/wav")},
                 ) as response:
                     if response.status_code >= 400:
-                        raise AsrCallError(_status_code(response.status_code))
+                        code = _status_code(response.status_code)
+                        if response.status_code == 429:
+                            raise AsrCallError(
+                                code,
+                                retry_after=_retry_after_header(response),
+                                response_received_at=datetime.now(UTC).isoformat(),
+                            )
+                        raise AsrCallError(code)
                     body = _read_response(response, maximum_response_bytes, deadline)
                     try:
                         document = json.loads(body)
@@ -149,7 +176,13 @@ def main() -> int:
         return 0
     except AsrCallError as exc:
         try:
-            _write_result(arguments.output, {"error_code": exc.code}, arguments.maximum_response_bytes)
+            error_payload: dict[str, Any] = {"error_code": exc.code}
+            if exc.code == "ASR_RATE_LIMITED":
+                if exc.retry_after is not None:
+                    error_payload["retry_after"] = exc.retry_after
+                if exc.response_received_at is not None:
+                    error_payload["response_received_at"] = exc.response_received_at
+            _write_result(arguments.output, error_payload, arguments.maximum_response_bytes)
         except OSError:
             pass
         return 0

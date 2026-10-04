@@ -77,8 +77,16 @@ export async function requestResult<T>(
 }
 
 export function getCsrfToken(): Promise<{ csrf_token: string }> {
-  return request('/auth/csrf');
+  if (csrfTokenRequest) return csrfTokenRequest;
+  const pending = request<{ csrf_token: string }>('/auth/csrf');
+  csrfTokenRequest = pending;
+  void pending.finally(() => {
+    if (csrfTokenRequest === pending) csrfTokenRequest = null;
+  }).catch(() => undefined);
+  return pending;
 }
+
+let csrfTokenRequest: Promise<{ csrf_token: string }> | null = null;
 
 export function getCurrentUser(): Promise<User> {
   return request('/auth/me');

@@ -14,9 +14,7 @@ from videoclip.settings import Settings, get_settings
 
 ROOT = Path(__file__).resolve().parents[1]
 TEST_DB_NAME = os.environ.get("VIDEOCLIP_TEST_DB_NAME", "videoclip_mvp_stage1_test")
-TEST_DATA = Path(
-    os.environ.get("VIDEOCLIP_TEST_DATA_DIR", str(ROOT / "data" / "mvp-stage-1" / "test-data"))
-)
+TEST_DATA = Path(os.environ.get("VIDEOCLIP_TEST_DATA_DIR", str(ROOT / "data" / "mvp-stage-1" / "test-data")))
 os.environ["APP_ENV"] = "test"
 os.environ["ANALYSIS_TEST_INLINE_SUPERVISOR"] = "1"
 os.environ["DB_NAME"] = TEST_DB_NAME
@@ -55,7 +53,8 @@ def empty_database(session_factory: sessionmaker[Session]) -> None:
     with session_factory.begin() as session:
         session.execute(
             text(
-                "TRUNCATE TABLE summary_requests, analysis_summaries, analysis_executions, "
+                "TRUNCATE TABLE summary_requests, analysis_summaries, shared_model_cooldowns, "
+                "analysis_executions, "
                 "transcript_segments, task_deliveries, "
                 "analysis_attempts, analysis_tasks, cleanup_intents, videos, upload_chunks, upload_handoffs, "
                 "sessions, users "

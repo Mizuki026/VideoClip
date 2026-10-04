@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -44,6 +45,9 @@ class Settings(BaseSettings):
     ffprobe_path: str = Field(default="ffprobe", alias="FFPROBE_PATH")
     ffmpeg_path: str = Field(default="ffmpeg", alias="FFMPEG_PATH")
     asr_base_url: str = Field(default="https://api.siliconflow.cn/v1", alias="SILICONFLOW_BASE_URL")
+    siliconflow_account_reference: str = Field(
+        default="primary", alias="SILICONFLOW_ACCOUNT_REFERENCE", min_length=1, max_length=64
+    )
     asr_model: str = Field(default="FunAudioLLM/SenseVoiceSmall", alias="SILICONFLOW_ASR_MODEL")
     asr_secret_reference: str = Field(default="environment:SILICONFLOW_API_KEY", alias="ASR_SECRET_REFERENCE")
     asr_request_parameters: dict[str, str] = Field(default_factory=dict, alias="ASR_REQUEST_PARAMETERS")
@@ -92,15 +96,11 @@ class Settings(BaseSettings):
     max_asr_response_bytes: int = Field(default=1_048_576, ge=1, le=4_194_304, alias="MAX_RESPONSE_BYTES")
     max_media_diagnostic_bytes: int = Field(default=8192, ge=512, le=65_536, alias="MAX_DIAGNOSTIC_BYTES")
     celery_broker_url: str = Field(default="redis://127.0.0.1:6379/0", alias="CELERY_BROKER_URL")
-    analysis_delivery_retry_limit: int = Field(
-        default=8, ge=1, le=32, alias="ANALYSIS_DELIVERY_RETRY_LIMIT"
-    )
+    analysis_delivery_retry_limit: int = Field(default=8, ge=1, le=32, alias="ANALYSIS_DELIVERY_RETRY_LIMIT")
     analysis_delivery_deadline_seconds: int = Field(
         default=86_400, ge=60, le=604_800, alias="ANALYSIS_DELIVERY_DEADLINE_SECONDS"
     )
-    analysis_delivery_scan_limit: int = Field(
-        default=4, ge=1, le=8, alias="ANALYSIS_DELIVERY_SCAN_LIMIT"
-    )
+    analysis_delivery_scan_limit: int = Field(default=4, ge=1, le=8, alias="ANALYSIS_DELIVERY_SCAN_LIMIT")
     analysis_delivery_interval_seconds: int = Field(
         default=60, ge=60, le=3600, alias="ANALYSIS_DELIVERY_INTERVAL_SECONDS"
     )
@@ -113,6 +113,18 @@ class Settings(BaseSettings):
     analysis_delivery_backoff_max_seconds: int = Field(
         default=900, ge=60, le=86_400, alias="ANALYSIS_DELIVERY_BACKOFF_MAX_SECONDS"
     )
+    model_cooldown_backoff_base_seconds: int = Field(
+        default=60, ge=1, le=3600, alias="MODEL_COOLDOWN_BACKOFF_BASE_SECONDS"
+    )
+    model_cooldown_backoff_max_seconds: int = Field(
+        default=900, ge=60, le=86_400, alias="MODEL_COOLDOWN_BACKOFF_MAX_SECONDS"
+    )
+    model_wait_single_limit_seconds: int = Field(
+        default=86_400, ge=60, le=604_800, alias="MODEL_WAIT_SINGLE_LIMIT_SECONDS"
+    )
+    model_wait_total_limit_seconds: int = Field(
+        default=259_200, ge=60, le=604_800, alias="MODEL_WAIT_TOTAL_LIMIT_SECONDS"
+    )
     worker_id: str = Field(default="videoclip-worker", alias="WORKER_ID")
     db_host: str = Field(default="127.0.0.1", alias="DB_HOST")
     db_port: int = Field(default=55442, ge=1, le=65535, alias="DB_PORT")
@@ -124,6 +136,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_security_settings(self) -> Settings:
+        if not re.fullmatch(
+            r"[A-Za-z0-9._-]{1,64}", self.siliconflow_account_reference
+        ) or self.siliconflow_account_reference.lower().startswith(("sk-", "sf-")):
+            raise ValueError("SILICONFLOW_ACCOUNT_REFERENCE must be a non-secret account label")
+        if self.model_cooldown_backoff_max_seconds < self.model_cooldown_backoff_base_seconds:
+            raise ValueError("MODEL_COOLDOWN_BACKOFF_MAX_SECONDS must be at least the base")
         if len(self.app_secret_key.get_secret_value().encode("utf-8")) < 32:
             raise ValueError("APP_SECRET_KEY must contain at least 32 bytes")
         origin = urlsplit(self.app_origin)
@@ -144,9 +162,7 @@ class Settings(BaseSettings):
         if self.audio_sample_format != "s16le":
             raise ValueError("AUDIO_SAMPLE_FORMAT must be s16le")
         if self.analysis_delivery_backoff_max_seconds < self.analysis_delivery_backoff_base_seconds:
-            raise ValueError(
-                "ANALYSIS_DELIVERY_BACKOFF_MAX_SECONDS must be at least the configured base"
-            )
+            raise ValueError("ANALYSIS_DELIVERY_BACKOFF_MAX_SECONDS must be at least the configured base")
         return self
 
     @property

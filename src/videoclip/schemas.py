@@ -136,6 +136,19 @@ class AnalysisTaskResponse(BaseModel):
     delivery_deadline_at: datetime | None
     delivery_wait_reason: str | None
     delivery_failure_code: str | None
+    model_wait_reason: str | None
+    model_wait_error_code: str | None
+    model_wait_stage: str | None
+    model_wait_until: datetime | None
+    model_wait_single_deadline_at: datetime | None
+    model_wait_seconds_used: int | None
+    model_wait_total_limit_seconds: int | None
+    auto_recovery_count: int | None
+    auto_recovery_limit: int | None
+    auto_recovery_budget_exhausted: bool | None
+    summary_requests_used: int
+    summary_requests_limit: int
+    summary_requests_exhausted: bool
     completed_segments: int
     expected_segments: int
     transcript_complete: bool

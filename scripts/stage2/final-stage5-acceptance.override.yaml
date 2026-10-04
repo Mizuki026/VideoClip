@@ -1,0 +1,63 @@
+services:
+  api:
+    environment:
+      SILICONFLOW_BASE_URL: ${SILICONFLOW_BASE_URL}
+      SSL_CERT_FILE: /appdata/stage5-stub/acceptance-ca.crt
+    depends_on:
+      model-stub:
+        condition: service_healthy
+
+  worker:
+    environment:
+      SILICONFLOW_BASE_URL: ${SILICONFLOW_BASE_URL}
+      SSL_CERT_FILE: /appdata/stage5-stub/acceptance-ca.crt
+    depends_on:
+      model-stub:
+        condition: service_healthy
+
+  model-stub:
+    image: ${MVP_IMAGE_NAME:-videoclip-mvp-stage5-api:acceptance}
+    pull_policy: never
+    env_file:
+      - path: ${MVP_STAGE1_ENV_FILE:?set the isolated Stage 5 acceptance environment file}
+        required: true
+    command:
+      [
+        "python",
+        "-m",
+        "videoclip.queue_coordination_stub",
+        "--host=0.0.0.0",
+        "--port=443",
+        "--certificate=/appdata/stage5-stub/server-chain.pem",
+        "--private-key=/appdata/stage5-stub/server.key",
+        "--event-log=/appdata/stage5-stub/traffic.jsonl",
+      ]
+    volumes:
+      - type: bind
+        source: ${MVP_STAGE1_DATA_DIR:?set the isolated Stage 5 acceptance data directory}/app
+        target: /appdata
+    mem_limit: 192m
+    pids_limit: 32
+    restart: "no"
+    stop_grace_period: 10s
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import ssl,urllib.request; urllib.request.urlopen('https://127.0.0.1:443/health', context=ssl._create_unverified_context(), timeout=2)",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 2s
+    logging:
+      driver: json-file
+      options:
+        max-size: 2m
+        max-file: "2"
+    networks:
+      default:
+        aliases:
+          - api.siliconflow.cn
