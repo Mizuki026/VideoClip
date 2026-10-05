@@ -31,6 +31,51 @@ function Get-FreeTcpPort {
     finally { $listener.Stop() }
 }
 
+function Convert-IPv4ToUInt32([string]$Address) {
+    $bytes = [System.Net.IPAddress]::Parse($Address).GetAddressBytes()
+    if ($bytes.Length -ne 4) { throw "Expected IPv4 address, got $Address" }
+    return [uint64]$bytes[0] * 16777216 + [uint64]$bytes[1] * 65536 + [uint64]$bytes[2] * 256 + [uint64]$bytes[3]
+}
+
+function Get-IPv4SubnetRange([string]$Subnet) {
+    $parts = $Subnet.Split('/')
+    if ($parts.Length -ne 2) { throw "Invalid Docker network subnet: $Subnet" }
+    $prefix = [int]$parts[1]
+    if ($prefix -lt 0 -or $prefix -gt 32) { throw "Invalid Docker network prefix: $Subnet" }
+    $address = Convert-IPv4ToUInt32 $parts[0]
+    $mask = if ($prefix -eq 0) { [uint64]0 } else { ([uint64]4294967295 -shl (32 - $prefix)) -band [uint64]4294967295 }
+    $network = $address -band $mask
+    return @($network, ($network + ([uint64]4294967295 - $mask)))
+}
+
+function Get-AvailableStage5Subnet {
+    $usedSubnets = @()
+    $networkIds = @(& docker network ls -q)
+    if ($LASTEXITCODE -ne 0) { throw 'Could not inspect Docker networks before Stage 5 acceptance.' }
+    foreach ($networkId in $networkIds) {
+        $configured = @(& docker network inspect $networkId --format '{{range .IPAM.Config}}{{println .Subnet}}{{end}}')
+        if ($LASTEXITCODE -ne 0) { throw 'Could not inspect Docker IPAM ranges before Stage 5 acceptance.' }
+        $usedSubnets += $configured | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+/\d+$' }
+    }
+
+    $start = Get-Random -Minimum 0 -Maximum 256
+    for ($offset = 0; $offset -lt 256; $offset++) {
+        $octet = ($start + $offset) % 256
+        $candidate = "10.253.$octet.0/24"
+        $candidateRange = Get-IPv4SubnetRange $candidate
+        $overlaps = $false
+        foreach ($used in $usedSubnets) {
+            $usedRange = Get-IPv4SubnetRange $used
+            if ($candidateRange[0] -le $usedRange[1] -and $usedRange[0] -le $candidateRange[1]) {
+                $overlaps = $true
+                break
+            }
+        }
+        if (-not $overlaps) { return $candidate }
+    }
+    throw 'No unused 10.253.x.0/24 Docker subnet is available for Stage 5 acceptance.'
+}
+
 if (-not (Test-Path -LiteralPath $python)) { throw 'Stage 5 acceptance needs data/mvp-stage-2/.venv.' }
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw 'Docker is required for isolated Stage 5 acceptance.' }
 if (-not (Test-Path -LiteralPath (Join-Path $repoRoot 'frontend\node_modules'))) { throw 'Run npm ci in frontend before browser acceptance.' }
@@ -50,6 +95,7 @@ New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 
 $databasePassword = New-RandomHex 32
 $appSecret = New-RandomHex 48
+$networkSubnet = Get-AvailableStage5Subnet
 $passwordFile = Join-Path $secretRoot 'postgres_password'
 [System.IO.File]::WriteAllText($passwordFile, $databasePassword, [System.Text.UTF8Encoding]::new($false))
 $stageData = $runRoot.Replace('\', '/')
@@ -78,6 +124,7 @@ $settings = @(
     "MVP_STAGE1_PG_PORT=$pgPort",
     "MVP_STAGE1_API_PORT=$apiPort",
     "MVP_STAGE1_WEB_PORT=$webPort",
+    "MVP_STAGE5_NETWORK_SUBNET=$networkSubnet",
     'MVP_IMAGE_NAME=videoclip-mvp-stage5-api:acceptance',
     'CELERY_BROKER_URL=redis://redis:6379/0',
     'UPLOAD_RECLAIM_BATCH_SIZE=4',

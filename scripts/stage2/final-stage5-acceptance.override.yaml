@@ -61,3 +61,9 @@ services:
       default:
         aliases:
           - api.siliconflow.cn
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${MVP_STAGE5_NETWORK_SUBNET:?set a verified unused Stage 5 subnet}
