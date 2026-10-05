@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { stat } from 'node:fs/promises';
+import { stat, unlink, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { expect, test, type Route } from '@playwright/test';
 import { shouldCleanupAcceptanceData } from './acceptance-data';
@@ -97,7 +97,7 @@ function readTaskExecutionAudit(taskId: string) {
     (SELECT count(DISTINCT source_fingerprint)::text FROM analysis_attempts WHERE task_id = '${taskId}'::uuid),
     (SELECT coalesce(sum(s.request_count), 0)::text FROM transcript_segments s JOIN analysis_attempts a ON a.id = s.attempt_id WHERE a.task_id = '${taskId}'::uuid),
     (SELECT count(*)::text FROM analysis_summaries WHERE task_id = '${taskId}'::uuid),
-    (SELECT concat_ws(',', coalesce(auto_recovery_count, 0)::text, coalesce(auto_recovery_limit, 0)::text, coalesce(delivery_retry_count, 0)::text, coalesce(delivery_retry_limit, 0)::text, coalesce(summary_requests_used, 0)::text, coalesce(summary_requests_limit, 0)::text) FROM analysis_tasks WHERE id = '${taskId}'::uuid))`;
+    (SELECT concat_ws(',', coalesce(auto_recovery_count, 0)::text, coalesce(auto_recovery_limit, 0)::text, coalesce(delivery_retry_count, 0)::text, coalesce(delivery_retry_limit, 0)::text, (SELECT count(*)::text FROM summary_requests WHERE task_id = '${taskId}'::uuid), '3') FROM analysis_tasks WHERE id = '${taskId}'::uuid))`;
   const output = stage2Command(
     'exec', '-T', 'postgres', 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-qAt',
     '-U', 'videoclip_stage2', '-d', 'videoclip_mvp_stage2', '-c', sql,
@@ -137,7 +137,7 @@ function readResumableVideoAudit(videoId: string, sourceDigest: string) {
     videoBytes: Number(videoBytes),
     durationSeconds: Number(duration),
     videosForUpload: Number(videoCount),
-    browserDigestMatchesServer: browserDigestMatchesServer === 't',
+    browserDigestMatchesServer: browserDigestMatchesServer === 'true',
   };
 }
 
@@ -219,7 +219,7 @@ async function cleanupGeneratedAccount(page: import('@playwright/test').Page, us
 test.afterEach(async ({ page, baseURL }, testInfo) => {
   if (!baseURL) return;
   if (!shouldCleanupAcceptanceData(testInfo.status)) {
-    console.error('stage6_browser_failure_data_retained=1');
+    console.error('stage7_browser_failure_data_retained=1');
     return;
   }
   for (const [username, password] of generatedAccounts) {
@@ -227,6 +227,7 @@ test.afterEach(async ({ page, baseURL }, testInfo) => {
     await cleanupGeneratedAccount(page, username, password);
   }
   generatedAccounts.clear();
+  await unlink(testInfo.outputPath('recovery-credentials.json')).catch(() => undefined);
 });
 
 function responsePath(path: string): string {
@@ -243,8 +244,18 @@ function citationSeconds(label: string): number | null {
   return match ? clockSeconds(match) : null;
 }
 
-async function createAccount(page: import('@playwright/test').Page, username: string, password: string) {
+async function createAccount(
+  page: import('@playwright/test').Page,
+  username: string,
+  password: string,
+  recoveryPath: string,
+) {
   generatedAccounts.set(username, password);
+  await writeFile(
+    recoveryPath,
+    JSON.stringify([...generatedAccounts].map(([account, secret]) => ({ username: account, password: secret }))),
+    'utf8',
+  );
   await page.goto('/');
   await expect(page.getByRole('heading', { name: '欢迎回来' })).toBeVisible();
   await page.getByRole('button', { name: '创建账户', exact: true }).click();
@@ -276,6 +287,7 @@ test('same-origin registration, resumable long upload, real processing, playback
   const primaryUser = `stage5fixture-${entropy}`;
   const secondaryUser = `stage5fixture-${randomBytes(6).toString('hex')}`;
   const password = `VideoClip-${randomBytes(16).toString('hex')}!`;
+  const recoveryPath = testInfo.outputPath('recovery-credentials.json');
   const requests: Array<{ path: string; method: string; status: number; contentType: string; origin: string | null; csrfPresent: boolean; cookiePresent: boolean }> = [];
   const sessionCookieWasHttpOnly: boolean[] = [];
 
@@ -308,7 +320,7 @@ test('same-origin registration, resumable long upload, real processing, playback
   await page.goto('/');
   await expect(page.getByRole('heading', { name: '欢迎回来' })).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath('anonymous-login.png') });
-  await createAccount(page, primaryUser, password);
+  await createAccount(page, primaryUser, password, recoveryPath);
   await expect(page.getByText(primaryUser)).toBeVisible();
   const csrfRejection = await page.evaluate(async () => {
     const rejected = await fetch('/api/auth/logout', { method: 'POST', headers: { 'X-CSRF-Token': 'invalid-fixture-token' } });
@@ -490,6 +502,8 @@ test('same-origin registration, resumable long upload, real processing, playback
   expect(executionAudit.budgets.automaticRecoveries).toBeLessThanOrEqual(executionAudit.budgets.automaticRecoveryLimit);
   expect(executionAudit.budgets.deliveryRetries).toBeLessThanOrEqual(executionAudit.budgets.deliveryRetryLimit);
   expect(executionAudit.budgets.summaryRequests).toBeLessThanOrEqual(executionAudit.budgets.summaryRequestLimit);
+  expect(finalTask.summary_requests_used).toBe(executionAudit.budgets.summaryRequests);
+  expect(finalTask.summary_requests_limit).toBe(executionAudit.budgets.summaryRequestLimit);
   if (recoveredSummaryAttempts > 0) {
     expect(finalTask.asr_request_count).toBe(0);
     expect(finalTask.reused_segments).toBe(finalTask.expected_segments);
@@ -648,7 +662,7 @@ test('same-origin registration, resumable long upload, real processing, playback
   }, videoId);
   expect(anonymousStatus).toEqual({ me: 401, content: 401 });
 
-  await createAccount(page, secondaryUser, password);
+  await createAccount(page, secondaryUser, password, recoveryPath);
   const isolation = await page.evaluate(async ({ id, taskId }) => {
     const requests = await Promise.all([
       fetch(`/api/videos/${id}`, { cache: 'no-store' }),
@@ -724,7 +738,7 @@ test('same-origin registration, resumable long upload, real processing, playback
   await expect(page.locator('video')).toHaveCount(0);
 
   const deleteResponsePromise = page.waitForResponse((response) => response.url().endsWith(`/api/videos/${videoId}`) && response.request().method() === 'DELETE');
-  await page.getByRole('button', { name: '删除记录' }).click();
+  await page.getByRole('button', { name: '删除整条记录' }).click();
   const deleteResponse = await deleteResponsePromise;
   expect([202, 204]).toContain(deleteResponse.status());
   if (deleteResponse.status() === 202) {
