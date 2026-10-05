@@ -11,7 +11,7 @@
 - Stage 2 私密配置在 `data/mvp-stage-2/.env`，PostgreSQL 密码在同目录的 `secrets/` 下；两者不应提交到 Git。若 Stage 2 配置尚不存在，需先按第 0 窗口流程准备本地 `data/mvp-stage-0/.env`，确认账户模型可用后运行 `scripts/stage2/prepare-stage2.ps1`。若配置已经存在，保留它，不要重新生成数据库凭据。
 - 选择你有权使用的课程视频。媒体时长必须大于 0 且不超过 20 分钟；当前不限制上传字节数，也不承诺业务数据目录总量上限。浏览器默认使用分片续传：中断后刷新页面并重新选择原文件，页面会重新计算摘要并从服务端确认偏移续传；普通上传接口仍保留供旧调用方使用。
 
-真实模型调用使用本机私密配置中的 SiliconFlow 凭据和模型。零价格以用户账户配置为依据；运行前请自行核对账户模型可用性，项目不会读取账单或账户余额。
+真实模型调用使用本机私密配置中的 SiliconFlow 凭据和模型。2026-10-05 官方价格中心将 SenseVoiceSmall 标为免费，Qwen3.5-4B 的官方上线公告称免费；本机账户配置和调用前账单截图也显示免费/¥0.00。本次真实调用后账户账单与剩余额度尚未取得证据；任何后续真实调用前仍需核对账户页面。项目不会读取账单或账户余额。
 
 Stage 1 与 Stage 2 使用独立数据库、端口和 E 盘数据目录。演示使用 Stage 2；仓库脚本只操作对应命名的 Compose 项目。
 
@@ -42,6 +42,8 @@ npm run dev
 3. 在视频详情页查看转写和已发布总结。点击至少两处不同引用，确认播放器跳到相应片段并继续播放。
 4. 若要保留笔记，在详情页选择“删除原视频，保留笔记”并确认。处理中会显示等待停止确认或清理状态；媒体不可用后播放器与回看入口关闭，但转写、总结引文与时间信息继续保留。清理失败只能重试清理。
 5. 若要删除全部内容，选择“删除整条记录”并确认；删除完成后，该记录的视频、转写和总结接口均不可访问。
+
+第 7 窗口交付后的启动/迁移/停止、正常流程和隔离故障演示步骤见[本地演示指南](.scratch/final-stage-7/demo-guide.md)。本窗口创建的账户和视频已经清理；Stage 2 保留其既有 6 个本地账户、8 条视频/笔记。真实样片、账户凭据、原文和模型响应只保存在 Git 忽略的 `data/mvp-stage-2/acceptance/`，不作为公开演示材料。
 
 总结会在 ASR 片段全部持久化后生成。新 execution 在领取提交后、开始任何分析副作用前，必须完成监督登记。受支持的停止边界为 Linux Worker 容器中的 execution session 及其子进程组，包括当前使用的 FFmpeg、ASR 和 LLM 子进程；监督器先回收并观察整个 session 退出，再按绑定身份提交证据。心跳超时、父进程退出、数据库锁释放、PID 不存在或服务重启本身都不能确认停止。监督器、容器或宿主机强停、边界身份不匹配时执行位继续保留，状态显示“停止尚未确认” / `STOP_CONFIRMATION_REQUIRED`，恢复和工作目录清理均被阻断。只有 Worker 容器已退出且 execution 的代次和容器 ID 精确匹配时，人工入口才登记停止确认。
 
@@ -142,7 +144,9 @@ docker compose --env-file data/mvp-stage-2/.env -p videoclip-mvp-stage2 -f compo
 - 总结校验失败、输出截断或请求超时不会发布半成品。输出结构或引用校验可按冻结规则做有限修复；真实截断、网络超时等终态失败需停止确认后手动恢复。每个 task 的总结请求总数最多 3 次。
 - 当前已实测的授权样本采用 H.264/AAC 且时间轴零起点；带延迟音轨或不能可靠映射的媒体会被拒绝。浏览器分片续传与 24 小时临时会话回收已按第 2 窗口验收；不提供通用转码、分析自动接管、画面理解、移动端或线上部署。
 - 停止证明覆盖 Linux Worker 容器中绑定的 execution session 与当前受支持子进程组，不覆盖主动逃逸到新 session 的恶意本机进程。监督器、容器或宿主机突然终止时需人工核对精确容器退出；本地证据不撤销已送达供应商的请求。旧 execution 身份字段为 NULL 时保持阻断，不伪造回填或追溯确认。
-- 20 分钟是媒体时长上限；完整 20 分钟视频尚未作为真实模型样本实测。上传字节数和业务数据目录总量均没有运行期硬上限。
-- 本地配置中的零费率不是账单回执；实际费用和剩余额度需在服务商账户中核对。
+- 20 分钟媒体边界 fixture 已验证：1200.0 秒接受，1200.01 秒拒绝；完整 20 分钟课程真实模型处理尚未运行。上传字节数和业务数据目录总量均没有运行期硬上限。
+- Stage 7 本次真实浏览器新账户上传约 17 分 41 秒授权样片，36 段 ASR、1 次 LLM、合法引用、API/Worker 重启读回、媒体删除保留笔记和整条删除已按分段运行证据核验。完整 Stage 7 Playwright 单测没有一次全绿运行，账户调用后账单/额度也未取得，详见[验收矩阵](.scratch/final-stage-7/acceptance-matrix.md)及[验证记录](.scratch/final-stage-7/validation.md)。
+- 37 个资源点覆盖真实处理期间；媒体目录删除后恢复到基线，未发现分析/维护容器持有被删媒体 FD。Docker 日志精确文件长度及 WSL VHDX 物理差额仍未知；窗口实测 Docker 分类净变化为 MB 级。
+- 本地零费率配置、官方免费模型说明和调用前 ¥0.00 截图不等同于调用后账单回执；实际账户费用和剩余额度仍需在服务商账户中核对。
 
-MVP 的实际验收证据、历史故障和限制见[第六窗口验收记录](.scratch/mvp-stage-6/validation.md)。最终版第 1 至第 6 窗口的规格与验收记录见[第 1 窗口](.scratch/final-stage-1/validation.md)、[第 2 窗口](.scratch/final-stage-2/validation.md)、[第 3 窗口](.scratch/final-stage-3/validation.md)、[第 4 窗口](.scratch/final-stage-4/validation.md)、[第 5 窗口](.scratch/final-stage-5/validation.md)和[第 6 窗口](.scratch/final-stage-6/validation.md)。第 7 窗口整体验收与展示材料仍待开展；20 分钟真实模型处理、账户计费证据、容器可写层峰值及 E 盘差额归因仍未验证。
+MVP 的实际验收证据、历史故障和限制见[第六窗口验收记录](.scratch/mvp-stage-6/validation.md)。最终版第 1 至第 6 窗口的规格与验收记录见[第 1 窗口](.scratch/final-stage-1/validation.md)、[第 2 窗口](.scratch/final-stage-2/validation.md)、[第 3 窗口](.scratch/final-stage-3/validation.md)、[第 4 窗口](.scratch/final-stage-4/validation.md)、[第 5 窗口](.scratch/final-stage-5/validation.md)和[第 6 窗口](.scratch/final-stage-6/validation.md)。第 7 窗口部分完成，逐项结论、命令和证据见[验收矩阵](.scratch/final-stage-7/acceptance-matrix.md)、[命令与证据索引](.scratch/final-stage-7/commands-and-evidence.md)、[验证记录](.scratch/final-stage-7/validation.md)及[公开脱敏展示材料](.scratch/final-stage-7/public-showcase.md)。
