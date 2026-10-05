@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from videoclip.db import create_database_engine, create_session_factory
+from videoclip.events import record_analysis_event
 from videoclip.models import AnalysisAttempt, AnalysisExecution, AnalysisTask, SummaryRequest, Video
 from videoclip.services import db_transaction
 from videoclip.settings import get_settings
@@ -241,6 +242,16 @@ def confirm_stopped_execution(
             request.error_code = "WORKER_EXECUTION_INTERRUPTED"
             request.finished_at = now
         # cleanup_state is deliberately untouched: confirmed stop and file cleanup are separate facts.
+        record_analysis_event(
+            session,
+            task_id=task.id,
+            event_key=f"stop-confirmed:{execution.id}",
+            event_type="stop_confirmed",
+            attempt_id=attempt.id,
+            execution_id=execution.id,
+            stage=task.stage,
+            error_code=execution.stop_reason,
+        )
     return "confirmed"
 
 

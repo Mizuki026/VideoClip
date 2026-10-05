@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.requests import ClientDisconnect
 
+from videoclip.events import record_analysis_event
 from videoclip.media import MediaError, MediaInfo, probe_media
 from videoclip.models import (
     AnalysisAttempt,
@@ -609,6 +610,16 @@ def _resume_media_cleanup(
             if intent is not None:
                 intent.state = "completed"
                 intent.error_code = None
+            task = session.scalar(select(AnalysisTask).where(AnalysisTask.video_id == video_id))
+            if task is not None:
+                record_analysis_event(
+                    session,
+                    task_id=task.id,
+                    event_key=f"media-cleanup-completed:{uuid.uuid4()}",
+                    event_type="media_cleanup_completed",
+                    attempt_id=task.current_attempt_id,
+                    stage=task.stage,
+                )
         return True
     except OSError:
         _set_media_cleanup_failure(factory, video_id, upload_id, "STORAGE_OPERATION_FAILED")
@@ -646,6 +657,18 @@ def delete_video_media(
             return True
         else:
             raise HTTPException(status_code=503, detail="video media state needs maintenance")
+        task_id = video.current_analysis_task_id
+        if task_id is not None:
+            task = session.get(AnalysisTask, task_id)
+            record_analysis_event(
+                session,
+                task_id=task_id,
+                event_key=f"media-cleanup-requested:{uuid.uuid4()}",
+                event_type="media_cleanup_started",
+                attempt_id=task.current_attempt_id if task is not None else None,
+                stage=task.stage if task is not None else None,
+                actor="user",
+            )
     return _resume_media_cleanup(factory, store, video_id, owner_id=owner_id)
 
 
@@ -672,6 +695,17 @@ def retry_video_media_cleanup(
             )
         video.media_status = "deletion_pending"
         _new_media_cleanup_intent(session, video).state = "pending"
+        task = session.scalar(select(AnalysisTask).where(AnalysisTask.video_id == video.id))
+        if task is not None:
+            record_analysis_event(
+                session,
+                task_id=task.id,
+                event_key=f"media-cleanup-retry:{uuid.uuid4()}",
+                event_type="media_cleanup_started",
+                attempt_id=task.current_attempt_id,
+                stage=task.stage,
+                actor="user",
+            )
     return _resume_media_cleanup(factory, store, video_id, owner_id=owner_id)
 
 
@@ -736,6 +770,15 @@ def delete_video(
                 task.status = "failed"
                 task.stage = "failed"
                 task.failure_code = "VIDEO_DELETION_REQUESTED"
+                record_analysis_event(
+                    session,
+                    task_id=task.id,
+                    event_key=f"record-cleanup-requested:{uuid.uuid4()}",
+                    event_type="record_cleanup_started",
+                    attempt_id=task.current_attempt_id,
+                    stage="failed",
+                    actor="user",
+                )
                 task.queue_entered_at = None
                 task.delivery_next_check_at = None
                 task.delivery_blocked_since = None
@@ -905,25 +948,66 @@ def _remove_attempt_files(
             return True
         work_directory_name = attempt.work_directory_name
         task_id = task.id
+        record_analysis_event(
+            session,
+            task_id=task.id,
+            event_key=f"attempt-cleanup-started:{attempt.id}:{uuid.uuid4()}",
+            event_type="attempt_cleanup_started",
+            attempt_id=attempt.id,
+            stage=task.stage,
+        )
 
     try:
         store.remove_attempt_directory(task_id, work_directory_name)
     except OSError:
         with db_transaction(factory) as session:
+            attempt_task_id = session.scalar(
+                select(AnalysisAttempt.task_id).where(AnalysisAttempt.id == attempt_id)
+            )
+            if attempt_task_id is None:
+                return False
+            task = session.scalar(
+                select(AnalysisTask).where(AnalysisTask.id == attempt_task_id).with_for_update()
+            )
             attempt = session.scalar(
                 select(AnalysisAttempt).where(AnalysisAttempt.id == attempt_id).with_for_update()
             )
-            if attempt is not None:
+            if attempt is not None and task is not None:
                 attempt.cleanup_state = "failed"
                 attempt.cleanup_error_code = "ATTEMPT_TEMP_CLEANUP_FAILED"
+                record_analysis_event(
+                    session,
+                    task_id=task.id,
+                    event_key=f"attempt-cleanup-failed:{attempt.id}:{uuid.uuid4()}",
+                    event_type="attempt_cleanup_failed",
+                    attempt_id=attempt.id,
+                    stage="failed",
+                    error_code=attempt.cleanup_error_code,
+                )
         return False
     with db_transaction(factory) as session:
+        attempt_task_id = session.scalar(
+            select(AnalysisAttempt.task_id).where(AnalysisAttempt.id == attempt_id)
+        )
+        if attempt_task_id is None:
+            return False
+        task = session.scalar(
+            select(AnalysisTask).where(AnalysisTask.id == attempt_task_id).with_for_update()
+        )
         attempt = session.scalar(
             select(AnalysisAttempt).where(AnalysisAttempt.id == attempt_id).with_for_update()
         )
-        if attempt is not None:
+        if attempt is not None and task is not None:
             attempt.cleanup_state = "cleaned"
             attempt.cleanup_error_code = None
+            record_analysis_event(
+                session,
+                task_id=task.id,
+                event_key=f"attempt-cleanup-completed:{attempt.id}:{uuid.uuid4()}",
+                event_type="attempt_cleanup_completed",
+                attempt_id=attempt.id,
+                stage="succeeded",
+            )
     return True
 
 
@@ -975,6 +1059,17 @@ def _set_video_cleanup_failure(
         if video is not None:
             video.status = "cleanup_failed"
             video.deletion_error = code
+            task = session.scalar(select(AnalysisTask).where(AnalysisTask.video_id == video.id))
+            if task is not None:
+                record_analysis_event(
+                    session,
+                    task_id=task.id,
+                    event_key=f"record-cleanup-failed:{uuid.uuid4()}",
+                    event_type="record_cleanup_failed",
+                    attempt_id=task.current_attempt_id,
+                    stage="failed",
+                    error_code=code,
+                )
         if intent is not None:
             intent.state = "cleanup_failed"
             intent.error_code = code
@@ -994,6 +1089,17 @@ def _set_media_cleanup_failure(
         if video is not None and video.media_status != "deleted":
             video.media_status = "cleanup_failed"
             video.media_error_code = code
+            task = session.scalar(select(AnalysisTask).where(AnalysisTask.video_id == video.id))
+            if task is not None:
+                record_analysis_event(
+                    session,
+                    task_id=task.id,
+                    event_key=f"media-cleanup-failed:{uuid.uuid4()}",
+                    event_type="media_cleanup_failed",
+                    attempt_id=task.current_attempt_id,
+                    stage="failed",
+                    error_code=code,
+                )
         if intent is not None:
             intent.state = "cleanup_failed"
             intent.error_code = code

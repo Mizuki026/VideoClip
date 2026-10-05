@@ -4,6 +4,7 @@ import {
   getCsrfToken,
   getCurrentUser,
   getDeletionProgress,
+  getAnalysisEvents,
   getMediaDeletionProgress,
   getSummary,
   getTask,
@@ -35,6 +36,7 @@ import {
 } from './model';
 import type {
   AnalysisTask,
+  AnalysisEvent,
   DeletionProgress,
   MediaDeletionProgress,
   Summary,
@@ -62,6 +64,39 @@ function apiMessage(error: unknown): string {
   if (error.code) return errorMessage(error.code) ?? `服务端返回状态：${error.code}`;
   if (error.status >= 500) return '服务端暂时不可用，请稍后重试。';
   return `请求未完成（HTTP ${error.status}）。`;
+}
+
+function eventLabel(type: string): string {
+  const labels: Record<string, string> = {
+    analysis_submitted: '已提交分析',
+    delivery_reserved: '已登记投递',
+    delivery_sent: '任务已发送',
+    delivery_retry_scheduled: '投递等待重试',
+    execution_claimed: 'Worker 已领取任务',
+    execution_failed: '执行失败',
+    checkpoint_saved: '转写检查点已保存',
+    transcription_completed: '转写片段已齐全',
+    summary_requested: '已请求生成总结',
+    summary_response_received: '收到总结响应',
+    summary_failed: '总结请求失败',
+    summary_published: '合法总结已发布',
+    model_wait_entered: '进入共享冷却等待',
+    model_wait_resumed: '冷却等待已续接',
+    model_rate_limited: '模型请求触发限流',
+    automatic_recovery_created: '已创建自动恢复尝试',
+    manual_recovery_created: '已创建人工恢复尝试',
+    manual_continuation_created: '已创建人工总结尝试',
+    stop_confirmed: '执行停止已确认',
+    attempt_cleanup_started: '开始清理执行临时文件',
+    attempt_cleanup_completed: '执行临时文件已清理',
+    attempt_cleanup_failed: '执行临时文件清理失败',
+    media_cleanup_started: '原视频清理已请求',
+    media_cleanup_completed: '原视频与临时文件已清理',
+    media_cleanup_failed: '原视频清理失败',
+    record_cleanup_started: '整条记录清理已请求',
+    record_cleanup_failed: '整条记录清理失败',
+  };
+  return labels[type] ?? '执行事件';
 }
 
 function isSessionExpired(error: unknown): boolean {
@@ -750,6 +785,12 @@ function VideoDetailPage({ videoId, csrf, onExpired, username, onLogout }: { vid
   const [task, setTask] = useState<AnalysisTask | null>(null);
   const [transcript, setTranscript] = useState<Transcript | null>(null);
   const [summary, setSummary] = useState<Summary | null>(null);
+  const [events, setEvents] = useState<AnalysisEvent[]>([]);
+  const [eventsVideoId, setEventsVideoId] = useState<string | null>(null);
+  const eventsVideoIdRef = useRef<string | null>(null);
+  const [eventCursor, setEventCursor] = useState<number | null>(null);
+  const [eventsHaveMore, setEventsHaveMore] = useState(false);
+  const [eventsError, setEventsError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notFound, setNotFound] = useState(false);
@@ -789,6 +830,24 @@ function VideoDetailPage({ videoId, csrf, onExpired, username, onLogout }: { vid
         return;
       }
       setVideo(detail);
+      const latestEvents = await getAnalysisEvents(videoId).catch((failure: unknown) => {
+        if (isSessionExpired(failure)) onExpired();
+        else if (eventsVideoIdRef.current === videoId) setEventsError('执行时间线暂时无法读取。');
+        return null;
+      });
+      if (latestEvents && eventsVideoIdRef.current === videoId) {
+        setEventsVideoId(videoId);
+        setEvents((current) => {
+          const merged = new Map(
+            current.filter((item) => item.video_id === videoId).map((item) => [item.id, item]),
+          );
+          latestEvents.items.forEach((item) => merged.set(item.id, item));
+          return [...merged.values()].sort((left, right) => left.id - right.id);
+        });
+        setEventCursor(latestEvents.next_before_id);
+        setEventsHaveMore(latestEvents.has_more);
+        setEventsError(null);
+      }
       if (detail.media_status !== 'available') {
         void getMediaDeletionProgress(videoId).then(setMediaProgress).catch((failure: unknown) => {
           if (isSessionExpired(failure)) onExpired();
@@ -829,7 +888,15 @@ function VideoDetailPage({ videoId, csrf, onExpired, username, onLogout }: { vid
     }
   }, [completeDeletion, loadDeletion, onExpired, updateDeletion, videoId]);
 
-  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    eventsVideoIdRef.current = videoId;
+    setEventsVideoId(null);
+    setEvents([]);
+    setEventCursor(null);
+    setEventsHaveMore(false);
+    setEventsError(null);
+    void refresh();
+  }, [refresh, videoId]);
 
   useEffect(() => {
     if (deleting) return undefined;
@@ -953,6 +1020,24 @@ function VideoDetailPage({ videoId, csrf, onExpired, username, onLogout }: { vid
     } finally { setBusy(null); }
   }
 
+  async function loadOlderEvents() {
+    if (eventCursor === null || eventsVideoIdRef.current !== videoId) return;
+    try {
+      const page = await getAnalysisEvents(videoId, { beforeId: eventCursor });
+      setEventsVideoId(videoId);
+      setEvents((current) => {
+        const merged = new Map(current.map((item) => [item.id, item]));
+        page.items.forEach((item) => merged.set(item.id, item));
+        return [...merged.values()].sort((left, right) => left.id - right.id);
+      });
+      setEventCursor(page.next_before_id);
+      setEventsHaveMore(page.has_more);
+    } catch (failure) {
+      if (isSessionExpired(failure)) onExpired();
+      else setEventsError('更早的执行事件暂时无法读取。');
+    }
+  }
+
   if (loading) return <div className="app-shell"><Header username={username} onLogout={onLogout} /><main className="detail-main"><div className="loading-row"><span className="spinner" />正在读取后端状态…</div></main></div>;
   if (notFound) return <div className="app-shell"><Header username={username} onLogout={onLogout} /><main className="detail-main"><div className="empty-state"><div className="empty-icon">?</div><h2>找不到这段视频</h2><p>视频不存在，或当前账号没有读取权限。</p><a className="button button-outline" href="/">返回视频库</a></div></main></div>;
   if (deleting) {
@@ -1040,6 +1125,23 @@ function VideoDetailPage({ videoId, csrf, onExpired, username, onLogout }: { vid
                 ) : (
                   <section className="summary-placeholder"><span className="placeholder-icon">✳</span><h3>{task?.summary_status === 'failed' ? '总结生成失败' : task?.summary_status === 'waiting' ? '总结尚未发布' : '总结将在验证后显示'}</h3><p>只有后端验证并持久化的合法总结会出现在这里。</p></section>
                 )}
+                <section className="execution-timeline" aria-labelledby="timeline-title">
+                  <div className="timeline-heading"><div><span className="section-label">PERSISTED EVENTS</span><h2 id="timeline-title">执行时间线</h2></div><span className="timeline-count">{eventsVideoId === videoId ? events.length : 0} 条</span></div>
+                  <p className="timeline-note">显示迁移后实际写入的事件；历史状态不会补造为事件。</p>
+                  {eventsVideoId === videoId && eventsError && <p className="timeline-error" role="status">{eventsError}</p>}
+                  {eventsVideoId === videoId && events.length ? <ol className="timeline-list">
+                    {[...events].reverse().map((event) => (
+                      <li className="timeline-item" key={event.id}>
+                        <span className="timeline-dot" />
+                        <div className="timeline-event"><strong>{eventLabel(event.event_type)}</strong><time dateTime={event.occurred_at}>{formatDate(event.occurred_at)}</time>
+                          <small>{[event.stage, event.error_code, event.actor === 'user' ? '人工操作' : null].filter(Boolean).join(' · ')}</small>
+                          {event.request_reference && <small className="timeline-reference">关联：{event.request_reference}</small>}
+                        </div>
+                      </li>
+                    ))}
+                  </ol> : eventsVideoId !== videoId || (!eventsError && <p className="timeline-empty">当前记录尚无新执行事件。</p>)}
+                  {eventsVideoId === videoId && eventsHaveMore && <button className="text-button timeline-more" type="button" onClick={() => void loadOlderEvents()}>加载更早事件</button>}
+                </section>
               </aside>
             </div>
             </PlayerSeekContext.Provider>

@@ -25,6 +25,7 @@ from videoclip.analysis_wait import (
     require_manual_wait,
     wait_budget_error,
 )
+from videoclip.events import record_analysis_event
 from videoclip.execution_gate import find_unconfirmed_execution
 from videoclip.model_cooling import (
     ModelIdentity,
@@ -468,6 +469,27 @@ def create_followup_attempt(
             task.auto_recovery_count = (task.auto_recovery_count or 0) + 1
         session.add(TaskDelivery(attempt_id=child.id, status="pending", operation_generation=0))
         session.flush()
+        if mode_for_eligibility == "automatic_recovery":
+            event_type = "automatic_recovery_created"
+            actor = "system"
+        elif mode == "manual_recovery":
+            event_type = "manual_recovery_created"
+            actor = "user"
+        elif mode == "manual_summary":
+            event_type = "manual_continuation_created"
+            actor = "user"
+        else:
+            event_type = "model_wait_resumed"
+            actor = "system"
+        record_analysis_event(
+            session,
+            task_id=task.id,
+            event_key=f"followup-created:{child.id}",
+            event_type=event_type,
+            attempt_id=child.id,
+            stage=task.stage,
+            actor=actor,
+        )
         return FollowupResult(RecoverySubmission(task.id, child.id, True), True, "created")
 
 

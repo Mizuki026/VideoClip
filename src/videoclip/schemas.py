@@ -192,6 +192,28 @@ class AnalysisSummaryResponse(BaseModel):
     created_at: datetime
 
 
+class AnalysisEventResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    video_id: UUID
+    task_id: UUID
+    attempt_id: UUID | None
+    execution_id: UUID | None
+    request_reference: str | None
+    event_type: str
+    stage: str | None
+    error_code: str | None
+    actor: str
+    occurred_at: datetime
+
+
+class AnalysisEventsResponse(BaseModel):
+    items: list[AnalysisEventResponse]
+    has_more: bool
+    next_before_id: int | None
+
+
 class RecoveryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

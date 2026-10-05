@@ -537,3 +537,34 @@ class SharedModelCooldown(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class AnalysisEvent(Base):
+    __tablename__ = "analysis_events"
+    __table_args__ = (
+        UniqueConstraint("task_id", "event_key", name="uq_analysis_events_task_key"),
+        CheckConstraint("actor IN ('system', 'user')", name="ck_analysis_events_actor"),
+        Index("ix_analysis_events_owner_video_id", "owner_id", "video_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    video_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("videos.id", ondelete="CASCADE"), nullable=False
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("analysis_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    attempt_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    execution_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    request_reference: Mapped[str | None] = mapped_column(String(128))
+    event_key: Mapped[str] = mapped_column(String(180), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    stage: Mapped[str | None] = mapped_column(String(32))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    actor: Mapped[str] = mapped_column(String(16), nullable=False, default="system")
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("clock_timestamp()"), nullable=False
+    )

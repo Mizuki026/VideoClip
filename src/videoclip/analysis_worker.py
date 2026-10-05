@@ -33,6 +33,7 @@ from videoclip.analysis_supervisor import (
 )
 from videoclip.analysis_wait import enter_model_wait, require_manual_wait, wait_budget_error
 from videoclip.db import create_database_engine
+from videoclip.events import record_analysis_event
 from videoclip.execution_gate import (
     EXECUTION_ADVISORY_LOCK_KEY,
     find_next_queued_task,
@@ -403,6 +404,15 @@ def _claim_attempt(
         if attempt.execution_mode == "summary_only":
             task.summary_status = "running"
         session.flush()
+        record_analysis_event(
+            session,
+            task_id=task.id,
+            event_key=f"execution-claimed:{execution_id}",
+            event_type="execution_claimed",
+            attempt_id=attempt.id,
+            execution_id=execution_id,
+            stage=task.stage,
+        )
         return ClaimedAttempt(
             task_id=task.id,
             attempt_id=attempt.id,
@@ -916,6 +926,16 @@ def _persist_transcript(
         segment.status = "succeeded"
         segment.request_finished_at = datetime.now(UTC)
         segment.request_metadata = metadata
+        record_analysis_event(
+            session,
+            task_id=claim.task_id,
+            event_key=f"checkpoint-saved:{attempt.id}:{segment_number}",
+            event_type="checkpoint_saved",
+            attempt_id=attempt.id,
+            execution_id=claim.execution_id,
+            request_reference=f"transcript-segment:{attempt.id}:{segment_number}",
+            stage="transcribing",
+        )
 
 
 def _mark_awaiting_summary(
@@ -937,6 +957,15 @@ def _mark_awaiting_summary(
         task.summary_status = "waiting"
         task.failure_code = None
         attempt.status = "awaiting_summary"
+        record_analysis_event(
+            session,
+            task_id=task.id,
+            event_key=f"transcription-completed:{attempt.id}",
+            event_type="transcription_completed",
+            attempt_id=attempt.id,
+            execution_id=claim.execution_id,
+            stage="awaiting_summary",
+        )
 
 
 def _fail_task(maker: sessionmaker[Session], lease: ExecutionLease, claim: ClaimedAttempt, code: str) -> None:
@@ -993,6 +1022,27 @@ def _fail_task(maker: sessionmaker[Session], lease: ExecutionLease, claim: Claim
         task.failure_code = task.failure_code or code[:64]
         task.delivery_next_check_at = datetime.now(UTC)
         task.delivery_wait_reason = "automatic_recovery_pending"
+        record_analysis_event(
+            session,
+            task_id=task.id,
+            event_key=f"execution-failed:{claim.execution_id}:{code[:64]}",
+            event_type="execution_failed",
+            attempt_id=attempt.id,
+            execution_id=claim.execution_id,
+            stage=task.stage,
+            error_code=code,
+        )
+        if code in {"ASR_RATE_LIMITED", "LLM_RATE_LIMITED"}:
+            record_analysis_event(
+                session,
+                task_id=task.id,
+                event_key=f"model-rate-limited:{claim.execution_id}:{code}",
+                event_type="model_rate_limited",
+                attempt_id=attempt.id,
+                execution_id=claim.execution_id,
+                stage=task.stage,
+                error_code=code,
+            )
         if task.summary_status == "running" or claim.execution_mode == "summary_only":
             task.summary_status = "failed"
             unfinished_requests = list(
@@ -1421,6 +1471,16 @@ def _start_summary_request(
             )
             session.add(record)
             session.flush()
+            record_analysis_event(
+                session,
+                task_id=task.id,
+                event_key=f"summary-request-started:{record.id}",
+                event_type="summary_requested",
+                attempt_id=attempt.id,
+                execution_id=execution.id,
+                request_reference=f"summary-request:{record.id}",
+                stage="summarizing",
+            )
             session.expunge(record)
     if should_wait:
         raise ModelCooldownWait("shared model cooldown blocked the summary request")
@@ -1451,6 +1511,16 @@ def _record_summary_response(
         record.provider_trace_id = metadata.get("trace_id")
         record.usage = metadata.get("usage") if isinstance(metadata.get("usage"), dict) else {}
         record.response_bytes = int(metadata["response_bytes"])
+        record_analysis_event(
+            session,
+            task_id=claim.task_id,
+            event_key=f"summary-response:{record.id}",
+            event_type="summary_response_received",
+            attempt_id=claim.attempt_id,
+            execution_id=claim.execution_id,
+            request_reference=f"summary-request:{record.id}",
+            stage="summarizing",
+        )
 
 
 def _record_summary_failure(
@@ -1484,6 +1554,17 @@ def _record_summary_failure(
             record.provider_trace_id = metadata.get("trace_id")
             record.usage = metadata.get("usage") if isinstance(metadata.get("usage"), dict) else {}
             record.response_bytes = int(metadata.get("response_bytes", 0))
+        record_analysis_event(
+            session,
+            task_id=claim.task_id,
+            event_key=f"summary-failed:{record.id}",
+            event_type="summary_failed",
+            attempt_id=claim.attempt_id,
+            execution_id=claim.execution_id,
+            request_reference=f"summary-request:{record.id}",
+            stage="summarizing",
+            error_code=error_code,
+        )
 
 
 def _publish_summary(
@@ -1574,6 +1655,16 @@ def _publish_summary(
         task.stage = "succeeded"
         task.summary_status = "succeeded"
         task.failure_code = None
+        record_analysis_event(
+            session,
+            task_id=task.id,
+            event_key=f"summary-published:{request.id}",
+            event_type="summary_published",
+            attempt_id=attempt.id,
+            execution_id=execution.id,
+            request_reference=f"summary-request:{request.id}",
+            stage="succeeded",
+        )
 
 
 def _read_llm_result(path: Path, maximum_bytes: int) -> tuple[str, dict[str, Any]]:

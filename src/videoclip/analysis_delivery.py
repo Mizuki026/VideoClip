@@ -12,6 +12,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
+from videoclip.events import record_analysis_event
 from videoclip.execution_gate import (
     find_next_queued_task,
     find_unconfirmed_execution,
@@ -317,6 +318,14 @@ def _reserve_delivery(
         delivery.updated_at = now
         task.delivery_next_check_at = now + timedelta(seconds=policy.operation_timeout_seconds)
         task.delivery_wait_reason = "delivery_operation_pending"
+        record_analysis_event(
+            session,
+            task_id=task.id,
+            event_key=f"delivery-reserved:{attempt.id}:{generation}",
+            event_type="delivery_reserved",
+            attempt_id=attempt.id,
+            stage=task.stage,
+        )
         return (
             DeliveryReservation(
                 task_id=task.id,
@@ -360,6 +369,15 @@ def _record_delivery_outcome(
         task.delivery_wait_reason = "delivery_claim_pending" if outcome == "sent" else "delivery_retry_wait"
         task.delivery_next_check_at = now + timedelta(
             seconds=_backoff_seconds(policy, reservation.retry_count)
+        )
+        record_analysis_event(
+            session,
+            task_id=task.id,
+            event_key=f"delivery-outcome:{attempt.id}:{reservation.generation}",
+            event_type="delivery_sent" if outcome == "sent" else "delivery_retry_scheduled",
+            attempt_id=attempt.id,
+            stage=task.stage,
+            error_code=error_code,
         )
         return True
 

@@ -268,6 +268,22 @@ button:focus-visible, a:focus-visible, input:focus-visible, label:focus-visible,
 .summary-placeholder { display: flex; flex-direction: column; align-items: center; padding: 30px 20px; border: 1px dashed #dfe7e1; border-radius: 14px; color: #849189; background: rgba(255, 255, 255, .52); text-align: center; }
 .summary-placeholder h3 { margin: 10px 0 5px; color: #53655a; font-size: 12px; }
 .summary-placeholder p { max-width: 250px; margin: 0; font-size: 9px; line-height: 1.7; }
+.execution-timeline { margin-top: 14px; padding: 17px; border: 1px solid #e3e9e4; border-radius: 13px; background: #fff; box-shadow: var(--shadow); }
+.timeline-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.timeline-heading h2 { margin: 5px 0 0; font-size: 15px; letter-spacing: -.035em; }
+.timeline-count { color: #849189; font-family: ui-monospace, Consolas, monospace; font-size: 9px; }
+.timeline-note, .timeline-empty, .timeline-error { margin: 10px 0 0; color: #8b9690; font-size: 9px; line-height: 1.6; }
+.timeline-error { color: #a4443c; }
+.timeline-list { display: grid; gap: 0; max-height: 390px; margin: 13px 0 0; padding: 0 3px 0 0; overflow-y: auto; list-style: none; }
+.timeline-item { position: relative; display: grid; grid-template-columns: 14px minmax(0, 1fr); gap: 8px; min-height: 53px; }
+.timeline-item:not(:last-child)::before { position: absolute; top: 9px; bottom: -2px; left: 4px; width: 1px; background: #e5ece7; content: ''; }
+.timeline-dot { position: relative; z-index: 1; width: 9px; height: 9px; margin-top: 3px; border: 2px solid #fff; border-radius: 50%; background: #6e9c7d; box-shadow: 0 0 0 1px #bdd2c2; }
+.timeline-event { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: 3px 8px; padding-bottom: 11px; }
+.timeline-event strong { color: #3f5147; font-size: 10px; font-weight: 600; }
+.timeline-event time, .timeline-event small { color: #98a29c; font-size: 8px; }
+.timeline-event small { grid-column: 1 / -1; }
+.timeline-event .timeline-reference { color: #87988d; font-family: ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
+.timeline-more { margin-top: 8px; font-size: 9px; }
 .placeholder-icon { width: 29px; height: 29px; display: grid; place-items: center; border-radius: 10px; color: #558064; background: #eaf4ed; }
 .inline-empty { display: flex; gap: 11px; margin: 20px 0 13px; padding: 13px 12px; border: 1px dashed #e2e8e3; border-radius: 10px; color: #9aa59e; background: #fbfcfb; }
 .inline-empty > span { color: #6d9a7e; font-size: 15px; }

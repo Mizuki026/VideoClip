@@ -94,6 +94,26 @@ export interface AnalysisTask {
   attempt: Attempt;
 }
 
+export interface AnalysisEvent {
+  id: number;
+  video_id: string;
+  task_id: string;
+  attempt_id: string | null;
+  execution_id: string | null;
+  request_reference: string | null;
+  event_type: string;
+  stage: string | null;
+  error_code: string | null;
+  actor: 'system' | 'user';
+  occurred_at: string;
+}
+
+export interface AnalysisEventPage {
+  items: AnalysisEvent[];
+  has_more: boolean;
+  next_before_id: number | null;
+}
+
 export interface TranscriptSegment {
   segment_number: number;
   source_attempt_id: string | null;

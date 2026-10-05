@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
+from videoclip.events import record_analysis_event
 from videoclip.model_cooling import ModelIdentity, require_utc
 from videoclip.models import AnalysisAttempt, AnalysisTask
 
@@ -89,6 +90,14 @@ def enter_model_wait(
         task.auto_recovery_limit = 2
         task.model_wait_total_seconds = task.model_wait_total_seconds or 0
         task.model_wait_total_limit_seconds = total_limit_seconds
+    record_analysis_event(
+        session,
+        task_id=task.id,
+        event_key=f"model-wait:{attempt.id}:{started_at.isoformat()}",
+        event_type="model_wait_entered",
+        attempt_id=attempt.id,
+        stage=task.stage,
+    )
 
 
 def require_manual_wait(task: AnalysisTask, attempt: AnalysisAttempt, error_code: str) -> None:

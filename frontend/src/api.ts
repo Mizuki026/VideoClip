@@ -1,5 +1,6 @@
 import type {
   AnalysisTask,
+  AnalysisEventPage,
   DeletionProgress,
   MediaDeletionProgress,
   Summary,
@@ -103,6 +104,17 @@ export function getVideo(videoId: string): Promise<VideoDetail> {
 
 export function getTask(videoId: string, taskId: string): Promise<AnalysisTask> {
   return request(`/videos/${encodeURIComponent(videoId)}/tasks/${encodeURIComponent(taskId)}`);
+}
+
+export function getAnalysisEvents(
+  videoId: string,
+  options: { beforeId?: number; limit?: number } = {},
+): Promise<AnalysisEventPage> {
+  const query = new URLSearchParams();
+  if (options.beforeId !== undefined) query.set('before_id', String(options.beforeId));
+  if (options.limit !== undefined) query.set('limit', String(options.limit));
+  const suffix = query.size > 0 ? `?${query.toString()}` : '';
+  return request(`/videos/${encodeURIComponent(videoId)}/events${suffix}`);
 }
 
 export function getTranscript(videoId: string): Promise<Transcript> {

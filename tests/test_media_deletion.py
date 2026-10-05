@@ -21,6 +21,7 @@ import videoclip.services as video_services
 from tests.helpers import csrf, login, mutate_headers, register
 from videoclip.analysis import submit_analysis_task
 from videoclip.analysis_worker import AnalysisFailure, ExecutionLease, _claim_attempt
+from videoclip.events import record_analysis_event
 from videoclip.main import create_app
 from videoclip.models import (
     AnalysisAttempt,
@@ -208,12 +209,28 @@ def test_media_delete_keeps_published_notes_and_closes_every_new_media_method(
         assert client.get(f"/videos/{video_id}/content", headers={"Range": "bytes=0-2"}).status_code == 410
         transcript = client.get(f"/videos/{video_id}/transcript")
         summary = client.get(f"/videos/{video_id}/summary")
+        timeline = client.get(f"/videos/{video_id}/events?limit=2")
         assert transcript.status_code == 200
         assert transcript.json()["complete"] is True
         assert transcript.json()["items"][0]["text"] == "保留的转写原文"
         assert summary.status_code == 200
         assert summary.json()["attempt_id"] == str(submitted.attempt_id)
         assert summary.json()["payload"]["preserved"] is True
+        assert timeline.status_code == 200
+        assert timeline.headers["cache-control"] == "private, no-store"
+        assert timeline.json()["has_more"] is True
+        assert [item["event_type"] for item in timeline.json()["items"]] == [
+            "attempt_cleanup_completed",
+            "media_cleanup_completed",
+        ]
+        earlier_timeline = client.get(
+            f"/videos/{video_id}/events?before_id={timeline.json()['next_before_id']}&limit=2"
+        )
+        assert earlier_timeline.status_code == 200
+        assert [item["event_type"] for item in earlier_timeline.json()["items"]] == [
+            "media_cleanup_started",
+            "attempt_cleanup_started",
+        ]
         assert client.get(f"/videos/{video_id}").json()["media_status"] == "deleted"
         assert client.get(f"/videos/{video_id}/media-deletion").json()["media_status"] == "deleted"
         repeated = client.delete(f"/videos/{video_id}/media", headers=headers)
@@ -225,6 +242,69 @@ def test_media_delete_keeps_published_notes_and_closes_every_new_media_method(
         assert client.delete(f"/videos/{video_id}", headers=headers).status_code == 204
         assert client.get(f"/videos/{video_id}").status_code == 404
         assert client.get(f"/videos/{video_id}/transcript").status_code == 404
+        assert client.get(f"/videos/{video_id}/events").status_code == 404
+
+
+def test_event_timeline_is_idempotent_paginated_and_owner_scoped(
+    test_settings: Settings, session_factory: sessionmaker[Session]
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    app = _app(test_settings, session_factory, store)
+    with TestClient(app) as owner_client, TestClient(app) as other_client:
+        owner_id = _account(owner_client, "analysis-events-owner")
+        video_id = _video(session_factory, store, owner_id)
+        submitted = submit_analysis_task(session_factory, owner_id, video_id, test_settings)
+        with session_factory.begin() as session:
+            event = record_analysis_event(
+                session,
+                task_id=submitted.task_id,
+                event_key="test-checkpoint-1",
+                event_type="checkpoint_saved",
+                attempt_id=submitted.attempt_id,
+                request_reference=f"transcript-segment:{submitted.attempt_id}:1",
+                stage="transcribing",
+            )
+            replay = record_analysis_event(
+                session,
+                task_id=submitted.task_id,
+                event_key="test-checkpoint-1",
+                event_type="checkpoint_saved",
+                attempt_id=submitted.attempt_id,
+                request_reference=f"transcript-segment:{submitted.attempt_id}:1",
+                stage="transcribing",
+            )
+            assert event is not None and replay is not None
+            assert event.id == replay.id
+            record_analysis_event(
+                session,
+                task_id=submitted.task_id,
+                event_key="test-summary-request-1",
+                event_type="summary_requested",
+                attempt_id=submitted.attempt_id,
+                request_reference=f"summary-request:{uuid.uuid4()}",
+                stage="summarizing",
+            )
+
+        first = owner_client.get(f"/videos/{video_id}/events?limit=2")
+        assert first.status_code == 200
+        payload = first.json()
+        assert payload["has_more"] is True
+        assert [item["event_type"] for item in payload["items"]] == [
+            "checkpoint_saved",
+            "summary_requested",
+        ]
+        older = owner_client.get(
+            f"/videos/{video_id}/events?limit=2&before_id={payload['next_before_id']}"
+        )
+        assert older.status_code == 200
+        assert [item["event_type"] for item in older.json()["items"]] == ["analysis_submitted"]
+        assert older.json()["has_more"] is False
+        assert first.json()["items"][0]["request_reference"].startswith("transcript-segment:")
+
+        other_id = _account(other_client, "analysis-events-other")
+        assert other_id != owner_id
+        assert other_client.get(f"/videos/{video_id}/events").status_code == 404
+        assert owner_client.get(f"/videos/{video_id}/events?limit=101").status_code == 422
 
 
 def test_deleting_awaiting_summary_cancels_plan_without_publishing_a_summary(

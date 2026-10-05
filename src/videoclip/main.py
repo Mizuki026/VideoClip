@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any, BinaryIO
 
-from fastapi import FastAPI, Header, HTTPException, Request, Response, status
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select
@@ -28,7 +28,7 @@ from videoclip.analysis import (
 from videoclip.analysis_delivery import DeliveryPolicy, coordinate_analysis_delivery
 from videoclip.celery_app import celery_app
 from videoclip.db import check_database, create_database_engine, create_session_factory
-from videoclip.models import AnalysisAttempt, AnalysisExecution, SessionRecord, User, Video
+from videoclip.models import AnalysisAttempt, AnalysisEvent, AnalysisExecution, SessionRecord, User, Video
 from videoclip.recovery import recover_interrupted_work
 from videoclip.resumable_uploads import (
     CHUNK_SIZE,
@@ -39,6 +39,8 @@ from videoclip.resumable_uploads import (
     write_upload_chunk,
 )
 from videoclip.schemas import (
+    AnalysisEventResponse,
+    AnalysisEventsResponse,
     AnalysisSummaryResponse,
     AnalysisTaskResponse,
     CleanupRequest,
@@ -651,6 +653,35 @@ def create_app(
                     detail={"code": "VIDEO_DELETION_IN_PROGRESS", "progress_endpoint": "deletion"},
                 )
             return _video_detail(video)
+
+    @app.get("/videos/{video_id}/events", response_model=AnalysisEventsResponse)
+    def get_video_events(
+        video_id: uuid.UUID,
+        request: Request,
+        response: Response,
+        before_id: int | None = Query(default=None, ge=1),
+        limit: int = Query(default=50, ge=1, le=100),
+    ) -> AnalysisEventsResponse:
+        user, _ = _current_auth(request, resolved_factory) or _raise_auth()
+        with resolved_factory() as session:
+            video = session.scalar(select(Video.id).where(Video.id == video_id, Video.owner_id == user.id))
+            if video is None:
+                raise HTTPException(status_code=404, detail="video not found")
+            statement = select(AnalysisEvent).where(
+                AnalysisEvent.video_id == video_id,
+                AnalysisEvent.owner_id == user.id,
+            )
+            if before_id is not None:
+                statement = statement.where(AnalysisEvent.id < before_id)
+            rows = list(session.scalars(statement.order_by(AnalysisEvent.id.desc()).limit(limit + 1)))
+            has_more = len(rows) > limit
+            page = list(reversed(rows[:limit]))
+            response.headers["Cache-Control"] = "private, no-store"
+            return AnalysisEventsResponse(
+                items=[AnalysisEventResponse.model_validate(row) for row in page],
+                has_more=has_more,
+                next_before_id=page[0].id if has_more and page else None,
+            )
 
     @app.get("/videos/{video_id}/deletion", response_model=VideoDeletionProgress)
     def get_video_deletion(video_id: uuid.UUID, request: Request) -> VideoDeletionProgress:

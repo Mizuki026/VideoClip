@@ -16,6 +16,7 @@ from videoclip.analysis_delivery import (
     DeliveryPolicy,
     current_delivery_wait_reason,
 )
+from videoclip.events import record_analysis_event
 from videoclip.models import (
     AnalysisAttempt,
     AnalysisExecution,
@@ -339,6 +340,14 @@ def submit_analysis_task(
         video.analysis_task_created_at = now
         session.add(TaskDelivery(attempt_id=attempt.id, status="pending", operation_generation=0))
         session.flush()
+        record_analysis_event(
+            session,
+            task_id=task.id,
+            event_key=f"analysis-submitted:{attempt.id}",
+            event_type="analysis_submitted",
+            attempt_id=attempt.id,
+            stage=task.stage,
+        )
         return SubmittedTask(task_id=task.id, attempt_id=attempt.id, created=True)
 
 

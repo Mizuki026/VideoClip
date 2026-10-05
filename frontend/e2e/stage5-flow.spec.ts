@@ -1,14 +1,27 @@
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { expect, test } from '@playwright/test';
+import { expect, test, type Route } from '@playwright/test';
 import { shouldCleanupAcceptanceData } from './acceptance-data';
 
 const sourceVideo = process.env.MVP_ACCEPTANCE_VIDEO;
 const expectedPromptVersion = process.env.MVP_ACCEPTANCE_PROMPT_VERSION ?? 'stage0-summary-v5';
+const expectedWebUrl = process.env.MVP_WEB_URL ?? `http://127.0.0.1:${process.env.VIDEOCLIP_WEB_PORT ?? '5174'}`;
 const uuidPattern = /[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/gi;
 const repoRoot = resolve(process.cwd(), '..');
 const generatedAccounts = new Map<string, string>();
+
+interface Deferred {
+  promise: Promise<void>;
+  resolve: () => void;
+}
+
+function deferred(): Deferred {
+  let resolve: () => void = () => undefined;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
 
 type TaskState = {
   status: string;
@@ -21,6 +34,15 @@ type TaskState = {
   asr_request_count: number;
   asr_elapsed_seconds: number;
   reused_segments: number;
+  asr_model: string;
+  config_sha256: string;
+  source_fingerprint: string;
+  auto_recovery_count: number | null;
+  auto_recovery_limit: number | null;
+  delivery_retry_count: number | null;
+  delivery_retry_limit: number | null;
+  summary_requests_used: number;
+  summary_requests_limit: number;
   attempt: { id: string; parent_attempt_id: string | null; execution_mode: string };
 };
 
@@ -63,6 +85,59 @@ function readSummaryRequestAudit(taskId: string) {
     }) : [],
     model,
     promptVersion,
+  };
+}
+
+function readTaskExecutionAudit(taskId: string) {
+  if (!/^[0-9a-f-]{36}$/i.test(taskId)) throw new Error('Invalid task identifier for acceptance audit.');
+  const sql = `SELECT concat_ws('|',
+    (SELECT count(DISTINCT config_sha256)::text FROM analysis_attempts WHERE task_id = '${taskId}'::uuid),
+    (SELECT string_agg(DISTINCT config_snapshot->'asr'->>'model', ',') FROM analysis_attempts WHERE task_id = '${taskId}'::uuid),
+    (SELECT string_agg(DISTINCT config_snapshot->'summary'->>'model', ',') FROM analysis_attempts WHERE task_id = '${taskId}'::uuid),
+    (SELECT count(DISTINCT source_fingerprint)::text FROM analysis_attempts WHERE task_id = '${taskId}'::uuid),
+    (SELECT coalesce(sum(s.request_count), 0)::text FROM transcript_segments s JOIN analysis_attempts a ON a.id = s.attempt_id WHERE a.task_id = '${taskId}'::uuid),
+    (SELECT count(*)::text FROM analysis_summaries WHERE task_id = '${taskId}'::uuid),
+    (SELECT concat_ws(',', coalesce(auto_recovery_count, 0)::text, coalesce(auto_recovery_limit, 0)::text, coalesce(delivery_retry_count, 0)::text, coalesce(delivery_retry_limit, 0)::text, coalesce(summary_requests_used, 0)::text, coalesce(summary_requests_limit, 0)::text) FROM analysis_tasks WHERE id = '${taskId}'::uuid))`;
+  const output = stage2Command(
+    'exec', '-T', 'postgres', 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-qAt',
+    '-U', 'videoclip_stage2', '-d', 'videoclip_mvp_stage2', '-c', sql,
+  );
+  const [configurationCount, asrModels, summaryModels, sourceCount, asrRequestCount, summaryCount, budgets] = output.split('|');
+  const [automaticRecoveries, automaticRecoveryLimit, deliveryRetries, deliveryRetryLimit, summaryRequests, summaryRequestLimit] = (budgets ?? '').split(',').map(Number);
+  return {
+    frozenConfigurationCount: Number(configurationCount),
+    asrModels: asrModels?.split(',') ?? [],
+    summaryModels: summaryModels?.split(',') ?? [],
+    sourceCount: Number(sourceCount),
+    asrRequestCount: Number(asrRequestCount),
+    summaryCount: Number(summaryCount),
+    budgets: { automaticRecoveries, automaticRecoveryLimit, deliveryRetries, deliveryRetryLimit, summaryRequests, summaryRequestLimit },
+  };
+}
+
+function readResumableVideoAudit(videoId: string, sourceDigest: string) {
+  if (!/^[0-9a-f-]{36}$/i.test(videoId)) throw new Error('Invalid video identifier for upload acceptance audit.');
+  if (!/^[0-9a-f]{64}$/i.test(sourceDigest)) throw new Error('Invalid source digest for upload acceptance audit.');
+  const sql = `SELECT concat_ws('|', u.state, coalesce(u.declared_total_bytes, 0)::text,
+    u.confirmed_offset::text, u.expected_content_sha256, v.byte_count::text, v.content_sha256,
+    coalesce(round(v.duration_seconds::numeric, 3)::text, '0'),
+    (SELECT count(*)::text FROM videos WHERE upload_id = v.upload_id),
+    (u.expected_content_sha256 = '${sourceDigest}')::text)
+    FROM videos v JOIN upload_handoffs u ON u.id = v.upload_id WHERE v.id = '${videoId}'::uuid`;
+  const output = stage2Command(
+    'exec', '-T', 'postgres', 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-qAt',
+    '-U', 'videoclip_stage2', '-d', 'videoclip_mvp_stage2', '-c', sql,
+  );
+  const [state, declaredBytes, confirmedOffset, expectedSha256, videoBytes, videoSha256, duration, videoCount, browserDigestMatchesServer] = output.split('|');
+  return {
+    state,
+    declaredBytes: Number(declaredBytes),
+    confirmedOffset: Number(confirmedOffset),
+    digestMatches: expectedSha256 === videoSha256,
+    videoBytes: Number(videoBytes),
+    durationSeconds: Number(duration),
+    videosForUpload: Number(videoCount),
+    browserDigestMatchesServer: browserDigestMatchesServer === 't',
   };
 }
 
@@ -190,10 +265,12 @@ async function loginAccount(page: import('@playwright/test').Page, username: str
   await expect(page.getByRole('heading', { name: '课程视频', exact: true })).toBeVisible({ timeout: 20_000 });
 }
 
-test('same-origin registration, raw upload, real processing, playback, account isolation, and deletion', async ({ page, baseURL }, testInfo) => {
+test('same-origin registration, resumable long upload, real processing, playback, account isolation, and deletion', async ({ page, baseURL }, testInfo) => {
   test.skip(!sourceVideo, 'Set MVP_ACCEPTANCE_VIDEO to the authorized course sample for the real browser flow.');
   test.setTimeout(1_800_000);
-  expect(baseURL).toBe('http://127.0.0.1:5174');
+  expect(baseURL).toBe(expectedWebUrl);
+  const sourceStat = await stat(sourceVideo!);
+  page.on('dialog', (dialog) => void dialog.accept());
 
   const entropy = randomBytes(6).toString('hex');
   const primaryUser = `stage5fixture-${entropy}`;
@@ -240,18 +317,68 @@ test('same-origin registration, raw upload, real processing, playback, account i
   });
   expect(csrfRejection).toEqual({ rejected: 403, session: 200 });
   const uploadStartedAt = Date.now();
-  const uploadResponsePromise = page.waitForResponse((response) => response.url().endsWith('/api/videos') && response.request().method() === 'POST');
-  await page.getByLabel('视频文件').setInputFiles(sourceVideo!);
-  await page.getByRole('button', { name: '上传视频' }).click();
-  const uploadResponse = await uploadResponsePromise;
+  const chunkPaused = deferred();
+  const continueChunk = deferred();
+  let uploadId = '';
+  let heldChunk = false;
+  await page.route(/\/api\/uploads\/[^/]+\/chunks\/\d+$/, async (route: Route) => {
+    const match = new URL(route.request().url()).pathname.match(/\/uploads\/([^/]+)\/chunks\/(\d+)$/);
+    if (match && match[1] === uploadId && match[2] === '1' && !heldChunk) {
+      heldChunk = true;
+      chunkPaused.resolve();
+      await continueChunk.promise;
+      try { await route.abort(); } catch { /* The UI may already have cancelled this request. */ }
+      return;
+    }
+    await route.continue();
+  });
+  const firstCreatePromise = page.waitForResponse((response) => response.url().endsWith('/api/uploads') && response.request().method() === 'POST');
+  await page.locator('#video-file').setInputFiles(sourceVideo!);
+  await page.getByRole('button', { name: /上传 \/ 继续上传/ }).click();
+  const firstCreate = await firstCreatePromise;
+  expect(firstCreate.status()).toBe(201);
+  uploadId = (await firstCreate.json() as { upload_id: string }).upload_id;
+  const sourceDigest = (firstCreate.request().postDataJSON() as { sha256: string }).sha256;
+  const idempotencyKey = (await firstCreate.request().allHeaders())['idempotency-key'];
+  expect(idempotencyKey).toBeTruthy();
+  await chunkPaused.promise;
+  await expect(page.getByText(/服务端已确认 8\.0 MiB/)).toBeVisible({ timeout: 60_000 });
+  const interruptedUpload = await page.evaluate(async (id) => {
+    const response = await fetch(`/api/uploads/${id}`, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`Resumable status returned HTTP ${response.status}.`);
+    return await response.json() as { state: string; confirmed_offset: number };
+  }, uploadId);
+  expect(interruptedUpload).toMatchObject({ state: 'receiving', confirmed_offset: 8_388_608 });
+  await page.getByRole('button', { name: '暂停上传' }).click();
+  continueChunk.resolve();
+  await expect(page.getByText(/上传已暂停/)).toBeVisible({ timeout: 30_000 });
+  await expect.poll(async () => (await page.evaluate(async (id) => {
+    const response = await fetch(`/api/uploads/${id}`, { cache: 'no-store' });
+    return (await response.json() as { confirmed_offset: number }).confirmed_offset;
+  }, uploadId))).toBe(8_388_608);
+
+  await page.reload();
+  await expect(page.getByRole('heading', { name: '课程视频', exact: true })).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByText(/此账户有 1 个临时上传/)).toBeVisible();
+  const resumePromise = page.waitForResponse((response) => response.url().endsWith('/api/uploads') && response.request().method() === 'POST');
+  await page.locator('#video-file').setInputFiles(sourceVideo!);
+  await page.getByRole('button', { name: /上传 \/ 继续上传/ }).click();
+  const resumedCreate = await resumePromise;
+  expect(resumedCreate.status()).toBe(200);
+  expect(await resumedCreate.json()).toEqual(expect.objectContaining({ upload_id: uploadId, replayed: true, confirmed_offset: 8_388_608 }));
+  await expect(page).toHaveURL(/\/videos\/[0-9a-f-]{36}$/, { timeout: 80 * 60 * 1000 });
   const uploadElapsedSeconds = (Date.now() - uploadStartedAt) / 1000;
-  expect(uploadResponse.status()).toBe(201);
-  const uploadHeaders = await uploadResponse.request().allHeaders();
-  expect(uploadHeaders['content-type'] ?? '').not.toContain('multipart/form-data');
-  expect(uploadHeaders['x-video-filename']).toBeTruthy();
-  expect(uploadHeaders.origin).toBe(baseURL);
-  await expect(page).toHaveURL(/\/videos\/[0-9a-f-]{36}$/);
   const videoId = new URL(page.url()).pathname.split('/').at(-1)!;
+  await page.unroute(/\/api\/uploads\/[^/]+\/chunks\/\d+$/);
+  const replayedCompletion = await page.evaluate(async (id) => {
+    const csrf = await (await fetch('/api/auth/csrf', { cache: 'no-store' })).json() as { csrf_token: string };
+    const response = await fetch(`/api/uploads/${id}/complete`, {
+      method: 'POST', headers: { 'X-CSRF-Token': csrf.csrf_token }, cache: 'no-store',
+    });
+    const payload = await response.json() as { video: { id: string } };
+    return { status: response.status, videoId: payload.video.id };
+  }, uploadId);
+  expect(replayedCompletion).toEqual({ status: 200, videoId });
   const detailResponse = await page.evaluate(async (id) => {
     const response = await fetch(`/api/videos/${id}`, { cache: 'no-store' });
     return { status: response.status, video: await response.json() };
@@ -261,6 +388,21 @@ test('same-origin registration, raw upload, real processing, playback, account i
   expect(videoId).toBe(uploadResult.video.id);
   expect(uploadResult.video.byte_count).toBeGreaterThan(0);
   expect(uploadResult.video.analysis_task_id ?? null).toBeNull();
+  const uploadAudit = readResumableVideoAudit(videoId, sourceDigest);
+  expect(uploadAudit.state).toBe('complete');
+  expect(uploadAudit.declaredBytes).toBe(sourceStat.size);
+  expect(uploadAudit.confirmedOffset).toBe(sourceStat.size);
+  expect(uploadAudit.videoBytes).toBe(sourceStat.size);
+  expect(uploadAudit.digestMatches).toBe(true);
+  expect(uploadAudit.browserDigestMatchesServer).toBe(true);
+  expect(uploadAudit.videosForUpload).toBe(1);
+  expect(uploadAudit.durationSeconds).toBeGreaterThan(1061.2);
+  expect(uploadAudit.durationSeconds).toBeLessThan(1061.5);
+  const accountVideos = await page.evaluate(async () => {
+    const response = await fetch('/api/videos', { cache: 'no-store' });
+    return (await response.json() as { items: Array<{ id: string }> }).items;
+  });
+  expect(accountVideos.filter((item) => item.id === videoId)).toHaveLength(1);
   await expect(page.getByRole('heading', { name: uploadResult.video.display_name })).toBeVisible({ timeout: 20_000 });
 
   const analysisStartedAt = Date.now();
@@ -338,6 +480,16 @@ test('same-origin registration, raw upload, real processing, playback, account i
   }
   expect(summaryAudit.model).toBe('Qwen/Qwen3.5-4B');
   expect(summaryAudit.promptVersion).toBe(expectedPromptVersion);
+  const executionAudit = readTaskExecutionAudit(task.id);
+  expect(executionAudit.frozenConfigurationCount).toBe(1);
+  expect(executionAudit.asrModels).toEqual(['FunAudioLLM/SenseVoiceSmall']);
+  expect(executionAudit.summaryModels).toEqual(['Qwen/Qwen3.5-4B']);
+  expect(executionAudit.sourceCount).toBe(1);
+  expect(executionAudit.asrRequestCount).toBeGreaterThanOrEqual(finalTask.expected_segments);
+  expect(executionAudit.summaryCount).toBe(1);
+  expect(executionAudit.budgets.automaticRecoveries).toBeLessThanOrEqual(executionAudit.budgets.automaticRecoveryLimit);
+  expect(executionAudit.budgets.deliveryRetries).toBeLessThanOrEqual(executionAudit.budgets.deliveryRetryLimit);
+  expect(executionAudit.budgets.summaryRequests).toBeLessThanOrEqual(executionAudit.budgets.summaryRequestLimit);
   if (recoveredSummaryAttempts > 0) {
     expect(finalTask.asr_request_count).toBe(0);
     expect(finalTask.reused_segments).toBe(finalTask.expected_segments);
@@ -391,7 +543,16 @@ test('same-origin registration, raw upload, real processing, playback, account i
   expect(taskAfterReload.status).toBe('succeeded');
   expect(taskAfterReload.completed_segments).toBe(taskAfterReload.expected_segments);
   expect(taskAfterReload.execution_stop_confirmed).toBe(true);
-  console.log(`stage6_browser_audit=${JSON.stringify({
+  const timelineAfterReload = await page.evaluate(async (id) => {
+    const response = await fetch(`/api/videos/${id}/events?limit=100`, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`Persisted event readback failed with HTTP ${response.status}.`);
+    return await response.json() as { items: Array<{ event_type: string; request_reference: string | null }> };
+  }, videoId);
+  const persistedEventTypes = timelineAfterReload.items.map((event) => event.event_type);
+  for (const requiredEvent of ['analysis_submitted', 'execution_claimed', 'checkpoint_saved', 'transcription_completed', 'summary_requested', 'summary_published', 'stop_confirmed']) {
+    expect(persistedEventTypes).toContain(requiredEvent);
+  }
+  console.log(`stage7_real_browser_audit=${JSON.stringify({
     uploadElapsedSeconds: Number(uploadElapsedSeconds.toFixed(3)),
     analysisElapsedSeconds: Number(((Date.now() - analysisStartedAt) / 1000).toFixed(3)),
     asrRequests: taskAfterReload.asr_request_count,
@@ -407,6 +568,10 @@ test('same-origin registration, raw upload, real processing, playback, account i
     promptVersion: summaryAudit.promptVersion,
     recoveredSummaryAttempts,
     reusedSegments: taskAfterReload.reused_segments,
+    uploadAudit,
+    timelineEventCount: timelineAfterReload.items.length,
+    timelineRequestReferences: timelineAfterReload.items.filter((event) => event.request_reference).length,
+    executionAudit,
     ...citationAudit,
     apiWorkerRestartReadback: process.env.MVP_STAGE6_RESTART_SERVICES === '1',
   })}`);
@@ -490,11 +655,12 @@ test('same-origin registration, raw upload, real processing, playback, account i
       fetch(`/api/videos/${id}/tasks/${taskId}`, { cache: 'no-store' }),
       fetch(`/api/videos/${id}/transcript`, { cache: 'no-store' }),
       fetch(`/api/videos/${id}/summary`, { cache: 'no-store' }),
+      fetch(`/api/videos/${id}/events`, { cache: 'no-store' }),
       fetch(`/api/videos/${id}/content`, { headers: { Range: 'bytes=0-0' }, cache: 'no-store' }),
     ]);
     return requests.map((response) => response.status);
   }, { id: videoId, taskId: task.id });
-  expect(isolation).toEqual([404, 404, 404, 404, 404]);
+  expect(isolation).toEqual([404, 404, 404, 404, 404, 404]);
 
   const logoutSecondary = page.waitForResponse((response) => response.url().endsWith('/api/auth/logout'));
   await page.getByRole('button', { name: '退出登录' }).click();
@@ -504,6 +670,59 @@ test('same-origin registration, raw upload, real processing, playback, account i
 
   await page.goto(`/videos/${videoId}`);
   await expect(page.getByRole('heading', { name: uploadResult.video.display_name })).toBeVisible({ timeout: 20_000 });
+  const removeMediaPromise = page.waitForResponse((response) => response.url().endsWith(`/api/videos/${videoId}/media`) && response.request().method() === 'DELETE');
+  await page.getByRole('button', { name: '删除原视频，保留笔记' }).click();
+  const removeMediaResponse = await removeMediaPromise;
+  expect(removeMediaResponse.status()).toBe(200);
+  await expect(page.getByText('原视频已删除，笔记保留')).toBeVisible({ timeout: 60_000 });
+  await expect(page.locator('video')).toHaveCount(0);
+  const retainedNotesAndClosedMedia = await page.evaluate(async ({ id, taskId }) => {
+    const [video, taskRead, transcript, summary, events, mediaGet, mediaHead, mediaRange] = await Promise.all([
+      fetch(`/api/videos/${id}`, { cache: 'no-store' }),
+      fetch(`/api/videos/${id}/tasks/${taskId}`, { cache: 'no-store' }),
+      fetch(`/api/videos/${id}/transcript`, { cache: 'no-store' }),
+      fetch(`/api/videos/${id}/summary`, { cache: 'no-store' }),
+      fetch(`/api/videos/${id}/events?limit=100`, { cache: 'no-store' }),
+      fetch(`/api/videos/${id}/content`, { cache: 'no-store' }),
+      fetch(`/api/videos/${id}/content`, { method: 'HEAD', cache: 'no-store' }),
+      fetch(`/api/videos/${id}/content`, { headers: { Range: 'bytes=0-15' }, cache: 'no-store' }),
+    ]);
+    const videoBody = await video.json() as { media_status: string };
+    const transcriptBody = await transcript.json() as { complete: boolean; items: unknown[] };
+    const summaryBody = await summary.json() as { payload: { chapters: unknown[]; key_points: unknown[] } };
+    const eventsBody = await events.json() as { items: Array<{ event_type: string }> };
+    return {
+      videoStatus: video.status,
+      mediaStatus: videoBody.media_status,
+      taskStatus: taskRead.status,
+      transcriptStatus: transcript.status,
+      transcriptComplete: transcriptBody.complete,
+      transcriptSegments: transcriptBody.items.length,
+      summaryStatus: summary.status,
+      chapters: summaryBody.payload.chapters.length,
+      keyPoints: summaryBody.payload.key_points.length,
+      eventStatus: events.status,
+      eventTypes: eventsBody.items.map((event) => event.event_type),
+      mediaStatuses: [mediaGet.status, mediaHead.status, mediaRange.status],
+    };
+  }, { id: videoId, taskId: task.id });
+  expect(retainedNotesAndClosedMedia.videoStatus).toBe(200);
+  expect(retainedNotesAndClosedMedia.mediaStatus).toBe('deleted');
+  expect(retainedNotesAndClosedMedia.taskStatus).toBe(200);
+  expect(retainedNotesAndClosedMedia.transcriptStatus).toBe(200);
+  expect(retainedNotesAndClosedMedia.transcriptComplete).toBe(true);
+  expect(retainedNotesAndClosedMedia.transcriptSegments).toBeGreaterThan(0);
+  expect(retainedNotesAndClosedMedia.summaryStatus).toBe(200);
+  expect(retainedNotesAndClosedMedia.chapters + retainedNotesAndClosedMedia.keyPoints).toBeGreaterThan(0);
+  expect(retainedNotesAndClosedMedia.eventStatus).toBe(200);
+  expect(retainedNotesAndClosedMedia.eventTypes).toContain('media_cleanup_completed');
+  expect(retainedNotesAndClosedMedia.mediaStatuses).toEqual([410, 410, 410]);
+  await page.reload();
+  await expect(page.getByText('原视频已删除，笔记保留')).toBeVisible();
+  await expect(page.getByRole('heading', { name: '课程总结' })).toBeVisible();
+  await expect(page.locator('.transcript-row').first()).toBeVisible();
+  await expect(page.locator('video')).toHaveCount(0);
+
   const deleteResponsePromise = page.waitForResponse((response) => response.url().endsWith(`/api/videos/${videoId}`) && response.request().method() === 'DELETE');
   await page.getByRole('button', { name: '删除记录' }).click();
   const deleteResponse = await deleteResponsePromise;
@@ -513,15 +732,19 @@ test('same-origin registration, raw upload, real processing, playback, account i
   }
   await expect(page).toHaveURL(/\/$/, { timeout: 60_000 });
   await expect(page.getByText(uploadResult.video.display_name)).toHaveCount(0);
-  const deletedContentStatus = await page.evaluate(async (id) => {
+  const deletedContentStatus = await page.evaluate(async ({ id, taskId }) => {
     const responses = await Promise.all([
+      fetch(`/api/videos/${id}`, { cache: 'no-store' }),
+      fetch(`/api/videos/${id}/tasks/${taskId}`, { cache: 'no-store' }),
       fetch(`/api/videos/${id}/content`, { headers: { Range: 'bytes=0-0' }, cache: 'no-store' }),
+      fetch(`/api/videos/${id}/content`, { method: 'HEAD', cache: 'no-store' }),
       fetch(`/api/videos/${id}/transcript`, { cache: 'no-store' }),
       fetch(`/api/videos/${id}/summary`, { cache: 'no-store' }),
+      fetch(`/api/videos/${id}/events`, { cache: 'no-store' }),
     ]);
     return responses.map((response) => response.status);
-  }, videoId);
-  expect(deletedContentStatus.every((status) => [404, 410].includes(status))).toBe(true);
+  }, { id: videoId, taskId: task.id });
+  expect(deletedContentStatus).toEqual([404, 404, 404, 404, 404, 404, 404]);
 
   expect(sessionCookieWasHttpOnly.some(Boolean)).toBe(true);
   expect(requests.some((entry) => entry.path === '/api/auth/me' && entry.status === 200 && entry.cookiePresent)).toBe(true);
