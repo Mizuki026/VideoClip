@@ -16,6 +16,7 @@ from videoclip.analysis_lifecycle import coordinate_due_analysis_recoveries
 from videoclip.celery_app import BROKER_URL, celery_app
 from videoclip.db import create_database_engine, create_session_factory
 from videoclip.resumable_uploads import reclaim_expired_uploads
+from videoclip.services import recover_pending_media_deletions
 from videoclip.settings import Settings, get_settings
 from videoclip.storage import MediaStore
 
@@ -148,7 +149,8 @@ def _reclaim_with_database_lock(
         return {"status": "overlap_skipped", "reclaimed": 0}
     try:
         count = reclaim_expired_uploads(factory, store, limit=limit)
-        return {"status": "completed", "reclaimed": count}
+        media_deleted = recover_pending_media_deletions(factory, store, limit=limit)
+        return {"status": "completed", "reclaimed": count, "media_deleted": media_deleted}
     finally:
         connection.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": RECLAIM_ADVISORY_LOCK_ID})
 
@@ -230,9 +232,10 @@ def reclaim_expired_uploads_task(_schedule_lock_token: str | None = None) -> dic
                 create_session_factory(engine), store, connection, _configured_scan_limit()
             )
         logger.info(
-            "reclaim_cycle_finished status=%s reclaimed=%s",
+            "reclaim_cycle_finished status=%s reclaimed=%s media_deleted=%s",
             result["status"],
             result["reclaimed"],
+            result["media_deleted"],
         )
         return result
     except Exception:

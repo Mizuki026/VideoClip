@@ -15,6 +15,7 @@ from videoclip.services import (
     db_transaction,
     delete_video,
     recover_confirmed_attempt_cleanup,
+    recover_pending_media_deletions,
 )
 from videoclip.settings import Settings
 from videoclip.storage import MediaStore
@@ -197,4 +198,5 @@ def recover_interrupted_work(factory: sessionmaker[Session], settings: Settings,
             delete_video(factory, store, owner_id, video_id)
         except Exception:
             logger.warning("video_recovery_cleanup_pending video_id=%s", video_id.hex)
+    recover_pending_media_deletions(factory, store, limit=4)
     recover_confirmed_attempt_cleanup(factory, store)

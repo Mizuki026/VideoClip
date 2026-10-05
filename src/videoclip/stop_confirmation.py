@@ -14,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from videoclip.db import create_database_engine, create_session_factory
-from videoclip.models import AnalysisAttempt, AnalysisExecution, AnalysisTask, SummaryRequest
+from videoclip.models import AnalysisAttempt, AnalysisExecution, AnalysisTask, SummaryRequest, Video
 from videoclip.services import db_transaction
 from videoclip.settings import get_settings
 
@@ -146,7 +146,16 @@ def confirm_stopped_execution(
         if not isinstance(container_id, str) or container_id[:12] != identity.worker_container_id[:12]:
             return "rejected"
 
+    with factory() as session:
+        video_id = session.scalar(
+            select(AnalysisTask.video_id).where(AnalysisTask.id == identity.task_id)
+        )
+        session.commit()
+    if video_id is None:
+        return "rejected"
+
     with db_transaction(factory) as session:
+        video = session.scalar(select(Video).where(Video.id == video_id).with_for_update())
         task = session.scalar(
             select(AnalysisTask).where(AnalysisTask.id == identity.task_id).with_for_update()
         )
@@ -165,9 +174,11 @@ def confirm_stopped_execution(
             .with_for_update()
         )
         if (
-            task is None
+            video is None
+            or task is None
             or attempt is None
             or execution is None
+            or task.video_id != video.id
             or attempt.claim_count != 1
             or attempt.execution_id != execution.id
             or not _matches(execution, identity)
@@ -199,8 +210,17 @@ def confirm_stopped_execution(
             task.status = "failed"
             task.stage = "failed"
             task.failure_code = task.failure_code or "WORKER_EXECUTION_INTERRUPTED"
-            task.delivery_wait_reason = "automatic_recovery_pending"
-            task.delivery_next_check_at = now
+            if video.status == "ready" and video.media_status == "available":
+                task.delivery_wait_reason = "automatic_recovery_pending"
+                task.delivery_next_check_at = now
+            else:
+                task.queue_entered_at = None
+                task.delivery_wait_reason = (
+                    "VIDEO_MEDIA_DELETION_REQUESTED"
+                    if video.status == "ready"
+                    else "VIDEO_DELETION_REQUESTED"
+                )
+                task.delivery_next_check_at = None
             task.updated_at = now
         if attempt.status == "failed" and attempt.finished_at is None:
             attempt.finished_at = now

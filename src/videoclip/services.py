@@ -8,11 +8,11 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import unquote
 
 from fastapi import HTTPException, Request, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.requests import ClientDisconnect
@@ -367,6 +367,340 @@ def _new_cleanup_intent(session: Session, video: Video) -> CleanupIntent:
     return intent
 
 
+def _new_media_cleanup_intent(session: Session, video: Video) -> CleanupIntent:
+    intent = session.scalar(
+        select(CleanupIntent)
+        .where(CleanupIntent.upload_id == video.upload_id, CleanupIntent.kind == "media")
+        .with_for_update()
+    )
+    if intent is None:
+        intent = CleanupIntent(
+            owner_id=video.owner_id,
+            upload_id=video.upload_id,
+            storage_name=video.storage_name,
+            kind="media",
+            state="pending",
+            attempts=0,
+        )
+        session.add(intent)
+    return intent
+
+
+def _pin_notes_attempt(session: Session, task: AnalysisTask) -> None:
+    if task.notes_attempt_id is not None:
+        return
+    published_attempt_id = session.scalar(
+        select(AnalysisSummary.attempt_id).where(AnalysisSummary.task_id == task.id)
+    )
+    if published_attempt_id is not None:
+        task.notes_attempt_id = published_attempt_id
+        return
+
+    versions = list(
+        session.execute(
+            select(
+                AnalysisAttempt.id,
+                AnalysisAttempt.attempt_number,
+                func.count(TranscriptSegment.id).filter(TranscriptSegment.status == "succeeded"),
+            )
+            .outerjoin(TranscriptSegment, TranscriptSegment.attempt_id == AnalysisAttempt.id)
+            .where(AnalysisAttempt.task_id == task.id)
+            .group_by(AnalysisAttempt.id)
+        ).all()
+    )
+    if not versions:
+        task.notes_attempt_id = task.current_attempt_id
+        return
+    selected_id, _, _ = max(
+        versions,
+        key=lambda row: (
+            int(row[2]),
+            row[0] == task.current_attempt_id,
+            row[1],
+        ),
+    )
+    task.notes_attempt_id = selected_id
+
+
+def _cancel_unfinished_analysis_for_media(session: Session, video: Video, now: datetime) -> None:
+    task_id = video.current_analysis_task_id
+    if task_id is None:
+        if video.analysis_task_created_at is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "ANALYSIS_TASK_ASSOCIATION_MISSING", "deletion_eligible": False},
+            )
+        return
+    task = session.scalar(select(AnalysisTask).where(AnalysisTask.id == task_id).with_for_update())
+    if task is None or task.video_id != video.id:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "ANALYSIS_TASK_ASSOCIATION_MISSING", "deletion_eligible": False},
+        )
+    _pin_notes_attempt(session, task)
+    attempts = list(
+        session.scalars(
+            select(AnalysisAttempt)
+            .where(AnalysisAttempt.task_id == task.id)
+            .order_by(AnalysisAttempt.attempt_number)
+            .with_for_update()
+        )
+    )
+    attempt_ids = [attempt.id for attempt in attempts]
+    deliveries = list(
+        session.scalars(
+            select(TaskDelivery)
+            .where(TaskDelivery.attempt_id.in_(attempt_ids))
+            .order_by(TaskDelivery.attempt_id)
+            .with_for_update()
+        )
+    ) if attempt_ids else []
+    has_published_summary = session.scalar(
+        select(AnalysisSummary.id).where(AnalysisSummary.task_id == task.id).limit(1)
+    ) is not None
+
+    task.queue_entered_at = None
+    task.delivery_next_check_at = None
+    task.delivery_blocked_since = None
+    task.delivery_wait_reason = "VIDEO_MEDIA_DELETION_REQUESTED"
+    task.model_wait_reason = None
+    task.model_wait_error_code = None
+    task.model_wait_stage = None
+    task.model_wait_origin = None
+    task.model_wait_until = None
+    task.model_wait_single_deadline_at = None
+
+    if not has_published_summary:
+        task.status = "failed"
+        task.stage = "failed"
+        task.failure_code = "VIDEO_MEDIA_DELETION_REQUESTED"
+        if task.summary_status in {"waiting", "running"}:
+            task.summary_status = "failed"
+
+    for attempt in attempts:
+        if attempt.status not in {"failed", "succeeded"}:
+            attempt.status = "failed"
+            attempt.failure_code = "VIDEO_MEDIA_DELETION_REQUESTED"
+            attempt.finished_at = attempt.finished_at or now
+
+    for delivery in deliveries:
+        delivery.status = "failed"
+        delivery.error_code = "VIDEO_MEDIA_DELETION_REQUESTED"
+        delivery.operation_generation = (delivery.operation_generation or 0) + 1
+        delivery.updated_at = now
+    unfinished_requests = list(
+        session.scalars(
+            select(SummaryRequest)
+            .where(
+                SummaryRequest.task_id == task.id,
+                SummaryRequest.status.in_(("started", "response_received")),
+            )
+            .order_by(SummaryRequest.id)
+            .with_for_update()
+        )
+    )
+    for request in unfinished_requests:
+        request.status = "failed"
+        request.error_code = "VIDEO_MEDIA_DELETION_REQUESTED"
+        request.finished_at = now
+
+
+def _resume_media_cleanup(
+    factory: sessionmaker[Session],
+    store: MediaStore,
+    video_id: uuid.UUID,
+    *,
+    owner_id: uuid.UUID | None = None,
+) -> bool:
+    with factory() as session:
+        query = select(Video).where(Video.id == video_id)
+        if owner_id is not None:
+            query = query.where(Video.owner_id == owner_id)
+        video = session.scalar(query)
+        if video is None:
+            return False
+        if video.media_status == "deleted":
+            return True
+        if video.media_status not in {"deletion_pending", "cleanup_failed"}:
+            return False
+        task = session.scalar(select(AnalysisTask).where(AnalysisTask.video_id == video.id))
+        attempts = (
+            list(
+                session.scalars(
+                    select(AnalysisAttempt)
+                    .where(AnalysisAttempt.task_id == task.id)
+                    .order_by(AnalysisAttempt.attempt_number)
+                )
+            )
+            if task is not None
+            else []
+        )
+        if any(not _attempt_stop_is_confirmed(session, attempt) for attempt in attempts):
+            return False
+        upload_id = video.upload_id
+
+    try:
+        lease = store.acquire_lease(upload_id)
+    except OSError:
+        _set_media_cleanup_failure(factory, video_id, upload_id, "FILE_LEASE_UNAVAILABLE")
+        return False
+    if lease is None:
+        return False
+
+    try:
+        with db_transaction(factory) as session:
+            current = session.scalar(select(Video).where(Video.id == video_id).with_for_update())
+            if current is None:
+                return False
+            if current.media_status == "deleted":
+                return True
+            if current.media_status not in {"deletion_pending", "cleanup_failed"}:
+                return False
+            task = session.scalar(
+                select(AnalysisTask).where(AnalysisTask.video_id == current.id).with_for_update()
+            )
+            attempts = (
+                list(
+                    session.scalars(
+                        select(AnalysisAttempt)
+                        .where(AnalysisAttempt.task_id == task.id)
+                        .order_by(AnalysisAttempt.attempt_number)
+                        .with_for_update()
+                    )
+                )
+                if task is not None
+                else []
+            )
+            if any(not _attempt_stop_is_confirmed(session, attempt) for attempt in attempts):
+                return False
+            task_id = task.id if task is not None else None
+            cleanup_rows = [(attempt.id, attempt.work_directory_name) for attempt in attempts]
+            storage_name = current.storage_name
+            upload_id = current.upload_id
+            owner_id = current.owner_id
+
+        if task_id is not None:
+            for attempt_id, _ in cleanup_rows:
+                if not _remove_attempt_files(
+                    factory,
+                    store,
+                    owner_id,
+                    video_id,
+                    attempt_id,
+                    cleanup_mode="media",
+                ):
+                    _set_media_cleanup_failure(
+                        factory, video_id, upload_id, "ATTEMPT_TEMP_CLEANUP_FAILED"
+                    )
+                    return False
+        store.remove_media(storage_name)
+        with db_transaction(factory) as session:
+            current = session.scalar(select(Video).where(Video.id == video_id).with_for_update())
+            if current is None:
+                return False
+            if current.media_status != "deleted":
+                current.media_status = "deleted"
+                current.media_error_code = None
+            intent = session.scalar(
+                select(CleanupIntent)
+                .where(CleanupIntent.upload_id == current.upload_id, CleanupIntent.kind == "media")
+                .with_for_update()
+            )
+            if intent is not None:
+                intent.state = "completed"
+                intent.error_code = None
+        return True
+    except OSError:
+        _set_media_cleanup_failure(factory, video_id, upload_id, "STORAGE_OPERATION_FAILED")
+        return False
+    finally:
+        lease.release()
+
+
+def delete_video_media(
+    factory: sessionmaker[Session], store: MediaStore, owner_id: uuid.UUID, video_id: uuid.UUID
+) -> bool:
+    with db_transaction(factory) as session:
+        video = session.scalar(
+            select(Video).where(Video.id == video_id, Video.owner_id == owner_id).with_for_update()
+        )
+        if video is None:
+            raise HTTPException(status_code=404, detail="video not found")
+        if video.status != "ready":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "VIDEO_DELETION_IN_PROGRESS", "deletion_eligible": False},
+            )
+        if video.media_status == "available":
+            video.media_status = "deletion_pending"
+            video.media_error_code = None
+            _new_media_cleanup_intent(session, video)
+            _cancel_unfinished_analysis_for_media(session, video, datetime.now(UTC))
+        elif video.media_status == "cleanup_failed":
+            video.media_status = "deletion_pending"
+            intent = _new_media_cleanup_intent(session, video)
+            intent.state = "pending"
+        elif video.media_status == "deletion_pending":
+            _new_media_cleanup_intent(session, video)
+        elif video.media_status == "deleted":
+            return True
+        else:
+            raise HTTPException(status_code=503, detail="video media state needs maintenance")
+    return _resume_media_cleanup(factory, store, video_id, owner_id=owner_id)
+
+
+def retry_video_media_cleanup(
+    factory: sessionmaker[Session], store: MediaStore, owner_id: uuid.UUID, video_id: uuid.UUID
+) -> bool:
+    with db_transaction(factory) as session:
+        video = session.scalar(
+            select(Video).where(Video.id == video_id, Video.owner_id == owner_id).with_for_update()
+        )
+        if video is None:
+            raise HTTPException(status_code=404, detail="video not found")
+        if video.status != "ready":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "VIDEO_DELETION_IN_PROGRESS", "deletion_eligible": False},
+            )
+        if video.media_status == "deleted":
+            return True
+        if video.media_status not in {"deletion_pending", "cleanup_failed"}:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "MEDIA_DELETION_NOT_REQUESTED", "cleanup_eligible": False},
+            )
+        video.media_status = "deletion_pending"
+        _new_media_cleanup_intent(session, video).state = "pending"
+    return _resume_media_cleanup(factory, store, video_id, owner_id=owner_id)
+
+
+def recover_pending_media_deletions(
+    factory: sessionmaker[Session], store: MediaStore, *, limit: int = 4
+) -> int:
+    if not 1 <= limit <= 8:
+        raise ValueError("media deletion recovery limit must be between 1 and 8")
+    with factory() as session:
+        candidates = list(
+            session.scalars(
+                select(Video.id)
+                .where(
+                    Video.status == "ready",
+                    Video.media_status.in_(("deletion_pending", "cleanup_failed")),
+                )
+                .order_by(Video.created_at, Video.id)
+                .limit(limit)
+            )
+        )
+    completed = 0
+    for video_id in candidates:
+        try:
+            completed += _resume_media_cleanup(factory, store, video_id)
+        except Exception:
+            logger.warning("media_cleanup_recovery_pending video_id=%s", video_id.hex)
+    return completed
+
+
 def delete_video(
     factory: sessionmaker[Session], store: MediaStore, owner_id: uuid.UUID, video_id: uuid.UUID
 ) -> int:
@@ -386,6 +720,8 @@ def delete_video(
             video.status = "deleting"
         else:
             video.status = "deleting"
+        if video.media_status not in {"deleted", "cleanup_failed"}:
+            video.media_status = "deletion_pending"
         video.deletion_error = None
         intent = _new_cleanup_intent(session, video)
         intent.state = "pending"
@@ -445,7 +781,7 @@ def delete_video(
                     owner_id,
                     video_id,
                     attempt_id,
-                    deletion_mode=True,
+                    cleanup_mode="whole",
                 ):
                     _set_video_cleanup_failure(factory, video_id, upload_id, "ATTEMPT_TEMP_CLEANUP_FAILED")
                     return status.HTTP_202_ACCEPTED
@@ -467,6 +803,7 @@ def delete_video(
                     )
                     if task is not None:
                         task.current_attempt_id = None
+                        task.notes_attempt_id = None
                         session.flush()
                         current_attempt_ids = list(
                             session.scalars(
@@ -504,11 +841,6 @@ def delete_video(
         return status.HTTP_204_NO_CONTENT
     finally:
         lease.release()
-        if cleanup_succeeded:
-            try:
-                store.remove_lease(upload_id)
-            except OSError:
-                logger.warning("lease_cleanup_pending upload_id=%s", upload_id.hex)
 
 
 def retry_cleanup(
@@ -540,7 +872,7 @@ def _remove_attempt_files(
     video_id: uuid.UUID,
     attempt_id: uuid.UUID,
     *,
-    deletion_mode: bool,
+    cleanup_mode: Literal["normal", "media", "whole"],
 ) -> bool:
     with db_transaction(factory) as session:
         video = session.scalar(
@@ -548,10 +880,16 @@ def _remove_attempt_files(
         )
         if video is None:
             return False
-        if deletion_mode:
+        if cleanup_mode == "whole":
             if video.status not in {"deleting", "cleanup_failed"}:
                 return False
-        elif video.status != "ready":
+        elif cleanup_mode == "media":
+            if (
+                video.status not in {"ready", "deleting", "cleanup_failed"}
+                or video.media_status not in {"deletion_pending", "cleanup_failed", "deleted"}
+            ):
+                return False
+        elif video.status != "ready" or video.media_status != "available":
             return False
         task = session.scalar(select(AnalysisTask).where(AnalysisTask.video_id == video_id).with_for_update())
         if task is None:
@@ -595,7 +933,7 @@ def cleanup_confirmed_attempt_files(
     """Clean only the exact attempt whose execution and attempt both carry stop confirmation."""
     with factory() as session:
         row = session.execute(
-            select(Video.owner_id, Video.id, Video.status)
+            select(Video.owner_id, Video.id, Video.status, Video.media_status)
             .join(AnalysisTask, AnalysisTask.video_id == Video.id)
             .join(AnalysisAttempt, AnalysisAttempt.task_id == AnalysisTask.id)
             .where(AnalysisAttempt.id == attempt_id)
@@ -605,11 +943,13 @@ def cleanup_confirmed_attempt_files(
         session.commit()
     if row is None or not eligible:
         return False
-    owner_id, video_id, video_status = row
+    owner_id, video_id, video_status, media_status = row
     if video_status == "ready":
-        deletion_mode = False
+        if media_status in {"deletion_pending", "cleanup_failed", "deleted"}:
+            return _resume_media_cleanup(factory, store, video_id, owner_id=owner_id)
+        cleanup_mode: Literal["normal", "media", "whole"] = "normal"
     elif video_status in {"deleting", "cleanup_failed"}:
-        deletion_mode = True
+        cleanup_mode = "whole"
     else:
         return False
     return _remove_attempt_files(
@@ -618,7 +958,7 @@ def cleanup_confirmed_attempt_files(
         owner_id,
         video_id,
         attempt_id,
-        deletion_mode=deletion_mode,
+        cleanup_mode=cleanup_mode,
     )
 
 
@@ -641,6 +981,25 @@ def _set_video_cleanup_failure(
             intent.attempts += 1
 
 
+def _set_media_cleanup_failure(
+    factory: sessionmaker[Session], video_id: uuid.UUID, upload_id: uuid.UUID, code: str
+) -> None:
+    with db_transaction(factory) as session:
+        video = session.scalar(select(Video).where(Video.id == video_id).with_for_update())
+        intent = session.scalar(
+            select(CleanupIntent)
+            .where(CleanupIntent.upload_id == upload_id, CleanupIntent.kind == "media")
+            .with_for_update()
+        )
+        if video is not None and video.media_status != "deleted":
+            video.media_status = "cleanup_failed"
+            video.media_error_code = code
+        if intent is not None:
+            intent.state = "cleanup_failed"
+            intent.error_code = code
+            intent.attempts += 1
+
+
 def retry_attempt_cleanup(
     factory: sessionmaker[Session],
     store: MediaStore,
@@ -657,6 +1016,11 @@ def retry_attempt_cleanup(
                 status_code=409,
                 detail={"code": "VIDEO_DELETION_IN_PROGRESS", "recovery_eligible": False},
             )
+        if video.media_status != "available":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "VIDEO_MEDIA_UNAVAILABLE", "recovery_eligible": False},
+            )
         task = session.scalar(
             select(AnalysisTask).where(
                 AnalysisTask.id == video.current_analysis_task_id,
@@ -672,7 +1036,7 @@ def retry_attempt_cleanup(
                 status_code=409,
                 detail={"code": "STOP_CONFIRMATION_REQUIRED", "cleanup_eligible": False},
             )
-    cleaned = _remove_attempt_files(factory, store, owner_id, video_id, attempt_id, deletion_mode=False)
+    cleaned = _remove_attempt_files(factory, store, owner_id, video_id, attempt_id, cleanup_mode="normal")
     if not cleaned:
         with factory() as session:
             attempt = session.get(AnalysisAttempt, attempt_id)
@@ -703,22 +1067,25 @@ def recover_confirmed_attempt_cleanup(factory: sessionmaker[Session], store: Med
     for task_id, attempt_id in candidates:
         with factory() as session:
             row = session.execute(
-                select(Video.owner_id, Video.id)
+                select(Video.owner_id, Video.id, Video.media_status)
                 .join(AnalysisTask, AnalysisTask.video_id == Video.id)
                 .where(AnalysisTask.id == task_id)
             ).first()
             attempt = session.get(AnalysisAttempt, attempt_id)
             if row is None or attempt is None or not _attempt_stop_is_confirmed(session, attempt):
                 continue
-            owner_id, video_id = row
+            owner_id, video_id, media_status = row
         try:
-            _remove_attempt_files(
-                factory,
-                store,
-                owner_id,
-                video_id,
-                attempt_id,
-                deletion_mode=False,
-            )
+            if media_status in {"deletion_pending", "cleanup_failed", "deleted"}:
+                _resume_media_cleanup(factory, store, video_id, owner_id=owner_id)
+            else:
+                _remove_attempt_files(
+                    factory,
+                    store,
+                    owner_id,
+                    video_id,
+                    attempt_id,
+                    cleanup_mode="normal",
+                )
         except Exception:
             logger.warning("attempt_cleanup_recovery_pending attempt_id=%s", attempt_id.hex)

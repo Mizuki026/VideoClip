@@ -115,6 +115,7 @@ describe('published result cleanup separation', () => {
       if (path === '/api/videos/video-id') return jsonResponse({
         id: 'video-id', display_name: 'fixture-video.mp4', byte_count: 1024, content_sha256: 'media-hash',
         duration_seconds: 30, media_info: {}, status: 'ready', deletion_error: null,
+        media_status: 'available', media_error_code: null,
         created_at: '2026-10-02T00:00:00Z', analysis_task_exists: true, analysis_task_id: 'task-id',
       });
       if (path === '/api/videos/video-id/tasks/task-id') return jsonResponse({

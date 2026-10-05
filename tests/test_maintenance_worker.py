@@ -109,7 +109,9 @@ def test_delivery_scan_has_an_independent_expiring_lock_and_database_guard(
     policy = maintenance_worker.DeliveryPolicy()
     locked = FakeConnection(acquired=False)
     skipped = maintenance_worker._coordinate_with_database_lock(
-        None, locked, policy  # type: ignore[arg-type]
+        None,
+        locked,
+        policy,  # type: ignore[arg-type]
     )
     assert skipped == {
         "status": "overlap_skipped",
@@ -124,7 +126,9 @@ def test_delivery_scan_has_an_independent_expiring_lock_and_database_guard(
 
     acquired = FakeConnection(acquired=True)
     completed = maintenance_worker._coordinate_with_database_lock(
-        None, acquired, policy  # type: ignore[arg-type]
+        None,
+        acquired,
+        policy,  # type: ignore[arg-type]
     )
     assert completed == {
         "status": "completed",
@@ -153,20 +157,28 @@ def test_database_lock_skips_overlap_and_releases_after_business_scan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[int] = []
+    media_calls: list[int] = []
 
     def reclaim(_factory: Any, _store: Any, *, limit: int) -> int:
         calls.append(limit)
         return 3
 
+    def recover_media(_factory: Any, _store: Any, *, limit: int) -> int:
+        media_calls.append(limit)
+        return 2
+
     monkeypatch.setattr(maintenance_worker, "reclaim_expired_uploads", reclaim)
+    monkeypatch.setattr(maintenance_worker, "recover_pending_media_deletions", recover_media)
     locked = FakeConnection(acquired=False)
     skipped = maintenance_worker._reclaim_with_database_lock(None, None, locked, 4)  # type: ignore[arg-type]
     assert skipped == {"status": "overlap_skipped", "reclaimed": 0}
     assert calls == []
+    assert media_calls == []
     assert "pg_advisory_unlock" not in " ".join(locked.statements)
 
     acquired = FakeConnection(acquired=True)
     result = maintenance_worker._reclaim_with_database_lock(None, None, acquired, 4)  # type: ignore[arg-type]
-    assert result == {"status": "completed", "reclaimed": 3}
+    assert result == {"status": "completed", "reclaimed": 3, "media_deleted": 2}
     assert calls == [4]
+    assert media_calls == [4]
     assert "pg_advisory_unlock" in " ".join(acquired.statements)

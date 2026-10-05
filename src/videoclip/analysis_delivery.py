@@ -104,6 +104,7 @@ def _locked_delivery_rows(
 def _is_current_unclaimed(video: Video, task: AnalysisTask, attempt: AnalysisAttempt) -> bool:
     return bool(
         video.status == "ready"
+        and video.media_status == "available"
         and video.current_analysis_task_id == task.id
         and task.video_id == video.id
         and task.status == "queued"

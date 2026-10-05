@@ -193,6 +193,20 @@ def create_followup_attempt(
                 raise HTTPException(status_code=404, detail="analysis task not found")
             return FollowupResult(RecoverySubmission(task_id, parent_attempt_id, False), False, "not_found")
 
+        if (
+            video.status != "ready"
+            or video.media_status != "available"
+            or video.current_analysis_task_id != task.id
+        ):
+            if mode.startswith("manual"):
+                code = (
+                    "VIDEO_MEDIA_UNAVAILABLE"
+                    if video.media_status != "available"
+                    else "VIDEO_DELETION_IN_PROGRESS"
+                )
+                raise _blocked(code, summary=mode == "manual_summary")
+            return FollowupResult(RecoverySubmission(task.id, parent.id, False), False, "video_unavailable")
+
         existing_child = session.scalar(
             select(AnalysisAttempt).where(AnalysisAttempt.parent_attempt_id == parent.id)
         )
@@ -216,10 +230,6 @@ def create_followup_attempt(
                 "existing_child",
             )
 
-        if video.status != "ready" or video.current_analysis_task_id != task.id:
-            if mode.startswith("manual"):
-                raise _blocked("VIDEO_DELETION_IN_PROGRESS", summary=mode == "manual_summary")
-            return FollowupResult(RecoverySubmission(task.id, parent.id, False), False, "video_unavailable")
         if task.current_attempt_id != parent.id:
             if mode.startswith("manual"):
                 raise _blocked("ATTEMPT_NOT_CURRENT", summary=mode == "manual_summary")

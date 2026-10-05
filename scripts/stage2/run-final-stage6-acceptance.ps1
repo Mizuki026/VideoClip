@@ -1,0 +1,283 @@
+param(
+    [switch]$SkipFullBackendTests
+)
+
+$ErrorActionPreference = 'Stop'
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$composeFile = Join-Path $repoRoot 'compose.yaml'
+$overrideFile = Join-Path $PSScriptRoot 'final-stage6-acceptance.override.yaml'
+$fixtureFile = Join-Path $PSScriptRoot 'final-stage6-browser-fixture.py'
+$processFixtureFile = Join-Path $PSScriptRoot 'final-stage6-process-acceptance.py'
+$python = Join-Path $repoRoot 'data\mvp-stage-2\.venv\Scripts\python.exe'
+$runId = ((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ') + '-' + [Guid]::NewGuid().ToString('N').Substring(0, 8)).ToLowerInvariant()
+$project = "videoclip-mvp-stage6-$runId"
+$acceptanceRoot = Join-Path $repoRoot 'data\mvp-stage-6\acceptance'
+$runRoot = Join-Path $acceptanceRoot $runId
+$appRoot = Join-Path $runRoot 'app'
+$secretRoot = Join-Path $runRoot 'secrets'
+$environmentFile = Join-Path $runRoot '.env'
+$outputDir = Join-Path $runRoot 'output'
+$succeeded = $false
+$composeStarted = $false
+
+function New-RandomHex([int]$ByteCount) {
+    $bytes = [System.Security.Cryptography.RandomNumberGenerator]::GetBytes($ByteCount)
+    try { return [Convert]::ToHexString($bytes).ToLowerInvariant() }
+    finally { [Array]::Clear($bytes, 0, $bytes.Length) }
+}
+
+function Get-FreeTcpPort {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    try { $listener.Start(); return [int]$listener.LocalEndpoint.Port }
+    finally { $listener.Stop() }
+}
+
+if (-not (Test-Path -LiteralPath $python)) { throw 'Stage 6 acceptance requires data/mvp-stage-2/.venv.' }
+if (-not (Test-Path -LiteralPath (Join-Path $repoRoot 'frontend\node_modules'))) { throw 'Install frontend dependencies before Stage 6 browser acceptance.' }
+if (Test-Path -LiteralPath $runRoot) { throw 'Refusing to reuse a Stage 6 acceptance directory.' }
+$resolvedDataRoot = [System.IO.Path]::GetFullPath((Join-Path $repoRoot 'data\mvp-stage-6')).TrimEnd('\') + '\'
+$resolvedRunRoot = [System.IO.Path]::GetFullPath($runRoot)
+if (-not $resolvedRunRoot.StartsWith($resolvedDataRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw 'Computed Stage 6 data path is outside data/mvp-stage-6.'
+}
+
+$oldNames = @(
+    'APP_ENV', 'APP_ORIGIN', 'APP_SECRET_KEY', 'APP_DATA_ROOT', 'COOKIE_SECURE', 'COOKIE_SAMESITE',
+    'DB_HOST', 'DB_PORT', 'DB_NAME', 'DB_USER', 'DB_PASSWORD_FILE', 'FFPROBE_PATH', 'FFMPEG_PATH',
+    'CELERY_BROKER_URL', 'VIDEOCLIP_TEST_DB_NAME', 'VIDEOCLIP_TEST_DATA_DIR', 'PYTHONPATH',
+    'MVP_STAGE6_USERNAME', 'MVP_STAGE6_PASSWORD', 'MVP_STAGE6_VIDEO_ID', 'VIDEOCLIP_WEB_PORT',
+    'VIDEOCLIP_API_TARGET', 'VIDEOCLIP_STAGE6_COMPOSE_ARGS', 'MVP_PLAYWRIGHT_OUTPUT_DIR', 'MVP_WEB_MODE',
+    'MVP_STAGE1_DATA_DIR', 'MVP_STAGE1_ENV_FILE'
+)
+$savedEnvironment = @{}
+foreach ($name in $oldNames) {
+    $entry = Get-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+    $savedEnvironment[$name] = if ($null -eq $entry) { $null } else { $entry.Value }
+}
+
+New-Item -ItemType Directory -Path (Join-Path $runRoot 'postgres') -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $runRoot 'redis') -Force | Out-Null
+New-Item -ItemType Directory -Path $appRoot -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $appRoot 'stage6-stub') -Force | Out-Null
+New-Item -ItemType Directory -Path $secretRoot -Force | Out-Null
+New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+
+$databasePassword = New-RandomHex 32
+$appSecret = New-RandomHex 48
+$browserPassword = "Stage6-$(New-RandomHex 16)!"
+$browserUsername = "stage6-$(New-RandomHex 6)"
+$passwordFile = Join-Path $secretRoot 'postgres_password'
+[System.IO.File]::WriteAllText($passwordFile, $databasePassword, [System.Text.UTF8Encoding]::new($false))
+$stageData = $runRoot.Replace('\', '/')
+$pgPort = Get-FreeTcpPort
+$apiPort = Get-FreeTcpPort
+$webPort = Get-FreeTcpPort
+$databaseName = 'videoclip_mvp_stage6_acceptance'
+$dbUser = 'videoclip_stage6'
+$testDbName = 'videoclip_mvp_final_stage6_test'
+$settings = @(
+    'APP_ENV=test',
+    "APP_ORIGIN=http://127.0.0.1:$webPort",
+    "APP_SECRET_KEY=$appSecret",
+    'APP_DATA_ROOT=/appdata',
+    'COOKIE_SECURE=false',
+    'COOKIE_SAMESITE=lax',
+    "DB_HOST=postgres",
+    'DB_PORT=5432',
+    "DB_NAME=$databaseName",
+    "DB_USER=$dbUser",
+    'DB_PASSWORD_FILE=/run/secrets/postgres_password',
+    'FFPROBE_PATH=/usr/bin/ffprobe',
+    'FFMPEG_PATH=/usr/bin/ffmpeg',
+    "POSTGRES_DB=$databaseName",
+    "POSTGRES_USER=$dbUser",
+    "MVP_STAGE6_DATA_DIR=$stageData",
+    "MVP_STAGE6_ENV_FILE=$($environmentFile.Replace('\', '/'))",
+    "MVP_STAGE1_DATA_DIR=$stageData",
+    "MVP_STAGE1_ENV_FILE=$($environmentFile.Replace('\', '/'))",
+    "MVP_STAGE1_PG_PORT=$pgPort",
+    "MVP_STAGE1_API_PORT=$apiPort",
+    'MVP_IMAGE_NAME=videoclip-mvp-stage6-api:acceptance',
+    'CELERY_BROKER_URL=redis://redis:6379/0',
+    'UPLOAD_RECLAIM_BATCH_SIZE=4',
+    'UPLOAD_RECLAIM_INTERVAL_SECONDS=3600',
+    'ANALYSIS_DELIVERY_RETRY_LIMIT=8',
+    'ANALYSIS_DELIVERY_DEADLINE_SECONDS=86400',
+    'ANALYSIS_DELIVERY_SCAN_LIMIT=4',
+    'ANALYSIS_DELIVERY_INTERVAL_SECONDS=60',
+    'ANALYSIS_DELIVERY_OPERATION_TIMEOUT_SECONDS=60',
+    'ANALYSIS_DELIVERY_BACKOFF_BASE_SECONDS=60',
+    'ANALYSIS_DELIVERY_BACKOFF_MAX_SECONDS=900',
+    'MODEL_COOLDOWN_BACKOFF_BASE_SECONDS=60',
+    'MODEL_COOLDOWN_BACKOFF_MAX_SECONDS=900',
+    'MODEL_WAIT_SINGLE_LIMIT_SECONDS=86400',
+    'MODEL_WAIT_TOTAL_LIMIT_SECONDS=259200',
+    'SILICONFLOW_ACCOUNT_REFERENCE=stage6-local-substitute',
+    'SILICONFLOW_API_KEY=stage6-local-substitute-only',
+    'SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1',
+    'SILICONFLOW_ASR_MODEL=FunAudioLLM/SenseVoiceSmall',
+    'SILICONFLOW_LLM_MODEL=Qwen/Qwen3.5-4B',
+    'ASR_SECRET_REFERENCE=environment:SILICONFLOW_API_KEY',
+    'ASR_REQUEST_PARAMETERS={}',
+    'PROMPT_VERSION=stage0-summary-v5',
+    'SUMMARY_SCHEMA_VERSION=summary-v1',
+    'LLM_CONTEXT_TOKENS=256000',
+    'LLM_MAX_OUTPUT_TOKENS=8192',
+    'LLM_TEMPERATURE=0.2',
+    'LLM_ENABLE_THINKING=false',
+    'HTTP_TOTAL_TIMEOUT_SECONDS=120',
+    'HTTP_CONNECT_TIMEOUT_SECONDS=1',
+    'HTTP_READ_TIMEOUT_SECONDS=120',
+    'LLM_HTTP_TOTAL_TIMEOUT_SECONDS=3',
+    'LLM_HTTP_CONNECT_TIMEOUT_SECONDS=1',
+    'LLM_HTTP_READ_TIMEOUT_SECONDS=2',
+    'LLM_HTTP_WRITE_TIMEOUT_SECONDS=1',
+    'LLM_HTTP_POOL_TIMEOUT_SECONDS=1',
+    'SEGMENT_SECONDS=30',
+    'AUDIO_SAMPLE_RATE=16000',
+    'AUDIO_CHANNELS=1',
+    'AUDIO_SAMPLE_FORMAT=s16le'
+)
+[System.IO.File]::WriteAllText($environmentFile, ($settings -join "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
+$compose = @('compose', '--env-file', $environmentFile, '-p', $project, '-f', $composeFile, '-f', $overrideFile)
+$composeBaseJson = ConvertTo-Json -InputObject $compose -Compress
+$composeBaseJson | Out-Null
+
+Push-Location $repoRoot
+try {
+    & docker @compose config --quiet
+    if ($LASTEXITCODE -ne 0) { throw 'Stage 6 Compose configuration validation failed.' }
+    & docker @compose build api worker maintenance-worker beat
+    if ($LASTEXITCODE -ne 0) { throw "Isolated Stage 6 image build failed: $LASTEXITCODE" }
+
+    $certificateCommand = @'
+set -eu
+mkdir -p /appdata/stage6-stub
+cd /appdata/stage6-stub
+openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 2 -subj '/CN=Stage6 Acceptance CA' -addext 'basicConstraints=critical,CA:TRUE' -addext 'keyUsage=critical,keyCertSign,cRLSign' -addext 'subjectKeyIdentifier=hash' -keyout acceptance-ca.key -out acceptance-ca.crt
+openssl req -newkey rsa:2048 -nodes -sha256 -subj '/CN=api.siliconflow.cn' -keyout server.key -out server.csr
+printf 'subjectAltName=DNS:api.siliconflow.cn\nextendedKeyUsage=serverAuth\n' > server.ext
+openssl x509 -req -sha256 -days 2 -in server.csr -CA acceptance-ca.crt -CAkey acceptance-ca.key -CAcreateserial -extfile server.ext -out server.crt
+cat server.crt acceptance-ca.crt > server-chain.pem
+'@
+    & docker @compose run --rm --no-deps --entrypoint sh -T api -ec $certificateCommand
+    if ($LASTEXITCODE -ne 0) { throw 'Could not create the isolated Stage 6 local substitute certificate.' }
+    $composeStarted = $true
+    & docker @compose up -d postgres redis model-stub
+    if ($LASTEXITCODE -ne 0) { throw 'Isolated Stage 6 database, queue or model substitute did not start.' }
+
+    $dependencyDeadline = [DateTime]::UtcNow.AddMinutes(5)
+    do {
+        $healthy = $true
+        foreach ($service in @('postgres', 'redis', 'model-stub')) {
+            $containerId = (& docker @compose ps -q $service).Trim()
+            if (-not $containerId) { throw "Stage 6 dependency is missing: $service" }
+            $state = (& docker inspect --format '{{.State.Health.Status}}' $containerId).Trim()
+            $healthy = $healthy -and $state -eq 'healthy'
+        }
+        if ($healthy) { break }
+        if ([DateTime]::UtcNow -ge $dependencyDeadline) { throw 'Timed out waiting for isolated Stage 6 dependencies.' }
+        Start-Sleep -Seconds 2
+    } while ($true)
+
+    & docker @compose run --rm api alembic upgrade head
+    if ($LASTEXITCODE -ne 0) { throw 'Isolated Stage 6 database migration failed.' }
+    & docker @compose exec -T postgres createdb -U $dbUser $testDbName
+    if ($LASTEXITCODE -ne 0) { throw 'Could not create the dedicated Stage 6 test database.' }
+
+    $env:APP_ENV = 'test'
+    $env:APP_ORIGIN = 'http://127.0.0.1:58001'
+    $env:APP_SECRET_KEY = $appSecret
+    $env:APP_DATA_ROOT = Join-Path $runRoot 'test-data\app'
+    $env:COOKIE_SAMESITE = 'lax'
+    $env:DB_HOST = '127.0.0.1'
+    $env:DB_PORT = "$pgPort"
+    $env:DB_NAME = $testDbName
+    $env:DB_USER = $dbUser
+    $env:DB_PASSWORD_FILE = $passwordFile
+    $env:FFPROBE_PATH = 'C:\Program Files\ffmpeg\bin\ffprobe.exe'
+    $env:FFMPEG_PATH = 'C:\Program Files\ffmpeg\bin\ffmpeg.exe'
+    $env:CELERY_BROKER_URL = 'redis://127.0.0.1:6379/0'
+    $env:VIDEOCLIP_TEST_DB_NAME = $testDbName
+    $env:VIDEOCLIP_TEST_DATA_DIR = Join-Path $runRoot 'test-data'
+    $env:PYTHONPATH = 'src'
+    $env:MVP_STAGE6_USERNAME = $browserUsername
+    $env:MVP_STAGE6_PASSWORD = $browserPassword
+    $env:VIDEOCLIP_STAGE6_USERNAME = $browserUsername
+    $env:VIDEOCLIP_STAGE6_PASSWORD = $browserPassword
+
+    & $python -m ruff check src tests migrations scripts/stage2/final-stage6-browser-fixture.py scripts/stage2/final-stage6-process-acceptance.py
+    if ($LASTEXITCODE -ne 0) { throw 'Ruff validation failed.' }
+    & $python -m mypy
+    if ($LASTEXITCODE -ne 0) { throw 'Mypy validation failed.' }
+    & $python -m pip check
+    if ($LASTEXITCODE -ne 0) { throw 'Python dependency validation failed.' }
+    & $python -m pytest -q tests/test_media_deletion.py *>&1 | Tee-Object -FilePath (Join-Path $outputDir 'pytest-direct.log')
+    if ($LASTEXITCODE -ne 0) { throw 'Direct Stage 6 backend tests failed.' }
+    & $python -m pytest -q tests/test_analysis.py::test_delete_winning_summary_race_blocks_publication_and_later_requests *>&1 | Tee-Object -FilePath (Join-Path $outputDir 'pytest-late-result.log')
+    if ($LASTEXITCODE -ne 0) { throw 'Late summary response race regression failed.' }
+
+    if (-not $SkipFullBackendTests) {
+        & $python -m pytest -q *>&1 | Tee-Object -FilePath (Join-Path $outputDir 'pytest-full.log')
+        if ($LASTEXITCODE -ne 0) { throw 'Full backend regression suite failed.' }
+    }
+
+    & docker @compose up -d api
+    if ($LASTEXITCODE -ne 0) { throw 'Isolated Stage 6 API did not start.' }
+    $apiDeadline = [DateTime]::UtcNow.AddMinutes(3)
+    do {
+        try {
+            $health = Invoke-RestMethod -Uri "http://127.0.0.1:$apiPort/health" -TimeoutSec 3
+            if ($health.status -eq 'ok') { break }
+        } catch { }
+        if ([DateTime]::UtcNow -ge $apiDeadline) { throw 'Isolated Stage 6 API health check timed out.' }
+        Start-Sleep -Seconds 2
+    } while ($true)
+
+    $apiContainerId = (& docker @compose ps -q api).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $apiContainerId) { throw 'Could not identify the isolated Stage 6 API container.' }
+    $apiContainerIdentity = (& docker inspect --format '{{.Id}}' $apiContainerId).Trim()
+    if ($LASTEXITCODE -ne 0 -or $apiContainerIdentity -notmatch '^[0-9a-f]{64}$') { throw 'Could not verify the isolated API container identity.' }
+    & docker cp $processFixtureFile "$($apiContainerId):/tmp/final-stage6-process-acceptance.py"
+    if ($LASTEXITCODE -ne 0) { throw 'Could not copy the Stage 6 process acceptance helper into its isolated container.' }
+    & docker @compose exec -T -e "VIDEOCLIP_STAGE6_CONTAINER_ID=$apiContainerIdentity" api python /tmp/final-stage6-process-acceptance.py
+    if ($LASTEXITCODE -ne 0) { throw 'Real controlled-process media-deletion acceptance failed.' }
+
+    $env:DB_NAME = $databaseName
+    $env:APP_DATA_ROOT = Join-Path $runRoot 'app'
+    $videoId = (& $python $fixtureFile).Trim()
+    if ($videoId -notmatch '^[0-9a-fA-F-]{36}$') { throw 'Synthetic Stage 6 browser fixture did not return a video id.' }
+    $env:VIDEOCLIP_STAGE6_VIDEO_ID = $videoId
+    $env:VIDEOCLIP_STAGE6_COMPOSE_ARGS = $composeBaseJson
+    $env:VIDEOCLIP_WEB_PORT = "$webPort"
+    $env:VIDEOCLIP_API_TARGET = "http://127.0.0.1:$apiPort"
+    $env:MVP_WEB_MODE = 'dev'
+    $browserRunDir = Join-Path $outputDir ("playwright-" + [Guid]::NewGuid().ToString('N'))
+    $env:MVP_PLAYWRIGHT_OUTPUT_DIR = $browserRunDir
+    Push-Location (Join-Path $repoRoot 'frontend')
+    try {
+        & npm run e2e -- --config=playwright.config.ts stage6-media-deletion.spec.ts *>&1 | Tee-Object -FilePath (Join-Path $outputDir 'playwright-stage6.log')
+        if ($LASTEXITCODE -ne 0) { throw 'Stage 6 real-browser acceptance failed.' }
+    } finally {
+        Pop-Location
+    }
+
+    $succeeded = $true
+    Write-Output "Stage 6 isolated acceptance passed. Evidence: $outputDir"
+    Write-Output "Stage 6 isolated project: $project (data preserved under $runRoot)"
+}
+finally {
+    Pop-Location
+    foreach ($name in $oldNames) {
+        if ($null -eq $savedEnvironment[$name]) {
+            Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+        } else {
+            Set-Item -Path "Env:$name" -Value $savedEnvironment[$name]
+        }
+    }
+    if ($composeStarted) {
+        & docker @compose down 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Warning "Could not remove only the isolated Stage 6 containers and network for $project." }
+    }
+    if (-not $succeeded) { Write-Warning "Stage 6 isolated data and logs were preserved for inspection: $runRoot" }
+}

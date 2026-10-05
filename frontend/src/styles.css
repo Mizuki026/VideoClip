@@ -161,6 +161,18 @@ button:focus-visible, a:focus-visible, input:focus-visible, label:focus-visible,
 .video-meta { display: flex; align-items: center; gap: 9px; color: #8b9790; font-family: ui-monospace, Consolas, monospace; font-size: 9px; }
 .meta-divider { width: 3px; height: 3px; border-radius: 50%; background: #c1c9c3; }
 .video-card-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 13px; padding-top: 10px; border-top: 1px solid #f0f2ef; }
+.video-delete-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 8px 12px; }
+.video-delete-actions .text-button { font-size: 9px; }
+.detail-delete-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.media-deletion-banner { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin: -8px 0 20px; padding: 14px 16px; border: 1px solid #d8e8df; border-radius: 12px; color: #426b54; background: #f5faf6; }
+.media-deletion-banner strong { font-size: 12px; }
+.media-deletion-banner p { margin: 5px 0 0; font-size: 11px; line-height: 1.6; }
+.media-deletion-banner small { display: inline-block; margin-top: 5px; color: #7b8b81; font-size: 9px; }
+.media-deletion-failed { border-color: #eedcbf; color: #84602e; background: #fffbf3; }
+.media-removed-panel { display: grid; min-height: 220px; place-content: center; padding: 24px; text-align: center; background: #f6f8f5; }
+.media-removed-panel strong { color: #53645a; font-size: 14px; }
+.media-removed-panel p { max-width: 360px; margin: 8px auto 0; color: #839087; font-size: 11px; line-height: 1.7; }
+.transcript-time-static { cursor: default; }
 .deletion-inline { color: #a16f31; font-size: 9px; }
 .video-card-deleting { opacity: .72; }
 .empty-state { display: flex; flex-direction: column; align-items: center; padding: 58px 20px; border: 1px dashed #dce4de; border-radius: 14px; color: #809087; background: rgba(255, 255, 255, .46); text-align: center; }
@@ -303,9 +315,12 @@ button:focus-visible, a:focus-visible, input:focus-visible, label:focus-visible,
   .video-title { font-size: 12px; }
   .video-meta { font-size: 8px; }
   .video-card-actions { align-items: flex-start; flex-direction: column; gap: 7px; }
+  .video-delete-actions { justify-content: flex-start; }
   .site-footer { font-size: 8px; }
   .detail-main { padding-top: 20px; }
   .detail-heading { align-items: flex-start; flex-direction: column; }
+  .detail-delete-actions { justify-content: flex-start; }
+  .media-deletion-banner { align-items: flex-start; flex-direction: column; }
   .detail-heading h1 { margin-top: 6px; }
   .detail-heading p { font-size: 9px; }
   .detail-grid { grid-template-columns: 1fr; }

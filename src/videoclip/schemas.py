@@ -39,6 +39,8 @@ class VideoSummary(BaseModel):
     media_info: dict[str, Any]
     status: str
     deletion_error: str | None
+    media_status: str
+    media_error_code: str | None
     created_at: datetime
 
 
@@ -123,6 +125,7 @@ class AnalysisTaskResponse(BaseModel):
     id: UUID
     video_id: UUID
     current_attempt_id: UUID
+    notes_attempt_id: UUID | None
     status: str
     stage: str
     delivery_status: str
@@ -211,6 +214,14 @@ class CleanupResponse(BaseModel):
 class VideoDeletionProgress(BaseModel):
     video_id: UUID
     state: str
+    error_code: str | None
+    pending_attempt_ids: list[UUID]
+    stop_confirmation_required: bool
+
+
+class VideoMediaDeletionProgress(BaseModel):
+    video_id: UUID
+    media_status: str
     error_code: str | None
     pending_attempt_ids: list[UUID]
     stop_confirmation_required: bool

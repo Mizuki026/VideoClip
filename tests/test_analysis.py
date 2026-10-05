@@ -9,6 +9,7 @@ import time
 import uuid
 import wave
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -73,7 +74,7 @@ from videoclip.models import (
 )
 from videoclip.recovery_rules import checkpoint_matches, evaluate_recovery
 from videoclip.schemas import AnalysisTaskResponse
-from videoclip.services import delete_video
+from videoclip.services import delete_video, delete_video_media
 from videoclip.settings import Settings
 from videoclip.stop_confirmation import (
     PROCESS_SCOPE,
@@ -1469,6 +1470,8 @@ def test_local_process_timeout_stops_and_reaps_the_child_group(
 
     monkeypatch.setattr(subprocess, "Popen", capture_process)
     monkeypatch.setattr(worker, "_progress_check", lambda *_args: None)
+    monkeypatch.setattr(worker, "db_transaction", lambda _maker: nullcontext(None))
+    monkeypatch.setattr(worker, "_lock_execution_rows", lambda *_args: None)
     with pytest.raises(AnalysisFailure, match="LOCAL_PROCESS_TIMEOUT"):
         _run_process(
             [sys.executable, "-c", "import time; time.sleep(30)"],
@@ -2001,6 +2004,7 @@ def test_stopped_attempt_cleanup_preserves_transcript_and_video(
             task_row.status = "awaiting_summary"
             task_row.stage = "awaiting_summary"
             attempt.status = "awaiting_summary"
+            attempt.manifest_fingerprint = "c" * 64
             attempt.stop_confirmed_at = stopped_at
             execution.stop_confirmed_at = stopped_at
             session.add(
@@ -3024,7 +3028,9 @@ def test_publish_database_failure_is_not_visible_and_recovery_reuses_transcript(
         assert client.get(f"/videos/{video_id}/summary").status_code == 200
 
 
+@pytest.mark.parametrize("deletion_kind", ["whole_record", "media_only"])
 def test_delete_winning_summary_race_blocks_publication_and_later_requests(
+    deletion_kind: str,
     test_settings: Settings,
     test_engine: Any,
     session_factory: sessionmaker[Session],
@@ -3084,7 +3090,10 @@ def test_delete_winning_summary_race_blocks_publication_and_later_requests(
         with ThreadPoolExecutor(max_workers=1) as pool:
             worker = pool.submit(transcribe_analysis, str(task_id), str(child_id))
             assert started.wait(timeout=10)
-            assert delete_video(session_factory, store, owner_id, video_id) == 202
+            if deletion_kind == "media_only":
+                assert delete_video_media(session_factory, store, owner_id, video_id) is False
+            else:
+                assert delete_video(session_factory, store, owner_id, video_id) == 202
             release.set()
             assert worker.result(timeout=15) == {"status": "failed"}
 
@@ -3098,7 +3107,25 @@ def test_delete_winning_summary_race_blocks_publication_and_later_requests(
             assert request is not None and request.status == "failed"
             assert attempt is not None and attempt.stop_confirmed_at is not None
             assert attempt.execution_mode == "summary_only"
-        assert delete_video(session_factory, store, owner_id, video_id) == 204
+            video = session.get(Video, video_id)
+            if deletion_kind == "media_only":
+                assert video is not None and video.status == "ready"
+                assert video.media_status == "deletion_pending"
+            else:
+                assert video is not None and video.status in {"deleting", "cleanup_failed"}
+        if deletion_kind == "media_only":
+            retried = client.post(
+                f"/videos/{video_id}/media-deletion/retry",
+                headers=headers,
+            )
+            assert retried.status_code == 200
+            assert retried.json()["media_status"] == "deleted"
+            assert client.get(f"/videos/{video_id}/transcript").status_code == 200
+            assert client.get(f"/videos/{video_id}/summary").status_code == 409
+            assert client.get(f"/videos/{video_id}/content").status_code == 410
+            assert client.delete(f"/videos/{video_id}", headers=headers).status_code == 204
+        else:
+            assert delete_video(session_factory, store, owner_id, video_id) == 204
         assert child_id != parent_id
 
 

@@ -4,11 +4,14 @@ import {
   getCsrfToken,
   getCurrentUser,
   getDeletionProgress,
+  getMediaDeletionProgress,
   getSummary,
   getTask,
   getTranscript,
   getVideo,
   listVideos,
+  deleteVideoMedia,
+  retryVideoMediaDeletion,
   request,
   requestResult,
 } from './api';
@@ -33,6 +36,7 @@ import {
 import type {
   AnalysisTask,
   DeletionProgress,
+  MediaDeletionProgress,
   Summary,
   SummaryItem,
   Transcript,
@@ -420,6 +424,7 @@ function VideoLibrary({ csrf, userId, onExpired, username, onLogout }: { csrf: s
   const [busyVideoId, setBusyVideoId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deletion, setDeletion] = useState<DeletionProgress | null>(null);
+  const [mediaProgress, setMediaProgress] = useState<Record<string, MediaDeletionProgress>>({});
   const [feedback, setFeedback] = useState<string | null>(null);
   const [deletionError, setDeletionError] = useState<string | null>(null);
 
@@ -430,6 +435,11 @@ function VideoLibrary({ csrf, userId, onExpired, username, onLogout }: { csrf: s
       const result = await listVideos();
       setVideos(result.items);
       setDeletingId((current) => current ?? result.items.find((item) => item.status !== 'ready')?.id ?? null);
+      const closedMedia = result.items.filter((item) => item.media_status !== 'available');
+      const progress = await Promise.all(closedMedia.map(async (item) => {
+        try { return await getMediaDeletionProgress(item.id); } catch { return null; }
+      }));
+      setMediaProgress(Object.fromEntries(progress.filter((item): item is MediaDeletionProgress => item !== null).map((item) => [item.video_id, item])));
     } catch (error) {
       if (isSessionExpired(error)) { onExpired(); return; }
       setLoadingError(apiMessage(error));
@@ -439,6 +449,30 @@ function VideoLibrary({ csrf, userId, onExpired, username, onLogout }: { csrf: s
   }, [onExpired]);
 
   useEffect(() => { void refresh(); }, [refresh]);
+
+  useEffect(() => {
+    const poll = async () => {
+      if (document.visibilityState !== 'visible') return;
+      try {
+        const result = await listVideos();
+        setVideos(result.items);
+        setDeletingId((current) => current ?? result.items.find((item) => item.status !== 'ready')?.id ?? null);
+        const closedMedia = result.items.filter((item) => item.media_status !== 'available');
+        const progress = await Promise.all(closedMedia.map(async (item) => {
+          try { return await getMediaDeletionProgress(item.id); } catch { return null; }
+        }));
+        setMediaProgress(Object.fromEntries(progress.filter((item): item is MediaDeletionProgress => item !== null).map((item) => [item.video_id, item])));
+      } catch (error) {
+        if (isSessionExpired(error)) onExpired();
+      }
+    };
+    const timer = window.setInterval(() => void poll(), 4000);
+    document.addEventListener('visibilitychange', poll);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', poll);
+    };
+  }, [onExpired]);
 
   const deletionProgress = useCallback((progress: DeletionProgress) => {
     setDeletion(progress);
@@ -455,6 +489,7 @@ function VideoLibrary({ csrf, userId, onExpired, username, onLogout }: { csrf: s
   useDeletionPolling(deletingId, deletionProgress, deletionComplete, onExpired, setDeletionError);
 
   async function remove(videoId: string) {
+    if (!window.confirm('删除整条记录将移除原视频、转写、章节、知识要点和总结。此操作不可撤销。继续？')) return;
     setBusyVideoId(videoId);
     setFeedback(null);
     setDeletionError(null);
@@ -478,6 +513,37 @@ function VideoLibrary({ csrf, userId, onExpired, username, onLogout }: { csrf: s
     } finally {
       setBusyVideoId(null);
     }
+  }
+
+  async function removeMedia(video: VideoSummary) {
+    if (video.media_status !== 'available') return;
+    if (!window.confirm('仅删除原视频文件，保留视频记录、合法转写、章节、知识要点、引用原文和时间信息。此操作不可撤销，也不能重新分析。继续？')) return;
+    setBusyVideoId(video.id);
+    setFeedback(null);
+    setVideos((items) => items.map((item) => item.id === video.id ? { ...item, media_status: 'deletion_pending' } : item));
+    try {
+      const progress = await deleteVideoMedia(video.id, csrf);
+      setMediaProgress((items) => ({ ...items, [video.id]: progress }));
+      setVideos((items) => items.map((item) => item.id === video.id ? { ...item, media_status: progress.media_status, media_error_code: progress.error_code } : item));
+      setFeedback(progress.media_status === 'deleted' ? '原视频已删除，笔记保留。' : '原视频删除请求已生效；正在完成安全清理，笔记仍可读取。');
+    } catch (error) {
+      if (isSessionExpired(error)) { onExpired(); return; }
+      setFeedback(apiMessage(error));
+      void refresh();
+    } finally { setBusyVideoId(null); }
+  }
+
+  async function retryMedia(videoId: string) {
+    setBusyVideoId(videoId);
+    try {
+      const progress = await retryVideoMediaDeletion(videoId, csrf);
+      setMediaProgress((items) => ({ ...items, [videoId]: progress }));
+      setVideos((items) => items.map((item) => item.id === videoId ? { ...item, media_status: progress.media_status, media_error_code: progress.error_code } : item));
+      setFeedback(progress.media_status === 'deleted' ? '原视频清理完成，笔记仍保留。' : '清理仍在进行，删除意图继续生效。');
+    } catch (error) {
+      if (isSessionExpired(error)) { onExpired(); return; }
+      setFeedback(apiMessage(error));
+    } finally { setBusyVideoId(null); }
   }
 
   return (
@@ -510,7 +576,7 @@ function VideoLibrary({ csrf, userId, onExpired, username, onLogout }: { csrf: s
                   <article className={`video-card${isDeleting ? ' video-card-deleting' : ''}`} key={video.id}>
                     <div className="video-card-art" aria-hidden="true"><span className="play-glyph">▶</span><span className="art-time">{formatDuration(video.duration_seconds)}</span></div>
                     <div className="video-card-body">
-                      <div className="video-card-top"><span className={`status-chip ${isDeleting ? 'status-wait' : 'status-ready'}`}><i />{isDeleting ? '删除处理中' : '可用'}</span><time>{formatDate(video.created_at)}</time></div>
+                      <div className="video-card-top"><span className={`status-chip ${isDeleting || video.media_status === 'deletion_pending' || video.media_status === 'cleanup_failed' ? 'status-wait' : 'status-ready'}`}><i />{isDeleting ? '整条删除处理中' : video.media_status === 'available' ? '原视频可用' : video.media_status === 'deleted' ? '仅保留笔记' : video.media_status === 'cleanup_failed' ? '原视频清理失败' : '原视频清理中'}</span><time>{formatDate(video.created_at)}</time></div>
                       <a className="video-title" href={`/videos/${encodeURIComponent(video.id)}`}>{video.display_name}</a>
                       <div className="video-meta"><span>{formatBytes(video.byte_count)}</span><span className="meta-divider" /> <span>{formatDuration(video.duration_seconds)}</span></div>
                       <div className="video-card-actions">
@@ -518,9 +584,13 @@ function VideoLibrary({ csrf, userId, onExpired, username, onLogout }: { csrf: s
                         {isDeleting ? (
                           <span className="deletion-inline">{deletion?.video_id === video.id && deletion.stop_confirmation_required ? '等待维护确认' : '按后端状态处理中'}</span>
                         ) : (
-                          <button className="text-button text-danger" type="button" disabled={busyVideoId === video.id} onClick={() => void remove(video.id)}>
-                            {busyVideoId === video.id ? '正在删除…' : '删除'}
-                          </button>
+                          <div className="video-delete-actions">
+                            {video.media_status === 'available' ? <button className="text-button" type="button" disabled={busyVideoId === video.id} onClick={() => void removeMedia(video)}>删除原视频，保留笔记</button> : (
+                              <span className="deletion-inline">{mediaProgress[video.id]?.stop_confirmation_required ? '等待停止确认' : video.media_status === 'cleanup_failed' ? '清理失败' : video.media_status === 'deleted' ? '原视频已删除' : '原视频清理中'}</span>
+                            )}
+                            {video.media_status === 'cleanup_failed' && <button className="text-button" type="button" disabled={busyVideoId === video.id} onClick={() => void retryMedia(video.id)}>重试清理</button>}
+                            <button className="text-button text-danger" type="button" disabled={busyVideoId === video.id} onClick={() => void remove(video.id)}>{busyVideoId === video.id ? '正在处理…' : '删除整条记录'}</button>
+                          </div>
                         )}
                       </div>
                     </div>
@@ -628,7 +698,7 @@ function MediaPlayer({ videoId, onMessage, onSeekReady }: {
   );
 }
 
-function EvidenceButton({ item, label }: { item: SummaryItem; label: string }) {
+function EvidenceButton({ item, label, allowSeek }: { item: SummaryItem; label: string; allowSeek: boolean }) {
   const seek = useContext(PlayerSeekContext);
   const evidence = item.evidence[0];
   if (!evidence) return null;
@@ -637,15 +707,15 @@ function EvidenceButton({ item, label }: { item: SummaryItem; label: string }) {
       <blockquote>{evidence.quote}</blockquote>
       <div className="evidence-actions">
         <span className="time-range">{formatDuration(evidence.start_seconds)} – {formatDuration(evidence.end_seconds)}</span>
-        <button className="cite-button" type="button" onClick={() => seek?.(evidence.start_seconds)} aria-label={`回看${label}引用，约 ${formatDuration(evidence.start_seconds)}`}>
+        {allowSeek ? <button className="cite-button" type="button" onClick={() => seek?.(evidence.start_seconds)} aria-label={`回看${label}引用，约 ${formatDuration(evidence.start_seconds)}`}>
           <span aria-hidden="true">▷</span> 回看引用
-        </button>
+        </button> : <span className="muted">原视频不可回看</span>}
       </div>
     </div>
   );
 }
 
-function SummaryContent({ summary }: { summary: Summary }) {
+function SummaryContent({ summary, allowSeek }: { summary: Summary; allowSeek: boolean }) {
   return (
     <div className="summary-content">
       <section className="summary-group" aria-labelledby="chapter-heading">
@@ -654,7 +724,7 @@ function SummaryContent({ summary }: { summary: Summary }) {
           {summary.payload.chapters.map((chapter, index) => (
             <article className="summary-item chapter-item" key={`${index}-${chapter.title ?? ''}`}>
               <span className="item-index">{String(index + 1).padStart(2, '0')}</span>
-              <div className="item-main"><h4>{chapter.title}</h4><EvidenceButton item={chapter} label="章节" /></div>
+              <div className="item-main"><h4>{chapter.title}</h4><EvidenceButton item={chapter} label="章节" allowSeek={allowSeek} /></div>
             </article>
           ))}
         </div>
@@ -665,12 +735,12 @@ function SummaryContent({ summary }: { summary: Summary }) {
           {summary.payload.key_points.map((point, index) => (
             <article className="summary-item keypoint-item" key={`${index}-${point.text ?? ''}`}>
               <span className="keypoint-mark" aria-hidden="true">✳</span>
-              <div className="item-main"><h4>{point.text}</h4><EvidenceButton item={point} label="要点" /></div>
+              <div className="item-main"><h4>{point.text}</h4><EvidenceButton item={point} label="要点" allowSeek={allowSeek} /></div>
             </article>
           ))}
         </div>
       </section>
-      <p className="summary-footnote">引用定位到对应转写片段的时间区间，提供片段级回看，不代表词级时间戳。</p>
+      <p className="summary-footnote">{allowSeek ? '引用定位到对应转写片段的时间区间，提供片段级回看，不代表词级时间戳。' : '原视频已删除；引用原文与时间信息保留，回看入口已关闭。'}</p>
     </div>
   );
 }
@@ -686,8 +756,9 @@ function VideoDetailPage({ videoId, csrf, onExpired, username, onLogout }: { vid
   const [deleting, setDeleting] = useState(false);
   const deletingRef = useRef(false);
   const [deletion, setDeletion] = useState<DeletionProgress | null>(null);
+  const [mediaProgress, setMediaProgress] = useState<MediaDeletionProgress | null>(null);
   const [deletionError, setDeletionError] = useState<string | null>(null);
-  const [busy, setBusy] = useState<'submit' | 'recover' | 'summarize' | 'cleanup' | 'delete' | null>(null);
+  const [busy, setBusy] = useState<'submit' | 'recover' | 'summarize' | 'cleanup' | 'delete' | 'media-delete' | 'media-retry' | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [summaryBlocked, setSummaryBlocked] = useState(false);
   const [playerMessage, setPlayerMessage] = useState<string | null>(null);
@@ -718,6 +789,13 @@ function VideoDetailPage({ videoId, csrf, onExpired, username, onLogout }: { vid
         return;
       }
       setVideo(detail);
+      if (detail.media_status !== 'available') {
+        void getMediaDeletionProgress(videoId).then(setMediaProgress).catch((failure: unknown) => {
+          if (isSessionExpired(failure)) onExpired();
+        });
+      } else {
+        setMediaProgress(null);
+      }
       if (!detail.analysis_task_id) {
         if (detail.analysis_task_exists) throw new ApiError(503, 'ANALYSIS_TASK_ASSOCIATION_MISSING');
         setTask(null);
@@ -754,14 +832,13 @@ function VideoDetailPage({ videoId, csrf, onExpired, username, onLogout }: { vid
   useEffect(() => { void refresh(); }, [refresh]);
 
   useEffect(() => {
-    if (!task || !shouldPollTask(task) || deleting) return undefined;
+    if (deleting) return undefined;
     const poll = () => { if (document.visibilityState === 'visible') void refresh(); };
-    const onVisibility = () => { if (document.visibilityState === 'visible') void refresh(); };
-    const timer = window.setInterval(poll, 2000);
-    document.addEventListener('visibilitychange', onVisibility);
+    const timer = window.setInterval(poll, task && shouldPollTask(task) ? 2000 : 4000);
+    document.addEventListener('visibilitychange', poll);
     return () => {
       window.clearInterval(timer);
-      document.removeEventListener('visibilitychange', onVisibility);
+      document.removeEventListener('visibilitychange', poll);
     };
   }, [deleting, refresh, task]);
 
@@ -818,6 +895,7 @@ function VideoDetailPage({ videoId, csrf, onExpired, username, onLogout }: { vid
 
   async function deleteRecord() {
     if (busy) return;
+    if (!window.confirm('删除整条记录将移除原视频、转写、章节、知识要点和总结。此操作不可撤销。继续？')) return;
     setBusy('delete');
     setActionError(null);
     setPlayerMessage(null);
@@ -837,6 +915,41 @@ function VideoDetailPage({ videoId, csrf, onExpired, username, onLogout }: { vid
         deletingRef.current = false;
         setDeleting(false);
       }
+    } finally { setBusy(null); }
+  }
+
+  async function deleteMedia() {
+    if (busy || !video || video.media_status !== 'available') return;
+    if (!window.confirm('仅删除原视频文件，保留视频记录、合法转写、章节、知识要点、引用原文和时间信息。此操作不可撤销，也不能重新分析。继续？')) return;
+    setBusy('media-delete');
+    setActionError(null);
+    setPlayerMessage(null);
+    playerSeek.current = () => undefined;
+    setVideo((current) => current ? { ...current, media_status: 'deletion_pending' } : current);
+    try {
+      const progress = await deleteVideoMedia(videoId, csrf);
+      setMediaProgress(progress);
+      setVideo((current) => current ? { ...current, media_status: progress.media_status, media_error_code: progress.error_code } : current);
+      setActionError(progress.media_status === 'deleted' ? '原视频已删除，笔记和已发布总结仍保留。' : progress.stop_confirmation_required ? '删除意图已生效，正在等待可信停止确认；笔记仍可读取。' : '删除意图已生效，正在清理文件；笔记仍可读取。');
+    } catch (failure) {
+      if (isSessionExpired(failure)) { onExpired(); return; }
+      setActionError(apiMessage(failure));
+      await refresh();
+    } finally { setBusy(null); }
+  }
+
+  async function retryMediaCleanup() {
+    if (busy || !video || video.media_status === 'available' || video.media_status === 'deleted') return;
+    setBusy('media-retry');
+    setActionError(null);
+    try {
+      const progress = await retryVideoMediaDeletion(videoId, csrf);
+      setMediaProgress(progress);
+      setVideo((current) => current ? { ...current, media_status: progress.media_status, media_error_code: progress.error_code } : current);
+      setActionError(progress.media_status === 'deleted' ? '原视频清理完成，笔记仍保留。' : progress.stop_confirmation_required ? '仍在等待可信停止确认，删除意图继续生效。' : '清理仍在进行，删除意图继续生效。');
+    } catch (failure) {
+      if (isSessionExpired(failure)) { onExpired(); return; }
+      setActionError(apiMessage(failure));
     } finally { setBusy(null); }
   }
 
@@ -870,14 +983,24 @@ function VideoDetailPage({ videoId, csrf, onExpired, username, onLogout }: { vid
           <>
             <div className="detail-heading">
               <div className="detail-title-block"><span className="section-label">VIDEO NOTE</span><h1>{video.display_name}</h1><p>{formatDuration(video.duration_seconds)} <span>·</span> {formatBytes(video.byte_count)} <span>·</span> 添加于 {formatDate(video.created_at)}</p></div>
-              <button className="button button-danger button-small" type="button" onClick={() => void deleteRecord()} disabled={busy === 'delete'}>{busy === 'delete' ? '正在删除…' : '删除记录'}</button>
+              <div className="detail-delete-actions">
+                {video.media_status === 'available' && <button className="button button-outline button-small" type="button" onClick={() => void deleteMedia()} disabled={busy !== null}>{busy === 'media-delete' ? '正在删除原视频…' : '删除原视频，保留笔记'}</button>}
+                <button className="button button-danger button-small" type="button" onClick={() => void deleteRecord()} disabled={busy !== null}>{busy === 'delete' ? '正在删除整条记录…' : '删除整条记录'}</button>
+              </div>
             </div>
+            {video.media_status !== 'available' && <div className={`media-deletion-banner${video.media_status === 'cleanup_failed' ? ' media-deletion-failed' : ''}`} role="status" aria-live="polite">
+              <div><strong>{video.media_status === 'deleted' ? '原视频已删除，笔记保留' : video.media_status === 'cleanup_failed' ? '原视频清理失败，笔记仍可读取' : mediaProgress?.stop_confirmation_required ? '删除已生效，等待停止确认' : '原视频删除处理中'}</strong>
+                <p>{video.media_status === 'deleted' ? '转写、章节、知识要点、引用原文和时间信息继续保留；回看入口已关闭。' : video.media_status === 'cleanup_failed' ? errorMessage(video.media_error_code) ?? '清理失败原因已记录。可以重试清理，重试不会创建分析任务。' : '新媒体请求和未完成分析已关闭。后端确认停止后会完成文件清理。'}</p>
+                {mediaProgress?.pending_attempt_ids.length ? <small>待停止或清理的 attempt：{mediaProgress.pending_attempt_ids.length}</small> : null}
+              </div>
+              {video.media_status !== 'deleted' && <button className="button button-outline button-small" type="button" onClick={() => void retryMediaCleanup()} disabled={busy !== null}>{busy === 'media-retry' ? '正在重试…' : video.media_status === 'cleanup_failed' ? '重试清理' : '检查并继续清理'}</button>}
+            </div>}
             <PlayerSeekContext.Provider value={(seconds) => playerSeek.current(seconds)}>
             <div className="detail-grid">
               <div className="detail-main-column">
                 <section className="player-card" aria-label="视频回看">
-                  <div className="player-card-head"><span className="section-label">WATCH & VERIFY</span><span className="media-kind"><i /> 已验证媒体</span></div>
-                  <MediaPlayer videoId={video.id} onMessage={setPlayerMessage} onSeekReady={registerSeek} />
+                  <div className="player-card-head"><span className="section-label">WATCH & VERIFY</span><span className="media-kind"><i /> {video.media_status === 'available' ? '已验证媒体' : '媒体不可用'}</span></div>
+                  {video.media_status === 'available' ? <MediaPlayer videoId={video.id} onMessage={setPlayerMessage} onSeekReady={registerSeek} /> : <div className="media-removed-panel"><strong>原视频已关闭访问</strong><p>已保存的笔记与引用时间继续保留，播放器和回看动作已关闭。</p></div>}
                   {playerMessage && <p className="player-message" role="status" aria-live="polite">{playerMessage}</p>}
                 </section>
                 <section className="transcript-card" aria-labelledby="transcript-title">
@@ -886,9 +1009,9 @@ function VideoDetailPage({ videoId, csrf, onExpired, username, onLogout }: { vid
                     <div className="transcript-list">
                       {transcript.items.map((segment) => (
                         <article className="transcript-row" key={segment.segment_number}>
-                          <button className="transcript-time" type="button" onClick={() => playerSeek.current(segment.video_start_seconds)} aria-label={`回看第 ${segment.segment_number + 1} 段转写`}>
+                          {video.media_status === 'available' ? <button className="transcript-time" type="button" onClick={() => playerSeek.current(segment.video_start_seconds)} aria-label={`回看第 ${segment.segment_number + 1} 段转写`}>
                             <span>{formatDuration(segment.video_start_seconds)}</span><small>{formatDuration(segment.video_end_seconds)}</small>
-                          </button>
+                          </button> : <span className="transcript-time transcript-time-static"><span>{formatDuration(segment.video_start_seconds)}</span><small>{formatDuration(segment.video_end_seconds)}</small></span>}
                           <div className="transcript-text">{segment.text ?? <span className="muted">该片段尚未完成</span>}</div>
                         </article>
                       ))}
@@ -907,10 +1030,11 @@ function VideoDetailPage({ videoId, csrf, onExpired, username, onLogout }: { vid
                   onCleanup={() => void retryCleanup()}
                   transcriptComplete={Boolean(transcript?.complete)}
                   summaryBlocked={summaryBlocked}
+                  mediaAvailable={video.media_status === 'available'}
                 />
                 {summary ? <section className="summary-card" aria-labelledby="summary-title">
                   <div className="summary-card-header"><span className="summary-spark" aria-hidden="true">✳</span><div><span className="section-label">VERIFIED SUMMARY</span><h2 id="summary-title">课程总结</h2></div><span className="status-chip status-ready"><i />已发布</span></div>
-                  <SummaryContent summary={summary} />
+                  <SummaryContent summary={summary} allowSeek={video.media_status === 'available'} />
                 </section> : task?.status === 'succeeded' ? (
                   <section className="summary-card"><div className="empty-state compact-empty"><div className="spinner" /><h3>正在读取总结</h3><p>结果以所属用户的总结接口为准。</p></div></section>
                 ) : (
@@ -927,18 +1051,19 @@ function VideoDetailPage({ videoId, csrf, onExpired, username, onLogout }: { vid
   );
 }
 
-function AnalysisPanel({ task, csrf, busy, onStart, onRecover, onSummarize, onCleanup, transcriptComplete, summaryBlocked }: {
+function AnalysisPanel({ task, csrf, busy, onStart, onRecover, onSummarize, onCleanup, transcriptComplete, summaryBlocked, mediaAvailable }: {
   task: AnalysisTask | null;
   csrf: string;
-  busy: 'submit' | 'recover' | 'summarize' | 'cleanup' | 'delete' | null;
+  busy: 'submit' | 'recover' | 'summarize' | 'cleanup' | 'delete' | 'media-delete' | 'media-retry' | null;
   onStart: () => void;
   onRecover: () => void;
   onSummarize: () => void;
   onCleanup: () => void;
   transcriptComplete: boolean;
   summaryBlocked: boolean;
+  mediaAvailable: boolean;
 }) {
-  const unavailable = !csrf || busy !== null;
+  const unavailable = !csrf || busy !== null || !mediaAvailable;
   const canContinueSummary = Boolean(task && task.status === 'awaiting_summary' && task.summary_status === 'waiting' && task.execution_state === 'stopped' && !summaryBlocked && !task.summary_requests_exhausted);
   const canRecover = Boolean(task?.recovery_eligible);
   const canCleanup = task?.attempt.cleanup_state === 'failed';
@@ -946,9 +1071,10 @@ function AnalysisPanel({ task, csrf, busy, onStart, onRecover, onSummarize, onCl
     <section className="analysis-card" aria-labelledby="analysis-title">
       <div className="analysis-card-header"><div><span className="section-label">ANALYSIS</span><h2 id="analysis-title">处理状态</h2></div>{task && <span className={`status-chip ${task.status === 'succeeded' ? 'status-ready' : task.status === 'failed' ? 'status-failed' : 'status-wait'}`}><i />{taskStatusLabel(task.status)}</span>}</div>
       {!task ? (
-        <div className="analysis-start"><p>将视频提交给后端，依次完成转写、总结校验与结果发布。</p><button className="button button-primary button-wide" type="button" onClick={onStart} disabled={unavailable}>{busy === 'submit' ? '正在提交…' : '开始分析'} <span aria-hidden="true">↗</span></button></div>
+        <div className="analysis-start"><p>{mediaAvailable ? '将视频提交给后端，依次完成转写、总结校验与结果发布。' : '原视频删除后，不能开始分析或创建新的处理尝试。'}</p>{mediaAvailable && <button className="button button-primary button-wide" type="button" onClick={onStart} disabled={unavailable}>{busy === 'submit' ? '正在提交…' : '开始分析'} <span aria-hidden="true">↗</span></button>}</div>
       ) : (
         <>
+          {!mediaAvailable && <div className="maintenance-notice"><span aria-hidden="true">!</span><p>原视频删除已生效，未完成分析和恢复计划已取消。保留的转写和已发布总结仍可读取。</p></div>}
           <div className="stage-line"><span className={`stage-marker ${task.status}`} /><div><strong>{stageLabel(task.stage)}</strong><small>{task.stage}</small></div></div>
           <div className="progress-facts"><div><strong>{task.expected_segments === 0 ? '—' : `${task.completed_segments} / ${task.expected_segments}`}</strong><span>已完成片段</span></div><div><strong>{task.delivery_status === 'sent' ? '已发送，等待领取' : task.delivery_status === 'pending' ? '等待投递确认' : task.delivery_status === 'unknown' ? '发送结果不确定' : task.delivery_status === 'failed' ? '投递失败' : '状态未知'}</strong><span>队列投递</span></div></div>
           {task.delivery_wait_reason && <StatusRow label="排队协调" value={deliveryWaitLabel(task.delivery_wait_reason) ?? '等待后端检查'} />}
@@ -972,9 +1098,9 @@ function AnalysisPanel({ task, csrf, busy, onStart, onRecover, onSummarize, onCl
           <StatusRow label="总结状态" value={task.summary_status === 'not_started' ? '尚未开始' : task.summary_status === 'waiting' ? '等待总结' : task.summary_status === 'running' ? '生成中' : task.summary_status === 'failed' ? '失败' : task.summary_status === 'succeeded' ? '已发布' : '未知'} />
           {task.recovery_error_code === 'STOP_CONFIRMATION_REQUIRED' && <NoticePanel code={task.recovery_error_code} />}
           {task.execution_state === 'stop_unconfirmed' && task.recovery_error_code !== 'STOP_CONFIRMATION_REQUIRED' && <NoticePanel code="STOP_CONFIRMATION_REQUIRED" />}
-          {task.attempt.cleanup_state !== 'cleaned' && <div className={`cleanup-line ${task.attempt.cleanup_state === 'failed' ? 'cleanup-failed' : ''}`}><span>临时文件清理：{task.attempt.cleanup_state === 'failed' ? '失败' : task.attempt.cleanup_state === 'cleaned' ? '已完成' : '待处理'}</span>{task.attempt.cleanup_error_code && <small>{errorMessage(task.attempt.cleanup_error_code) ?? task.attempt.cleanup_error_code}</small>}{canCleanup && <button className="text-button" type="button" onClick={onCleanup} disabled={unavailable}>{busy === 'cleanup' ? '清理中…' : '重试清理'}</button>}</div>}
-          {canContinueSummary && <button className="button button-primary button-wide action-button" type="button" onClick={onSummarize} disabled={unavailable}>{busy === 'summarize' ? '正在请求…' : '继续生成总结'} <span aria-hidden="true">↗</span></button>}
-          {canRecover && <button className="button button-primary button-wide action-button" type="button" onClick={onRecover} disabled={unavailable}>{busy === 'recover' ? '正在恢复…' : '手动恢复分析'} <span aria-hidden="true">↻</span></button>}
+          {task.attempt.cleanup_state !== 'cleaned' && <div className={`cleanup-line ${task.attempt.cleanup_state === 'failed' ? 'cleanup-failed' : ''}`}><span>临时文件清理：{task.attempt.cleanup_state === 'failed' ? '失败' : task.attempt.cleanup_state === 'cleaned' ? '已完成' : '待处理'}</span>{task.attempt.cleanup_error_code && <small>{errorMessage(task.attempt.cleanup_error_code) ?? task.attempt.cleanup_error_code}</small>}{canCleanup && mediaAvailable && <button className="text-button" type="button" onClick={onCleanup} disabled={unavailable}>{busy === 'cleanup' ? '清理中…' : '重试清理'}</button>}</div>}
+          {mediaAvailable && canContinueSummary && <button className="button button-primary button-wide action-button" type="button" onClick={onSummarize} disabled={unavailable}>{busy === 'summarize' ? '正在请求…' : '继续生成总结'} <span aria-hidden="true">↗</span></button>}
+          {mediaAvailable && canRecover && <button className="button button-primary button-wide action-button" type="button" onClick={onRecover} disabled={unavailable}>{busy === 'recover' ? '正在恢复…' : '手动恢复分析'} <span aria-hidden="true">↻</span></button>}
           {task.recovery_error_code && task.recovery_error_code !== 'TRANSCRIPT_COMPLETE_AWAITING_SUMMARY' && task.recovery_error_code !== 'STOP_CONFIRMATION_REQUIRED' && !task.recovery_eligible && <p className="recovery-hint">{errorMessage(task.recovery_error_code)}</p>}
           <p className="model-note">ASR：{task.asr_model}</p>
         </>

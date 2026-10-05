@@ -12,6 +12,8 @@ export interface VideoSummary {
   media_info: Record<string, unknown>;
   status: string;
   deletion_error: string | null;
+  media_status: 'available' | 'deletion_pending' | 'cleanup_failed' | 'deleted';
+  media_error_code: string | null;
   created_at: string;
 }
 
@@ -42,6 +44,7 @@ export interface AnalysisTask {
   id: string;
   video_id: string;
   current_attempt_id: string;
+  notes_attempt_id: string | null;
   status: string;
   stage: string;
   delivery_status: string;
@@ -148,6 +151,14 @@ export interface Summary {
 export interface DeletionProgress {
   video_id: string;
   state: string;
+  error_code: string | null;
+  pending_attempt_ids: string[];
+  stop_confirmation_required: boolean;
+}
+
+export interface MediaDeletionProgress {
+  video_id: string;
+  media_status: 'available' | 'deletion_pending' | 'cleanup_failed' | 'deleted';
   error_code: string | null;
   pending_attempt_ids: string[];
   stop_confirmation_required: boolean;

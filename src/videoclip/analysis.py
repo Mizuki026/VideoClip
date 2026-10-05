@@ -284,6 +284,11 @@ def submit_analysis_task(
             raise HTTPException(status_code=404, detail="video not found")
         if video.status != "ready":
             raise HTTPException(status_code=409, detail="video is not available for analysis")
+        if video.media_status != "available":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "VIDEO_MEDIA_UNAVAILABLE", "recovery_eligible": False},
+            )
 
         if video.current_analysis_task_id is not None:
             task = session.get(AnalysisTask, video.current_analysis_task_id)
@@ -520,6 +525,7 @@ def task_response(
         recoverable_by_operator = not is_manual_recovery_blocked(attempt.failure_code or task.failure_code)
         recovery_allowed = (
             eligibility.eligible
+            and video.media_status == "available"
             and stop_evidence_valid
             and recoverable_by_operator
             and summary_requests_used < MAX_SUMMARY_REQUESTS
@@ -531,6 +537,7 @@ def task_response(
             id=task.id,
             video_id=task.video_id,
             current_attempt_id=current_attempt_id,
+            notes_attempt_id=task.notes_attempt_id,
             status=task.status,
             stage=task.stage,
             delivery_status=delivery.status,
@@ -600,6 +607,9 @@ def task_response(
             failure_code=task.failure_code,
             recovery_eligible=recovery_allowed,
             recovery_error_code=(
+                "VIDEO_MEDIA_UNAVAILABLE"
+                if video.media_status != "available"
+                else
                 "SUMMARY_REQUEST_BUDGET_EXHAUSTED"
                 if eligibility.eligible and summary_requests_used >= MAX_SUMMARY_REQUESTS
                 else "STOP_CONFIRMATION_REQUIRED"
@@ -645,9 +655,10 @@ def transcript_response(
                 AnalysisTask.owner_id == owner_id,
             )
         )
-        if task is None or task.current_attempt_id is None:
+        if task is None or (task.notes_attempt_id is None and task.current_attempt_id is None):
             raise HTTPException(status_code=404, detail="transcript not found")
-        attempt = session.get(AnalysisAttempt, task.current_attempt_id)
+        selected_attempt_id = task.notes_attempt_id or task.current_attempt_id
+        attempt = session.get(AnalysisAttempt, selected_attempt_id)
         if attempt is None:
             raise HTTPException(status_code=404, detail="transcript not found")
         segments = list(
@@ -660,12 +671,9 @@ def transcript_response(
         return TranscriptResponse(
             task_id=task.id,
             complete=(
-                task.status == "awaiting_summary"
-                or (
-                    bool(segments)
-                    and attempt.manifest_fingerprint is not None
-                    and all(item.status == "succeeded" for item in segments)
-                )
+                bool(segments)
+                and attempt.manifest_fingerprint is not None
+                and all(item.status == "succeeded" for item in segments)
             ),
             summary_status=task.summary_status,
             items=[
@@ -716,7 +724,7 @@ def summary_response(
                 AnalysisSummary.video_id == video.id,
             )
         )
-        if result is None or result.attempt_id != task.current_attempt_id:
+        if result is None:
             raise HTTPException(status_code=503, detail="summary publication needs maintenance")
         return AnalysisSummaryResponse(
             video_id=result.video_id,

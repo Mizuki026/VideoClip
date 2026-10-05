@@ -40,11 +40,12 @@ npm run dev
 1. 在注册 / 登录页创建本地账户并登录。
 2. 在视频列表页上传授权课程视频。中断后刷新并重新选择原文件即可从服务端已确认的分片续传；确认上传后再开始分析并查看处理进度。
 3. 在视频详情页查看转写和已发布总结。点击至少两处不同引用，确认播放器跳到相应片段并继续播放。
-4. 在详情页删除视频记录；删除完成后，媒体、转写和总结接口不再提供该记录内容。
+4. 若要保留笔记，在详情页选择“删除原视频，保留笔记”并确认。处理中会显示等待停止确认或清理状态；媒体不可用后播放器与回看入口关闭，但转写、总结引文与时间信息继续保留。清理失败只能重试清理。
+5. 若要删除全部内容，选择“删除整条记录”并确认；删除完成后，该记录的视频、转写和总结接口均不可访问。
 
 总结会在 ASR 片段全部持久化后生成。新 execution 在领取提交后、开始任何分析副作用前，必须完成监督登记。受支持的停止边界为 Linux Worker 容器中的 execution session 及其子进程组，包括当前使用的 FFmpeg、ASR 和 LLM 子进程；监督器先回收并观察整个 session 退出，再按绑定身份提交证据。心跳超时、父进程退出、数据库锁释放、PID 不存在或服务重启本身都不能确认停止。监督器、容器或宿主机强停、边界身份不匹配时执行位继续保留，状态显示“停止尚未确认” / `STOP_CONFIRMATION_REQUIRED`，恢复和工作目录清理均被阻断。只有 Worker 容器已退出且 execution 的代次和容器 ID 精确匹配时，人工入口才登记停止确认。
 
-若总结请求失败，只有执行停止已确认且 task 仍符合恢复条件时，页面才提供人工恢复；恢复尝试使用 summary-only 模式并复用匹配的成功转写片段。每个 task 最多 3 次总结请求。第 4 窗口已实现不同视频任务持久排队、发送结果不确定时的补偿，以及忙时消息被 ACK 后的周期续接；补投不会自动重跑已开始的 execution，也不改变总结请求额度。第 5 窗口已实现共享模型冷却与受控自动恢复：默认本地退避为 60–900 秒，单次等待上限 24 小时、task 累计等待上限 72 小时，自动恢复最多 2 次；供应商给出的较长合法 `Retry-After` 不会被本地截短，超出等待上限则转人工。总结请求预算仍跨全部 attempt 共 3 次；Stage 4 的 8 次补投与 24 小时可推进期限保持独立。冷却仅按供应商、非秘密账户引用和模型共享；密钥轮换不应更换账户引用。迁移不自动纳入历史 `failed` / `awaiting_summary`，只有新任务及部署后明确接受的人工操作加入 Stage 5。供应商已收到的请求不能由本地停止证明撤销，HTTP 请求也不承诺恰好一次。参数、错误白名单、历史策略和验证证据见[第 5 窗口规格](.scratch/final-stage-5/spec.md)及[验收记录](.scratch/final-stage-5/validation.md)；停止证明边界见[第 3 窗口验收记录](.scratch/final-stage-3/validation.md)，队列和补偿语义见[第 4 窗口规格及验收](.scratch/final-stage-4/spec.md)与[验收记录](.scratch/final-stage-4/validation.md)。第 6 窗口原视频与笔记分离删除尚未开始。
+若总结请求失败，只有执行停止已确认且 task 仍符合恢复条件时，页面才提供人工恢复；恢复尝试使用 summary-only 模式并复用匹配的成功转写片段。每个 task 最多 3 次总结请求。第 4 窗口已实现不同视频任务持久排队、发送结果不确定时的补偿，以及忙时消息被 ACK 后的周期续接；补投不会自动重跑已开始的 execution，也不改变总结请求额度。第 5 窗口已实现共享模型冷却与受控自动恢复：默认本地退避为 60–900 秒，单次等待上限 24 小时、task 累计等待上限 72 小时，自动恢复最多 2 次；供应商给出的较长合法 `Retry-After` 不会被本地截短，超出等待上限则转人工。总结请求预算仍跨全部 attempt 共 3 次；Stage 4 的 8 次补投与 24 小时可推进期限保持独立。冷却仅按供应商、非秘密账户引用和模型共享；密钥轮换不应更换账户引用。迁移不自动纳入历史 `failed` / `awaiting_summary`，只有新任务及部署后明确接受的人工操作加入 Stage 5。供应商已收到的请求不能由本地停止证明撤销，HTTP 请求也不承诺恰好一次。参数、错误白名单、历史策略和验证证据见[第 5 窗口规格](.scratch/final-stage-5/spec.md)及[验收记录](.scratch/final-stage-5/validation.md)；停止证明边界见[第 3 窗口验收记录](.scratch/final-stage-3/validation.md)，队列和补偿语义见[第 4 窗口规格及验收](.scratch/final-stage-4/spec.md)与[验收记录](.scratch/final-stage-4/validation.md)。第 6 窗口已实现独立原媒体删除、笔记保留及失败重试；接口状态和验证证据见[规格](.scratch/final-stage-6/spec.md)与[验收记录](.scratch/final-stage-6/validation.md)。这些窗口的本地替身验收不代表真实供应商限额或账单。
 
 停止网页用 `Ctrl+C`。确认没有仍在运行的分析后，在仓库根目录运行：
 
@@ -144,4 +145,4 @@ docker compose --env-file data/mvp-stage-2/.env -p videoclip-mvp-stage2 -f compo
 - 20 分钟是媒体时长上限；完整 20 分钟视频尚未作为真实模型样本实测。上传字节数和业务数据目录总量均没有运行期硬上限。
 - 本地配置中的零费率不是账单回执；实际费用和剩余额度需在服务商账户中核对。
 
-MVP 的实际验收证据、历史故障和限制见[第六窗口验收记录](.scratch/mvp-stage-6/validation.md)。最终版第 1 至第 4 窗口的规格和验收证据见[第 1 窗口记录](.scratch/final-stage-1/validation.md)、[第 2 窗口记录](.scratch/final-stage-2/validation.md)、[第 3 窗口记录](.scratch/final-stage-3/validation.md)及[第 4 窗口记录](.scratch/final-stage-4/validation.md)。
+MVP 的实际验收证据、历史故障和限制见[第六窗口验收记录](.scratch/mvp-stage-6/validation.md)。最终版第 1 至第 6 窗口的规格与验收记录见[第 1 窗口](.scratch/final-stage-1/validation.md)、[第 2 窗口](.scratch/final-stage-2/validation.md)、[第 3 窗口](.scratch/final-stage-3/validation.md)、[第 4 窗口](.scratch/final-stage-4/validation.md)、[第 5 窗口](.scratch/final-stage-5/validation.md)和[第 6 窗口](.scratch/final-stage-6/validation.md)。第 7 窗口整体验收与展示材料仍待开展；20 分钟真实模型处理、账户计费证据、容器可写层峰值及 E 盘差额归因仍未验证。

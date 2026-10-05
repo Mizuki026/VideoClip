@@ -131,6 +131,8 @@ class Video(Base):
     duration_seconds: Mapped[float] = mapped_column(nullable=False)
     media_info: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     status: Mapped[str] = mapped_column(String(24), default="ready", nullable=False)
+    media_status: Mapped[str] = mapped_column(String(24), default="available", nullable=False)
+    media_error_code: Mapped[str | None] = mapped_column(String(64))
     analysis_task_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     current_analysis_task_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
@@ -239,6 +241,16 @@ class AnalysisTask(Base):
             "analysis_attempts.id",
             use_alter=True,
             name="fk_analysis_tasks_current_attempt",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+    )
+    notes_attempt_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "analysis_attempts.id",
+            use_alter=True,
+            name="fk_analysis_tasks_notes_attempt",
             deferrable=True,
             initially="DEFERRED",
         ),

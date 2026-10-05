@@ -7,6 +7,7 @@ function task(overrides: Partial<AnalysisTask> = {}): AnalysisTask {
     id: 'task',
     video_id: 'video',
     current_attempt_id: 'attempt',
+    notes_attempt_id: null,
     status: 'queued',
     stage: 'queued',
     delivery_status: 'pending',

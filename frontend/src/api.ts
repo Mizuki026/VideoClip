@@ -1,6 +1,7 @@
 import type {
   AnalysisTask,
   DeletionProgress,
+  MediaDeletionProgress,
   Summary,
   Transcript,
   User,
@@ -114,4 +115,16 @@ export function getSummary(videoId: string): Promise<Summary> {
 
 export function getDeletionProgress(videoId: string): Promise<DeletionProgress> {
   return request(`/videos/${encodeURIComponent(videoId)}/deletion`);
+}
+
+export function getMediaDeletionProgress(videoId: string): Promise<MediaDeletionProgress> {
+  return request(`/videos/${encodeURIComponent(videoId)}/media-deletion`);
+}
+
+export function deleteVideoMedia(videoId: string, csrf: string): Promise<MediaDeletionProgress> {
+  return request(`/videos/${encodeURIComponent(videoId)}/media`, { method: 'DELETE', csrf });
+}
+
+export function retryVideoMediaDeletion(videoId: string, csrf: string): Promise<MediaDeletionProgress> {
+  return request(`/videos/${encodeURIComponent(videoId)}/media-deletion/retry`, { method: 'POST', csrf });
 }

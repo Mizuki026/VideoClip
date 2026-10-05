@@ -329,7 +329,10 @@ def _lock_execution_rows(
             )
         )
         or attempt.claim_count != 1
-        or (not allow_invalid_video and video.status != "ready")
+        or (
+            not allow_invalid_video
+            and (video.status != "ready" or video.media_status != "available")
+        )
     ):
         raise AnalysisFailure("EXECUTION_OWNERSHIP_LOST" if video is not None else "VIDEO_UNAVAILABLE")
     return task, attempt, video, execution
@@ -361,6 +364,7 @@ def _claim_attempt(
             or attempt.status != "queued"
             or attempt.claim_count != 0
             or video.status != "ready"
+            or video.media_status != "available"
             or video.current_analysis_task_id != task.id
             or attempt.task_id != task.id
         ):
@@ -548,7 +552,6 @@ def _run_process(
 ) -> None:
     if timeout_seconds <= 0:
         raise AnalysisFailure("ATTEMPT_TIMEOUT")
-    _progress_check(maker, lease, claim)
     launch_options: dict[str, Any] = {}
     if os.name == "nt":
         launch_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -556,13 +559,15 @@ def _run_process(
         # A fresh process group stays inside the execution's supervised Linux session.
         launch_options["process_group"] = 0
     try:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            **launch_options,
-        )
+        with db_transaction(maker) as session:
+            _lock_execution_rows(session, claim)
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **launch_options,
+            )
     except OSError as exc:
         raise AnalysisFailure("LOCAL_PROCESS_START_FAILED") from exc
     started = time.monotonic()
@@ -632,12 +637,16 @@ def _hash_source(
     claim: ClaimedAttempt,
     attempt_deadline: float,
 ) -> None:
-    if path.is_symlink() or not path.is_file() or path.stat().st_size != expected_bytes:
-        raise AnalysisFailure("VIDEO_SOURCE_CHANGED")
+    _progress_check(maker, lease, claim)
     digest = hashlib.sha256()
     last_check = time.monotonic()
     try:
-        with path.open("rb") as source:
+        with db_transaction(maker) as session:
+            _lock_execution_rows(session, claim)
+            if path.is_symlink() or not path.is_file() or path.stat().st_size != expected_bytes:
+                raise AnalysisFailure("VIDEO_SOURCE_CHANGED")
+            source = path.open("rb")
+        with source:
             while block := source.read(1024 * 1024):
                 digest.update(block)
                 now = time.monotonic()
@@ -652,19 +661,23 @@ def _hash_source(
         raise AnalysisFailure("VIDEO_SOURCE_CHANGED")
 
 
-def _build_attempt_directory(store: MediaStore, claim: ClaimedAttempt) -> Path:
+def _build_attempt_directory(
+    store: MediaStore, claim: ClaimedAttempt, maker: sessionmaker[Session]
+) -> Path:
     if len(claim.work_directory_name) != 32 or any(
         character not in "0123456789abcdef" for character in claim.work_directory_name
     ):
         raise AnalysisFailure("INVALID_WORK_DIRECTORY")
     parent = store.analysis / claim.task_id.hex
-    parent.mkdir(parents=True, exist_ok=True)
-    attempt_directory = parent / claim.work_directory_name
-    if attempt_directory.parent != parent or attempt_directory.is_symlink():
-        raise AnalysisFailure("INVALID_WORK_DIRECTORY")
-    if not attempt_directory.resolve().is_relative_to(store.analysis.resolve()):
-        raise AnalysisFailure("INVALID_WORK_DIRECTORY")
-    attempt_directory.mkdir(exist_ok=False)
+    with db_transaction(maker) as session:
+        _lock_execution_rows(session, claim)
+        parent.mkdir(parents=True, exist_ok=True)
+        attempt_directory = parent / claim.work_directory_name
+        if attempt_directory.parent != parent or attempt_directory.is_symlink():
+            raise AnalysisFailure("INVALID_WORK_DIRECTORY")
+        if not attempt_directory.resolve().is_relative_to(store.analysis.resolve()):
+            raise AnalysisFailure("INVALID_WORK_DIRECTORY")
+        attempt_directory.mkdir(exist_ok=False)
     return attempt_directory
 
 
@@ -929,7 +942,52 @@ def _mark_awaiting_summary(
 def _fail_task(maker: sessionmaker[Session], lease: ExecutionLease, claim: ClaimedAttempt, code: str) -> None:
     lease.assert_alive()
     with db_transaction(maker) as session:
-        task, attempt, _, _ = _lock_execution_rows(session, claim, allow_invalid_video=True)
+        task, attempt, video, _ = _lock_execution_rows(session, claim, allow_invalid_video=True)
+        if video.status != "ready" or video.media_status != "available":
+            cancellation_code = (
+                "VIDEO_MEDIA_DELETION_REQUESTED"
+                if video.status == "ready"
+                else "VIDEO_DELETION_REQUESTED"
+            )
+            task.queue_entered_at = None
+            task.delivery_next_check_at = None
+            task.delivery_blocked_since = None
+            task.delivery_wait_reason = cancellation_code
+            task.model_wait_reason = None
+            task.model_wait_error_code = None
+            task.model_wait_stage = None
+            task.model_wait_origin = None
+            task.model_wait_until = None
+            task.model_wait_single_deadline_at = None
+            if task.status != "succeeded":
+                task.status = "failed"
+                task.stage = "failed"
+                task.failure_code = task.failure_code or cancellation_code
+            has_published_summary = session.scalar(
+                select(AnalysisSummary.id).where(AnalysisSummary.task_id == task.id).limit(1)
+            ) is not None
+            if not has_published_summary and task.summary_status != "succeeded":
+                if task.summary_status in {"running", "waiting"} or claim.execution_mode == "summary_only":
+                    task.summary_status = "failed"
+                unfinished_requests = list(
+                    session.scalars(
+                        select(SummaryRequest)
+                        .where(
+                            SummaryRequest.attempt_id == attempt.id,
+                            SummaryRequest.status.in_(("started", "response_received")),
+                        )
+                        .with_for_update()
+                    )
+                )
+                for request in unfinished_requests:
+                    request.status = "failed"
+                    request.error_code = cancellation_code
+                    request.finished_at = datetime.now(UTC)
+            if attempt.status != "succeeded":
+                attempt.status = "failed"
+                attempt.failure_code = attempt.failure_code or cancellation_code
+                attempt.finished_at = attempt.finished_at or datetime.now(UTC)
+            return
         task.status = "failed"
         task.stage = "failed"
         task.failure_code = task.failure_code or code[:64]
@@ -1037,9 +1095,11 @@ def _confirm_inline_test_stop(
 
 def _deletion_cleanup_is_pending(maker: sessionmaker[Session], claim: ClaimedAttempt) -> bool:
     with maker() as session:
-        status_value = session.scalar(select(Video.status).where(Video.id == claim.video_id))
+        row = session.execute(
+            select(Video.status, Video.media_status).where(Video.id == claim.video_id)
+        ).one_or_none()
         session.commit()
-    return status_value != "ready"
+    return row is None or row.status != "ready" or row.media_status != "available"
 
 
 def _create_wav_segments(
@@ -1121,7 +1181,7 @@ def _transcribe(
         claim=claim,
         attempt_deadline=attempt_deadline,
     )
-    directory = _build_attempt_directory(store, claim)
+    directory = _build_attempt_directory(store, claim, maker)
     pcm_path = directory / "audio.s16le"
     _set_stage(maker, lease, claim, "extracting_audio")
     extraction_seconds = min(
@@ -1587,7 +1647,7 @@ def _summarize(
     if not directory.is_dir():
         if claim.execution_mode != "summary_only":
             raise AnalysisFailure("SUMMARY_WORK_DIRECTORY_UNAVAILABLE")
-        directory = _build_attempt_directory(store, claim)
+        directory = _build_attempt_directory(store, claim, maker)
     try:
         validate_transcript_context_budget(segments, contract)
         prompt = build_summary_prompt(segments, contract.prompt_version)

@@ -8,7 +8,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
@@ -58,6 +58,7 @@ from videoclip.schemas import (
     VideoDeletionProgress,
     VideoDetailResponse,
     VideoListResponse,
+    VideoMediaDeletionProgress,
     VideoSummary,
 )
 from videoclip.security import (
@@ -71,11 +72,14 @@ from videoclip.security import (
     verify_password,
 )
 from videoclip.services import (
+    _attempt_stop_is_confirmed,
     db_transaction,
     delete_video,
+    delete_video_media,
     receive_video_upload,
     register_account,
     retry_attempt_cleanup,
+    retry_video_media_cleanup,
 )
 from videoclip.settings import Settings, get_settings
 from videoclip.storage import MediaStore
@@ -234,6 +238,8 @@ def _video_summary(video: Video) -> VideoSummary:
         media_info=video.media_info,
         status=video.status,
         deletion_error=video.deletion_error,
+        media_status=video.media_status,
+        media_error_code=video.media_error_code,
         created_at=video.created_at,
     )
 
@@ -271,6 +277,38 @@ def _parse_range(value: str, byte_count: int) -> tuple[int, int] | None:
         return None
 
 
+def _media_deletion_progress(session: Session, video: Video) -> VideoMediaDeletionProgress:
+    if video.status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "VIDEO_DELETION_IN_PROGRESS", "deletion_eligible": False},
+        )
+    attempts: list[AnalysisAttempt] = []
+    if video.current_analysis_task_id is not None:
+        attempts = list(
+            session.scalars(
+                select(AnalysisAttempt)
+                .where(AnalysisAttempt.task_id == video.current_analysis_task_id)
+                .order_by(AnalysisAttempt.attempt_number)
+            )
+        )
+    pending_attempt_ids: list[uuid.UUID] = []
+    stop_confirmation_required = False
+    for attempt in attempts:
+        stopped = _attempt_stop_is_confirmed(session, attempt)
+        if not stopped:
+            stop_confirmation_required = True
+        if not stopped or attempt.cleanup_state != "cleaned":
+            pending_attempt_ids.append(attempt.id)
+    return VideoMediaDeletionProgress(
+        video_id=video.id,
+        media_status=video.media_status,
+        error_code=video.media_error_code,
+        pending_attempt_ids=pending_attempt_ids,
+        stop_confirmation_required=stop_confirmation_required,
+    )
+
+
 def create_app(
     settings: Settings | None = None,
     session_factory: sessionmaker[Session] | None = None,
@@ -304,6 +342,33 @@ def create_app(
             policy=delivery_policy,
         )
 
+    async def finish_media_cleanup_request(
+        owner_id: uuid.UUID,
+        video_id: uuid.UUID,
+        operation: Callable[[], bool],
+        response: Response,
+    ) -> VideoMediaDeletionProgress:
+        cleanup_tasks: set[asyncio.Task[Any]] = request_cleanup_tasks
+        cleanup_task = asyncio.create_task(asyncio.to_thread(operation))
+        cleanup_tasks.add(cleanup_task)
+        cleanup_task.add_done_callback(cleanup_tasks.discard)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(cleanup_task), timeout=resolved_settings.cleanup_timeout_seconds
+            )
+        except TimeoutError:
+            logger.warning("video_media_cleanup_timeout video_id=%s", video_id.hex)
+        with resolved_factory() as session:
+            video = session.scalar(
+                select(Video).where(Video.id == video_id, Video.owner_id == owner_id)
+            )
+            if video is None:
+                raise HTTPException(status_code=404, detail="video not found")
+            progress = _media_deletion_progress(session, video)
+        response.status_code = 200 if progress.media_status == "deleted" else status.HTTP_202_ACCEPTED
+        response.headers["Cache-Control"] = "no-store"
+        return progress
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         resolved_store.prepare()
@@ -318,7 +383,8 @@ def create_app(
     app.state.settings = resolved_settings
     app.state.session_factory = resolved_factory
     app.state.store = resolved_store
-    app.state.cleanup_tasks = set()
+    request_cleanup_tasks: set[asyncio.Task[Any]] = set()
+    app.state.cleanup_tasks = request_cleanup_tasks
     app.add_middleware(JsonBodyLimitMiddleware, max_bytes=resolved_settings.max_json_body_bytes)
 
     @app.exception_handler(RequestValidationError)
@@ -625,6 +691,51 @@ def create_app(
                 stop_confirmation_required=stop_required,
             )
 
+    @app.get("/videos/{video_id}/media-deletion", response_model=VideoMediaDeletionProgress)
+    def get_video_media_deletion(
+        video_id: uuid.UUID, request: Request, response: Response
+    ) -> VideoMediaDeletionProgress:
+        user, _ = _current_auth(request, resolved_factory) or _raise_auth()
+        with resolved_factory() as session:
+            video = session.scalar(select(Video).where(Video.id == video_id, Video.owner_id == user.id))
+            if video is None:
+                raise HTTPException(status_code=404, detail="video not found")
+            response.headers["Cache-Control"] = "private, no-store"
+            return _media_deletion_progress(session, video)
+
+    @app.delete("/videos/{video_id}/media", response_model=VideoMediaDeletionProgress)
+    async def remove_video_media(
+        video_id: uuid.UUID, request: Request, response: Response
+    ) -> VideoMediaDeletionProgress:
+        current = _current_auth(request, resolved_factory)
+        _require_csrf(request, resolved_settings, resolved_factory, current)
+        assert current is not None
+        user, _ = current
+        return await finish_media_cleanup_request(
+            user.id,
+            video_id,
+            lambda: delete_video_media(resolved_factory, resolved_store, user.id, video_id),
+            response,
+        )
+
+    @app.post(
+        "/videos/{video_id}/media-deletion/retry",
+        response_model=VideoMediaDeletionProgress,
+    )
+    async def retry_video_media_deletion(
+        video_id: uuid.UUID, request: Request, response: Response
+    ) -> VideoMediaDeletionProgress:
+        current = _current_auth(request, resolved_factory)
+        _require_csrf(request, resolved_settings, resolved_factory, current)
+        assert current is not None
+        user, _ = current
+        return await finish_media_cleanup_request(
+            user.id,
+            video_id,
+            lambda: retry_video_media_cleanup(resolved_factory, resolved_store, user.id, video_id),
+            response,
+        )
+
     @app.post(
         "/videos/{video_id}/tasks",
         status_code=status.HTTP_202_ACCEPTED,
@@ -764,6 +875,12 @@ def create_app(
             )
             if video is None:
                 raise HTTPException(status_code=404, detail="video not found")
+            if video.media_status != "available":
+                raise HTTPException(
+                    status_code=410,
+                    detail={"code": "VIDEO_MEDIA_UNAVAILABLE"},
+                    headers={"Cache-Control": "private, no-store"},
+                )
             storage_name = video.storage_name
             byte_count = video.byte_count
             path = resolved_store.target_path(storage_name)
