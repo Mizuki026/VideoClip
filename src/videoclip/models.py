@@ -524,6 +524,7 @@ class SharedModelCooldown(Base):
     __table_args__ = (
         UniqueConstraint("provider", "account_reference", "model", name="uq_shared_model_cooldown_identity"),
         CheckConstraint("consecutive_rate_limits >= 0", name="ck_shared_model_cooldown_count_nonnegative"),
+        Index("ix_shared_model_cooldowns_until", "cooldown_until"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
