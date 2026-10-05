@@ -1,6 +1,6 @@
 # 第 6 窗口验收记录：原视频与笔记分离
 
-> 状态：实现、隔离验收及部署前历史数据复核通过；Stage 2 迁移/部署结果及提交哈希在本次交付结束前补记。第 7 窗口未开始。
+> 状态：第 6 窗口实现、隔离验收与 Stage 2 迁移部署完成；保留一个已确认属于第 5 窗口的 Alembic 模型/索引元数据差异。第 7 窗口未开始。
 > 日期：2026-10-05（Asia/Shanghai）。
 
 ## 基线、分支与数据保护
@@ -58,7 +58,15 @@ Stage 6 专用运行器（含独立 Compose、迁移、质量检查、直接/完
 | 隔离真实浏览器流程 | 1 passed；API restart 期间 Vite `/health` 有预期连接重置日志，重启后健康检查、读回及断言通过 |
 | `git diff --check` | 通过；Git 提示若干既有工作区文件将来可能 LF→CRLF，没有 whitespace error |
 
-Stage 2 部署前复核（只读）：6 users、8 `complete` upload handoffs、8/8 `ready` videos、tasks `awaiting_summary:2/failed:4/succeeded:2`、attempts `awaiting_summary:2/failed:10/succeeded:2`（14 总数）、14 executions（未确认 0）、attempt 未确认停止 0、14 deliveries、330 transcript segments、12 summary requests、2 published summaries、旧 `deletion_error` 0、cleanup intents 0、running tasks 0、analysis 队列长度 0；8 个由受控 `storage_name` 定位的历史 `.media` 文件均存在。Stage 2 PostgreSQL/Redis 健康运行；API、分析 Worker、维护 Worker、Beat 均停止。执行 `scripts/stage2/run-stage2.ps1` 前仍会再次通过脚本门禁确认未确认 execution、running task 和队列为空。迁移/部署结果、迁移后历史快照、运行地址和服务形态将在此处补记。不得把 `data/mvp-stage-6/acceptance` 的隔离结果当作 Stage 2 部署证据。
+### Stage 2 迁移部署与历史数据核对
+
+- 功能提交 `1eca10b9ef071024ff74cb226e909fe9faefe7eb`（分支仍为 `codex/mvp`）。通过 `scripts/stage2/run-stage2.ps1` 构建该提交对应镜像。脚本在迁移前检查 Stage 2 未确认 execution、running task 及 Redis analysis 队列均为 0；然后仅对 `videoclip-mvp-stage2` 执行迁移和启停，未触碰其他 Compose 项目。
+- 迁移从 `7c2a91e5b04d` 成功升级到 `d42f6c8a901e`。运行中的服务为 1 个 API、1 个受监督分析 Worker、1 个并发为 1 且只消费 maintenance 队列的维护 Worker、1 个 Beat，以及原 Stage 2 PostgreSQL/Redis；Stage 2 脚本门禁检查通过，API `http://127.0.0.1:58002/health` 返回 `ok`。
+- 迁移后历史快照与迁移前一致：users 6、uploads 8、videos 8（`ready=8`、`media_status=available` 8）、tasks `awaiting_summary:2/failed:4/succeeded:2`、attempts 14、executions 14（未确认 0）、deliveries 14、transcript segments 330、summary requests 12、published summaries 2、cleanup intents 0、旧 `deletion_error` 0、running tasks 0、analysis 队列长度 0；8 个受控历史 `.media` 文件仍全部存在。`notes_attempt_id` 保持 NULL（8 个历史视频），迁移未选择、改写或丢弃历史结果。
+- `docker compose ... config --quiet` 通过。部署后 `api alembic check` 未通过，错误仅为“检测到将删除 `ix_shared_model_cooldowns_until`”。这属于第 5 窗口既有模型/迁移元数据差异：迁移 `7c2a91e5b04d_shared_model_cooldown_recovery.py` 创建该索引，而 Stage 6 提交的父版本 ORM `SharedModelCooldown` 元数据没有声明该索引；本次 `d42f6c8a901e` 未修改该表或索引。遵照不扩大本窗口范围，未改写该既有结构；不能报告 `alembic check` 通过，应由第 7 窗口或单独 schema 修复任务决定如何收敛。
+- 前端 Vite 地址配置为 `http://127.0.0.1:5174`，本次未启动开发服务器（该端口当前不可达）；Stage 2 后端保持运行。真实浏览器证据来自专用隔离 Compose，不使用 Stage 2 账户或历史笔记。
+
+不得把 `data/mvp-stage-6/acceptance` 的隔离结果当作 Stage 2 部署证据；Stage 2 的历史快照和 API 健康状态已单独复核。
 
 ## 未验证事项、限制和第 7 窗口交接
 
