@@ -158,6 +158,7 @@ def current_cooldown_until(session: Session, identity: ModelIdentity) -> datetim
     return require_utc(row.cooldown_until) if row is not None else None
 
 
+# 冷却期限按服务商、账户引用和模型共享，并通过行锁合并并发收到的 429。
 def extend_shared_cooldown(
     factory: sessionmaker[Session],
     identity: ModelIdentity,
