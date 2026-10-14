@@ -39,6 +39,7 @@ celery_app.conf.update(
     },
     task_serializer="json",
     accept_content=["json"],
+    # 业务任务状态和结果由 PostgreSQL 维护，Celery 不保存结果副本。
     result_backend=None,
     task_ignore_result=True,
     task_store_errors_even_if_ignored=False,
