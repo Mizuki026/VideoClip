@@ -35,6 +35,7 @@ def verify_password(password_hash: str, password: str) -> bool:
         return False
 
 
+# Cookie 返回随机令牌，数据库只保存其 SHA-256 摘要以便校验会话。
 def new_session_token() -> str:
     return secrets.token_urlsafe(32)
 
