@@ -144,6 +144,7 @@ def _recover_one(
                 return
             state = upload.state
             owner_id = upload.owner_id
+        # 只有进入 promoting 的交接才可能已有正式文件；其他状态按未完成的临时上传清理。
         if state != "promoting":
             remove_lease_after_release = _discard_interrupted(factory, store, upload_id)
             return
