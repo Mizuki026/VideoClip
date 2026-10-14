@@ -94,6 +94,7 @@ def _matching_create_request(
     )
 
 
+# 创建请求先按幂等键查找可复用会话，再校验文件大小和摘要并建立分片状态。
 def create_upload_session(
     factory: sessionmaker[Session],
     owner_id: uuid.UUID,
@@ -269,6 +270,7 @@ def _storage_corrupt(
     return _error(507, "UPLOAD_STORAGE_FAILED")
 
 
+# 以数据库确认偏移校准磁盘分片，逐项核对清单和摘要后才接受后续写入。
 def _reconcile(
     factory: sessionmaker[Session], store: MediaStore, upload: UploadHandoff
 ) -> list[UploadChunk]:
@@ -328,6 +330,7 @@ def get_upload_status(
         lease.release()
 
 
+# 分片写入先核验会话所有权、偏移和摘要；已确认的重复分片按幂等重放处理。
 async def write_upload_chunk(
     request: Request,
     factory: sessionmaker[Session],
@@ -510,6 +513,7 @@ def _promoted_content_matches(store: MediaStore, upload: UploadHandoff, *, targe
     return byte_count == upload.byte_count and digest_value == upload.content_sha256
 
 
+# 正式文件已接管时补齐视频记录和上传完成状态，使崩溃后的恢复可重复执行。
 def _finish_promoting_upload(
     factory: sessionmaker[Session], store: MediaStore, upload_id: uuid.UUID
 ) -> Video | None:
@@ -535,6 +539,7 @@ def _finish_promoting_upload(
     return _find_video(factory, upload_id)
 
 
+# 仅当全部字节已确认并通过整文件校验后才进入正式文件接管流程。
 async def complete_upload_session(
     factory: sessionmaker[Session],
     settings: Settings,
@@ -788,6 +793,7 @@ def abandon_upload_session(
         lease.release()
 
 
+# 到期回收按持久化状态和租约判断处理对象，正式交接中的文件会先恢复而非删除。
 def reclaim_expired_uploads(
     factory: sessionmaker[Session],
     store: MediaStore,
@@ -844,6 +850,7 @@ def reclaim_expired_uploads(
     return removed
 
 
+# 启动时扫描未完成交接并修复状态，避免遗留临时文件或已接管文件失去记录。
 def recover_resumable_uploads_on_startup(
     factory: sessionmaker[Session], store: MediaStore
 ) -> None:
