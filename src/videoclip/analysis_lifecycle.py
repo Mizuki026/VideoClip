@@ -290,6 +290,7 @@ def create_followup_attempt(
                 return FollowupResult(
                     RecoverySubmission(task.id, parent.id, False), False, "stop_confirmation_required"
                 )
+        # 创建后续 attempt 前必须先把当前执行的可信停止证据写入数据库。
         if mode_for_eligibility in {"automatic_recovery", "manual_recovery", "manual_summary", "wait_resume"}:
             if not _verified_stop(session, task, parent, settings):
                 if mode.startswith("manual"):
