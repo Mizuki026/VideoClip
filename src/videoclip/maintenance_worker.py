@@ -30,6 +30,7 @@ DEFAULT_SCAN_LIMIT = 4
 MAX_SCAN_LIMIT = 8
 
 
+# 调度锁带有过期时间和所有者标记，防止多个定时触发同时启动同一轮扫描。
 def _claim_schedule_lock(token: str, client: Any | None = None) -> bool:
     redis_client = client or Redis.from_url(BROKER_URL, decode_responses=True)
     try:
@@ -67,6 +68,7 @@ def _release_schedule_lock(token: str, client: Any | None = None) -> bool:
             redis_client.close()
 
 
+# 维护任务开始前取得单飞锁，结束时只有锁所有者才能释放它。
 class SingleFlightMaintenanceTask(Task):  # type: ignore[misc]
     """Coalesce scheduled work with an expiring, owner-checked Redis lock."""
 
@@ -155,6 +157,7 @@ def _reclaim_with_database_lock(
         connection.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": RECLAIM_ADVISORY_LOCK_ID})
 
 
+# 获得数据库事务锁后才扫描到期记录，避免不同维护进程重叠协调。
 def _coordinate_with_database_lock(
     factory: sessionmaker[Session],
     connection: Connection,
@@ -221,6 +224,7 @@ def _coordinate_with_database_lock(
     soft_time_limit=140,
     time_limit=150,
 )
+# 定时清理只处理已过期且状态允许回收的上传，不改写有效续传进度。
 def reclaim_expired_uploads_task(_schedule_lock_token: str | None = None) -> dict[str, int | str]:
     del _schedule_lock_token
     settings = get_settings()
@@ -256,6 +260,7 @@ def reclaim_expired_uploads_task(_schedule_lock_token: str | None = None) -> dic
     soft_time_limit=140,
     time_limit=150,
 )
+# 定时投递扫描负责处理到期预留和补投，实际发送由统一协调器执行。
 def coordinate_analysis_deliveries_task(_schedule_lock_token: str | None = None) -> dict[str, int | str]:
     del _schedule_lock_token
     settings = get_settings()
