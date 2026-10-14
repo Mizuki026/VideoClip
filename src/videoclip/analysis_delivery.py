@@ -81,6 +81,7 @@ def _backoff_seconds(policy: DeliveryPolicy, retry_count: int) -> int:
     return int(min(policy.backoff_max_seconds, policy.backoff_base_seconds * factor))
 
 
+# 协调器按固定顺序锁定任务、尝试和投递记录，串行修改同一代投递状态。
 def _locked_delivery_rows(
     session: Session, task_id: uuid.UUID, attempt_id: uuid.UUID
 ) -> tuple[Video, AnalysisTask, AnalysisAttempt, TaskDelivery] | None:
@@ -233,6 +234,7 @@ def _exhaust_delivery_budget(
     delivery.updated_at = now
 
 
+# 预留时先在短事务中递增代次并记录期限，提交后才调用消息代理。
 def _reserve_delivery(
     factory: sessionmaker[Session],
     task_id: uuid.UUID,
@@ -342,6 +344,7 @@ def timedelta_deadline(now: datetime, deadline_seconds: int) -> datetime:
     return now + timedelta(seconds=deadline_seconds)
 
 
+# 回写结果前核对预留代次，迟到的旧结果不能覆盖更新一轮投递状态。
 def _record_delivery_outcome(
     factory: sessionmaker[Session],
     reservation: DeliveryReservation,
@@ -382,6 +385,7 @@ def _record_delivery_outcome(
         return True
 
 
+# 先持久化发送意图再发布消息；结果不确定时留给后续协调扫描补投。
 def coordinate_analysis_delivery(
     factory: sessionmaker[Session],
     task_id: uuid.UUID,
@@ -438,6 +442,7 @@ def coordinate_analysis_delivery(
     return "sent" if outcome == "sent" and written else outcome if written else "superseded"
 
 
+# 按到期时间批量处理待投递任务，并限制每轮扫描数量。
 def coordinate_due_analysis_deliveries(
     factory: sessionmaker[Session],
     publisher: Publisher,
