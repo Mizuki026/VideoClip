@@ -370,6 +370,7 @@ def _claim_attempt(
             or attempt.task_id != task.id
         ):
             return None
+        # 收到消息不代表可以执行；领取阶段还要核对全局未确认执行位。
         if find_unconfirmed_execution(session) is not None:
             return None
         if find_next_queued_task(session) != task.id:
@@ -922,6 +923,7 @@ def _persist_transcript(
         )
         if segment is None or segment.status != "expected" or segment.request_count != 1:
             raise AnalysisFailure("TRANSCRIPT_CHECKPOINT_NOT_ELIGIBLE")
+        # 成功文本和检查点状态在同一事务提交，未提交的模型响应不能复用。
         segment.text = text_value
         segment.status = "succeeded"
         segment.request_finished_at = datetime.now(UTC)
