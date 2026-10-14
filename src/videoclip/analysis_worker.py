@@ -170,6 +170,7 @@ class ManifestEntry:
     pcm_end_byte: int
 
 
+# 持有数据库专用连接和会话级互斥锁，整个分析执行期间占用唯一执行位。
 class ExecutionLease:
     """Dedicated PostgreSQL session retaining the deployment-wide advisory lock."""
 
@@ -257,6 +258,7 @@ class ExecutionLease:
             self.connection.close()
 
 
+# 从已探测媒体生成不可变片段清单，记录音频区间、视频映射和源文件指纹。
 def build_manifest(
     *, pcm_bytes: int, duration_seconds: float, sample_rate: int, channels: int, segment_seconds: int
 ) -> list[ManifestEntry]:
@@ -342,6 +344,7 @@ def _lock_execution_rows(
     return task, attempt, video, execution
 
 
+# 收到消息后重新检查当前任务、排队顺序和全局执行位，避免重复或越权领取。
 def _claim_attempt(
     lease: ExecutionLease,
     task_id: uuid.UUID,
@@ -507,6 +510,7 @@ def _signal_process_group(process_group: int, signal_number: int) -> None:
     kill_group(process_group, signal_number)
 
 
+# 先请求子进程组退出，再按期限升级信号；未确认整组退出前不释放执行身份。
 def _stop_process_group(process: subprocess.Popen[bytes], grace_seconds: float) -> None:
     process_group = process.pid
     if os.name == "nt":
@@ -553,6 +557,7 @@ def _stop_process_group(process: subprocess.Popen[bytes], grace_seconds: float) 
         raise StopUnconfirmed()
 
 
+# 在监督边界内启动外部程序，并把退出码、超时和停止证据交回调用方。
 def _run_process(
     command: list[str],
     *,
@@ -905,6 +910,7 @@ def _start_segment_request(
     return segment
 
 
+# 只有当前执行持有有效身份且片段请求仍符合预期时，才提交文本和检查点状态。
 def _persist_transcript(
     maker: sessionmaker[Session],
     lease: ExecutionLease,
@@ -1214,6 +1220,7 @@ def _read_asr_result(path: Path, return_code: int, max_bytes: int) -> tuple[str,
     return payload["text"], metadata
 
 
+# 按清单逐片生成音频并调用识别服务，成功片段及时落库供恢复复用。
 def _transcribe(
     maker: sessionmaker[Session],
     lease: ExecutionLease,
@@ -1574,6 +1581,7 @@ def _record_summary_failure(
         )
 
 
+# 再次核对当前尝试和执行身份，并依靠任务唯一约束避免重复发布摘要。
 def _publish_summary(
     maker: sessionmaker[Session],
     lease: ExecutionLease,
@@ -1718,6 +1726,7 @@ def _read_llm_result(path: Path, maximum_bytes: int) -> tuple[str, dict[str, Any
     return payload["content"], metadata
 
 
+# 读取已核验转写和冻结配置后调用摘要服务，模型返回仍须经过后端契约校验。
 def _summarize(
     maker: sessionmaker[Session],
     lease: ExecutionLease,
@@ -1983,6 +1992,7 @@ def _get_or_make_worker_components(
     soft_time_limit=10_830,
     time_limit=10_860,
 )
+# 后台任务入口解析任务与尝试编号，领取执行位后才进入转写或摘要阶段。
 def transcribe_analysis(task_id_value: str, attempt_id_value: str | None = None) -> dict[str, str]:
     if attempt_id_value is None:
         return {"status": "ignored_legacy_task_message"}
