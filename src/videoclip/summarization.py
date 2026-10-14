@@ -611,6 +611,7 @@ def validate_summary_output(
             if type(segment_id) is not int or segment_id not in by_id:
                 raise SummaryFailure("SUMMARY_UNKNOWN_SEGMENT")
             source = by_id[segment_id]
+            # 模型只选择转写片段编号；引用原文和视频时间由后端从已校验记录生成。
             quote = _quote_for(text_value.strip(), str(source["text"]))
             start = float(source["video_start_seconds"])
             end = float(source["video_end_seconds"])
