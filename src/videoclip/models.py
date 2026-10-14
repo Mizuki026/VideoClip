@@ -173,6 +173,7 @@ class CleanupIntent(Base):
     )
 
 
+# 任务行保存用户可见状态和当前尝试指针；单次执行身份由独立记录跟踪。
 class AnalysisTask(Base):
     __tablename__ = "analysis_tasks"
     __table_args__ = (
@@ -403,6 +404,7 @@ class TranscriptSegment(Base):
     request_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
 
+# 部分唯一索引约束全局未确认停止的执行记录最多只有一条。
 class AnalysisExecution(Base):
     __tablename__ = "analysis_executions"
     __table_args__ = (
