@@ -110,6 +110,7 @@ def evaluate_recovery(
 
     if claim_count != 1:
         return RecoveryEligibility(False, "ATTEMPT_STATE_INVALID")
+    # 已领取的执行必须同时有 attempt 与 execution 的停止确认，超时本身不能作为停止证明。
     if attempt_stop_confirmed and execution_stop_confirmed:
         if attempt_status in {"failed", "running"} and task_status in {"failed", "running"}:
             return RecoveryEligibility(True, None)
