@@ -113,6 +113,7 @@ def read_boot_id() -> str:
     return value
 
 
+# 记录进程号、启动时刻、系统会话和容器身份，后续只核验最初绑定的执行范围。
 def establish_execution_boundary() -> WorkerBoundary:
     if not sys.platform.startswith("linux") or not hasattr(os, "setsid"):
         raise BoundaryUnknown("trusted analysis execution requires a Linux session boundary")
@@ -158,6 +159,7 @@ def _identity_json(identity: ExecutionIdentity) -> dict[str, object]:
     }
 
 
+# 把执行身份注册给监督进程，使工作进程退出后仍能独立完成进程清点。
 def register_execution_with_supervisor(identity: ExecutionIdentity, socket_path: Path = SOCKET_PATH) -> None:
     address_family = getattr(socket, "AF_UNIX", None)
     if address_family is None:
@@ -200,6 +202,7 @@ def _identity_from_payload(value: Any) -> ExecutionIdentity:
 
 
 # 按绑定的 Linux session 清点活进程；心跳超时本身不能证明执行者已经退出。
+# 按绑定的系统会话清点活动进程；心跳超时不能单独证明执行者已经退出。
 def _processes_in_session(session_id: int) -> list[ProcessStat]:
     proc = Path("/proc")
     if not proc.is_dir():
@@ -245,6 +248,7 @@ def _leader_state(identity: ExecutionIdentity) -> Literal["alive", "exited", "mi
     return "alive"
 
 
+# 向原会话中的进程组发送终止信号，并在所有进程退出后才返回确认结果。
 def _terminate_session(identity: ExecutionIdentity, *, include_leader: bool) -> bool:
     leader_state = _leader_state(identity)
     if leader_state == "mismatch" or (leader_state == "alive" and not include_leader):
@@ -273,6 +277,7 @@ def _terminate_session(identity: ExecutionIdentity, *, include_leader: bool) -> 
     return not _processes_in_session(identity.boundary_session_id)
 
 
+# 监督进程集中处理执行注册、停止请求和退出确认，不依赖工作进程自身报告存活。
 class AnalysisSupervisor:
     def __init__(
         self,
@@ -515,6 +520,7 @@ def _worker_command() -> list[str]:
     ]
 
 
+# 启动本地监督服务并接管工作进程退出后的清理职责。
 def run_supervisor() -> int:
     if not sys.platform.startswith("linux"):
         raise RuntimeError("trusted analysis supervision is supported only in the Linux Worker container")
