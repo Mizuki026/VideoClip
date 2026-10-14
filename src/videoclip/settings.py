@@ -15,6 +15,7 @@ def _missing_app_secret() -> SecretStr:
     raise RuntimeError("APP_SECRET_KEY is required")
 
 
+# 应用所需的数据库、媒体、会话和模型参数集中在此处声明，并由环境配置覆盖默认值。
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file="data/mvp-stage-1/.env",
@@ -195,5 +196,6 @@ class Settings(BaseSettings):
 
 
 @lru_cache(maxsize=1)
+# 配置对象按进程缓存，避免每个请求重复读取和解析环境变量。
 def get_settings() -> Settings:
     return Settings()
