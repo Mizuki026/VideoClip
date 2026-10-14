@@ -63,6 +63,7 @@ def enter_model_wait(
         if task.model_wait_single_deadline_at
         else started_at + timedelta(seconds=single_limit_seconds)
     )
+    # 冷却期限先持久化，再由维护扫描到期唤醒；Worker 不在这里占用执行位等待。
     task.model_wait_until = until
     task.model_wait_reason = "MODEL_COOLDOWN"
     task.model_wait_error_code = None
