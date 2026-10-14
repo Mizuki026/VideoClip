@@ -49,5 +49,6 @@
 - 完整后端测试：160 passed，1 个 Starlette/AnyIO 弃用警告。前端 lint、构建通过，前端测试 14 passed；Stage 0 测试 32 passed；Ruff、mypy 和依赖检查通过。
 - 在独立 PostgreSQL 数据库中回退并重放迁移：旧 `consecutive_rate_limits=7` 升级后为 `consecutive_backpressure_responses=7`；`alembic check` 无差异。
 - 完整后端验证日志保存在 `data/mvp-stage-2/acceptance/model-overload-final-11a8e000ac724d4e9644e84ce6ef42bc/pytest-full.log`。Worker 保留日志中按三个 attempt ID 检索到执行清理记录；失败码、请求耗时与状态以 `summary_requests` 和 `analysis_events` 为准。供应商正文和密钥未被记录到此诊断文档。
+- 修复提交 `aef2774` 已通过干净构建上下文部署到本机 Stage 2。迁移后数据库版本为 `c7a3951e2f48 (head)`，API `/health` 为 `ok`，API/Worker/maintenance worker/Beat 均运行，分析队列与活动执行数均为 0。部署日志保存在 `data/mvp-stage-2/acceptance/stage2-deploy-5db366d36cfb4fe2b49d3f16859106af.log`。
 
 修复已由本地 HTTP 替身和隔离数据库验证；没有对真实供应商发起额外请求。用户截图中的视频仍为 `failed`，总结请求数已达 3/3，因此本次修复不能追溯生成这条视频的总结；需要供应商可用且用户在预算允许后发起新请求才能验证真实恢复。
