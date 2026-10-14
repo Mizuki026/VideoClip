@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from videoclip.models import AnalysisAttempt, AnalysisExecution, AnalysisTask, Video
 
+# 投递协调只短暂持有事务锁；执行期间的全局占位由 Worker 会话锁负责。
 EXECUTION_ADVISORY_LOCK_KEY = 0x566964656F436C69
 
 
