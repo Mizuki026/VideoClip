@@ -26,6 +26,7 @@ class Base(DeclarativeBase):
     pass
 
 
+# 用户表保存账户身份；登录会话另存随机令牌摘要、过期时间和撤销时间。
 class User(Base):
     __tablename__ = "users"
     __table_args__ = (UniqueConstraint("username", name="uq_users_username"),)
@@ -56,6 +57,7 @@ class SessionRecord(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+# 上传交接表持久化分片进度和文件接管阶段，数据库确认偏移是续传的权威位置。
 class UploadHandoff(Base):
     __tablename__ = "upload_handoffs"
     __table_args__ = (
@@ -116,6 +118,7 @@ class UploadChunk(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+# 视频记录关联已校验媒体、用户笔记、删除状态和当前分析任务。
 class Video(Base):
     __tablename__ = "videos"
     __table_args__ = (
@@ -152,6 +155,7 @@ class Video(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+# 清理意图先落库再执行文件操作，使进程中断后的清理可以安全重试。
 class CleanupIntent(Base):
     __tablename__ = "cleanup_intents"
     __table_args__ = (
@@ -296,6 +300,7 @@ class AnalysisTask(Base):
     )
 
 
+# 每次分析尝试独立保存状态、预算和停止确认，任务记录只指向当前尝试。
 class AnalysisAttempt(Base):
     __tablename__ = "analysis_attempts"
     __table_args__ = (
@@ -347,6 +352,7 @@ class AnalysisAttempt(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+# 投递记录持久化消息发送代次、退避时间和最终状态，不依赖消息代理保存业务结果。
 class TaskDelivery(Base):
     __tablename__ = "task_deliveries"
     __table_args__ = (
@@ -368,6 +374,7 @@ class TaskDelivery(Base):
     )
 
 
+# 转写片段按尝试和片段编号唯一定位，状态与请求次数共同决定能否作为检查点复用。
 class TranscriptSegment(Base):
     __tablename__ = "transcript_segments"
     __table_args__ = (
@@ -455,6 +462,7 @@ class AnalysisExecution(Base):
     stop_evidence_sha256: Mapped[str | None] = mapped_column(String(64))
 
 
+# 每个任务只保存一份已发布摘要，并记录生成它的尝试及转写指纹。
 class AnalysisSummary(Base):
     __tablename__ = "analysis_summaries"
     __table_args__ = (
@@ -525,6 +533,7 @@ class SummaryRequest(Base):
     correction_error_code: Mapped[str | None] = mapped_column(String(64))
 
 
+# 共享冷却按服务商、账户引用和模型定位，让同一模型的任务共用限流等待期限。
 class SharedModelCooldown(Base):
     __tablename__ = "shared_model_cooldowns"
     __table_args__ = (
@@ -548,6 +557,7 @@ class SharedModelCooldown(Base):
     )
 
 
+# 分析事件使用稳定业务键去重，记录状态变化和内部引用而不保存正文内容。
 class AnalysisEvent(Base):
     __tablename__ = "analysis_events"
     __table_args__ = (
