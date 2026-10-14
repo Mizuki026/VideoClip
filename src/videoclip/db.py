@@ -27,6 +27,7 @@ def create_session_factory(engine: Engine) -> sessionmaker[Session]:
 @contextmanager
 def transaction(factory: sessionmaker[Session]) -> Iterator[Session]:
     with factory() as session:
+        # 同一事务内的写入一起提交；代码抛出异常时由事务上下文回滚。
         with session.begin():
             yield session
 
