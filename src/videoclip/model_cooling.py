@@ -59,6 +59,7 @@ def require_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+# 将服务商、非敏感账户引用和模型名组合成共享冷却键，不把访问密钥放进标识。
 def model_identity(provider: object, account_reference: object, model: object) -> ModelIdentity:
     if not isinstance(provider, str) or not re.fullmatch(r"[a-z0-9_-]{1,32}", provider):
         raise ValueError("invalid model provider identity")
@@ -131,6 +132,7 @@ def fallback_cooldown_seconds(
     return lower + int(random_fraction * width)
 
 
+# 优先采用服务端返回的重试时间；缺失或无效时使用有上限的退避时长。
 def proposed_cooldown_deadline(
     *,
     now: datetime,
@@ -163,6 +165,7 @@ def current_cooldown_until(session: Session, identity: ModelIdentity) -> datetim
 
 
 # 429 与模型过载的冷却期限按服务商、账户引用和模型共享。
+# 通过数据库行锁合并并发冷却更新，只延长到更晚的期限并累计限流次数。
 def extend_shared_cooldown(
     factory: sessionmaker[Session],
     identity: ModelIdentity,
@@ -221,6 +224,7 @@ def extend_shared_cooldown(
         return CooldownUpdate(identity, require_utc(row.cooldown_until), count, accepted)
 
 
+# 成功响应清除连续限流计数，为之后的新一轮限流重新计算退避。
 def record_model_success(
     factory: sessionmaker[Session],
     identity: ModelIdentity,
