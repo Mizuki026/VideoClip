@@ -642,6 +642,7 @@ def delete_video_media(
                 status_code=409,
                 detail={"code": "VIDEO_DELETION_IN_PROGRESS", "deletion_eligible": False},
             )
+        # 先持久化删除意图并取消未完成分析；磁盘清理在数据库事务提交后执行。
         if video.media_status == "available":
             video.media_status = "deletion_pending"
             video.media_error_code = None
