@@ -93,6 +93,7 @@ def _transcript_rows(session: Session, attempt_id: uuid.UUID) -> list[dict[str, 
     ]
 
 
+# 恢复前统一核验片段编号、时间范围、来源和清单指纹，避免复用不完整或错源的转写。
 def _validated_transcript(
     session: Session, video: Video, attempt: AnalysisAttempt
 ) -> tuple[list[dict[str, Any]], str]:
@@ -132,6 +133,7 @@ def _validated_transcript(
     return validated, transcript_fingerprint
 
 
+# 只有与当前不可变清单一致的完整转写才从父尝试复制，摘要续跑无需重复调用语音服务。
 def _copy_complete_transcript(
     session: Session, source_attempt: AnalysisAttempt, target_attempt: AnalysisAttempt
 ) -> None:
@@ -168,6 +170,7 @@ def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+# 为视频源文件和选定音轨生成稳定指纹，用于恢复时确认分析输入没有变化。
 def build_source_fingerprint(video: Video, audio_stream_index: int) -> str:
     return canonical_sha256(
         {
@@ -183,6 +186,7 @@ def build_source_fingerprint(video: Video, audio_stream_index: int) -> str:
     )
 
 
+# 把模型、提示版本、切片参数和源文件指纹冻结在任务快照中，后续检查点按此核对。
 def build_configuration_snapshot(video: Video, settings: Settings) -> dict[str, Any]:
     streams = video.media_info.get("streams", [])
     audio_stream = next(
@@ -272,6 +276,7 @@ def build_configuration_snapshot(video: Video, settings: Settings) -> dict[str, 
     return snapshot
 
 
+# 锁定视频后先复用现有当前任务；创建新任务时一并保存快照、首次尝试和投递预算。
 def submit_analysis_task(
     factory: sessionmaker[Session], owner_id: uuid.UUID, video_id: uuid.UUID, settings: Settings
 ) -> SubmittedTask:
@@ -352,6 +357,7 @@ def submit_analysis_task(
         return SubmittedTask(task_id=task.id, attempt_id=attempt.id, created=True)
 
 
+# 恢复入口将状态判断交给生命周期模块，统一检查停止证明、恢复次数和失败类型。
 def recover_analysis_attempt(
     factory: sessionmaker[Session],
     owner_id: uuid.UUID,
@@ -422,6 +428,7 @@ def continue_summary_attempt(
     ).submission
 
 
+# 把任务、当前尝试、投递状态、冷却等待和恢复资格组装成前端轮询快照。
 def task_response(
     factory: sessionmaker[Session],
     owner_id: uuid.UUID,
@@ -647,6 +654,7 @@ def task_response(
         )
 
 
+# 转写响应只整理当前任务可见的片段，并明确给出是否已经完整。
 def transcript_response(
     factory: sessionmaker[Session], owner_id: uuid.UUID, video_id: uuid.UUID
 ) -> TranscriptResponse:
