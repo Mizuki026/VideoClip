@@ -155,6 +155,7 @@ def confirm_stopped_execution(
     if video_id is None:
         return "rejected"
 
+    # 先锁定原 task、attempt 和 execution 再校验身份，旧容器或旧 generation 的证据不能解锁。
     with db_transaction(factory) as session:
         video = session.scalar(select(Video).where(Video.id == video_id).with_for_update())
         task = session.scalar(
