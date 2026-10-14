@@ -169,6 +169,7 @@ class JsonBodyLimitMiddleware:
         await send({"type": "http.response.body", "body": body})
 
 
+# 每个请求都用 Cookie 令牌摘要检查会话有效性，不信任客户端提供的用户编号。
 def _current_auth(
     request: Request, factory: sessionmaker[Session], required: bool = True
 ) -> tuple[User, SessionRecord] | None:
@@ -254,6 +255,7 @@ def _video_detail(video: Video) -> VideoDetailResponse:
     )
 
 
+# 播放接口只接受单个字节区间，多区间 Range 请求会被拒绝。
 def _parse_range(value: str, byte_count: int) -> tuple[int, int] | None:
     if byte_count <= 0 or not value.startswith("bytes=") or "," in value:
         return None
