@@ -37,6 +37,7 @@ class User(Base):
 
 
 class SessionRecord(Base):
+    # 登录会话保存在 sessions 表，Cookie 中的原始令牌不入库。
     __tablename__ = "sessions"
     __table_args__ = (
         UniqueConstraint("token_hash", name="uq_sessions_token_hash"),
@@ -44,10 +45,13 @@ class SessionRecord(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # 外键把会话绑定到用户，删除用户时一并清理其会话。
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
+    # 分别保存登录令牌和 CSRF Token 的摘要，用于请求校验。
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     csrf_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # expires_at 控制自然过期；revoked_at 非空表示主动撤销，旧 Cookie 随即失效。
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
