@@ -13,11 +13,13 @@ DELIVERY_INTERVAL_SECONDS = int(os.environ.get("ANALYSIS_DELIVERY_INTERVAL_SECON
 if not 60 <= DELIVERY_INTERVAL_SECONDS <= 3600:
     raise RuntimeError("ANALYSIS_DELIVERY_INTERVAL_SECONDS must be between 60 and 3600")
 
+# 此处绑定消息代理并加载分析与维护任务模块，具体业务状态仍由数据库负责。
 celery_app = Celery(
     "videoclip",
     broker=BROKER_URL,
     include=["videoclip.analysis_worker", "videoclip.maintenance_worker"],
 )
+# 队列路由、单并发消费和定时扫描在此统一配置，避免多个分析任务同时占用执行位。
 celery_app.conf.update(
     task_default_queue="analysis",
     task_default_exchange="analysis",
