@@ -169,6 +169,7 @@ def _coordinate_with_database_lock(
     if not acquired:
         return {"status": "overlap_skipped", "scanned": 0, "published": 0, "blocked": 0, "exhausted": 0}
     try:
+        # Redis 锁用于合并调度触发，数据库 advisory lock 再避免多个协调周期重叠。
         recovery = (
             coordinate_due_analysis_recoveries(
                 factory,
