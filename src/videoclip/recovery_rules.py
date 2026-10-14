@@ -79,6 +79,7 @@ class RecoveryEligibility:
     available_at: datetime | None = None
 
 
+# 恢复资格由任务、尝试、视频状态、失败类型和可信停止证据共同决定，超时不等于停止。
 def evaluate_recovery(
     *,
     video_status: str,
@@ -117,6 +118,7 @@ def evaluate_recovery(
     return RecoveryEligibility(False, "STOP_CONFIRMATION_REQUIRED")
 
 
+# 复用转写检查点前逐项比较不可变清单，源文件或分析配置变化都会使检查点失效。
 def checkpoint_matches(
     previous: Mapping[str, Any],
     expected: Mapping[str, Any],
