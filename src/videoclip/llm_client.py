@@ -56,6 +56,7 @@ def _retry_after_header(response: httpx.Response) -> str | None:
     return value.strip()
 
 
+# 模型响应逐块读取并同时检查总期限和最大字节数，避免无界缓冲。
 def _read_response(response: httpx.Response, maximum: int, deadline: float) -> bytes:
     length_header = response.headers.get("content-length")
     if length_header and length_header.isdecimal() and int(length_header) > maximum:
@@ -88,6 +89,7 @@ def _trace_id(response: httpx.Response) -> str | None:
 
 
 # 总请求期限覆盖完整响应读取，避免慢速分块绕过单次读取超时。
+# 一次请求的总期限覆盖完整响应读取，不能被反复返回小数据块绕过。
 def request_completion(
     request: dict[str, Any],
     *,
@@ -193,6 +195,7 @@ def request_completion(
         raise LlmCallError("LLM_NETWORK_ERROR") from exc
 
 
+# 命令行入口只负责保存结构化模型响应，任务状态仍由后端业务事务维护。
 def _write_output(path: Path, result: dict[str, Any], maximum_bytes: int) -> None:
     encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(encoded) > maximum_bytes:
