@@ -51,6 +51,7 @@ def _number(value: Any, field: str) -> float:
     return result
 
 
+# 媒体白名单同时核验容器、音视频编码、轨道数量、时长和时间戳证据。
 def validate_probe(probe: dict[str, Any], max_seconds: float = 1200.0) -> MediaInfo:
     fmt = probe.get("format")
     if not isinstance(fmt, dict):
@@ -124,6 +125,7 @@ def validate_probe(probe: dict[str, Any], max_seconds: float = 1200.0) -> MediaI
     )
 
 
+# 探测进程受总时限和输出字节上限约束，超时后会逐级终止并确认读取线程退出。
 def _run_bounded(command: list[str], timeout: float, grace: float, max_output: int) -> bytes:
     launch_options: dict[str, Any] = {}
     if os.name == "nt":
@@ -212,6 +214,7 @@ def _run_bounded(command: list[str], timeout: float, grace: float, max_output: i
     return bytes(captured)
 
 
+# 只请求生成校验所需的媒体元数据，再把解析结果交给统一白名单验证。
 def probe_media(path: Path, executable: str, timeout: float, grace: float) -> MediaInfo:
     command = [
         executable,
