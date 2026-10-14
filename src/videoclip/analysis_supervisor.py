@@ -199,6 +199,7 @@ def _identity_from_payload(value: Any) -> ExecutionIdentity:
     )
 
 
+# 按绑定的 Linux session 清点活进程；心跳超时本身不能证明执行者已经退出。
 def _processes_in_session(session_id: int) -> list[ProcessStat]:
     proc = Path("/proc")
     if not proc.is_dir():
