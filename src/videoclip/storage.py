@@ -149,6 +149,7 @@ class MediaStore:
             if expected_offset != confirmed_offset:
                 raise StorageFailure(errno.EIO, "confirmed upload manifest does not match offset")
 
+            # 只有文件长度、修改时间和确认偏移均匹配时才复用前缀摘要，否则逐片重算。
             cached = self._verified_upload_prefixes.get(upload_id)
             cache_matches = (
                 cached is not None
