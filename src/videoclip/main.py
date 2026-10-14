@@ -173,6 +173,8 @@ class JsonBodyLimitMiddleware:
 def _current_auth(
     request: Request, factory: sessionmaker[Session], required: bool = True
 ) -> tuple[User, SessionRecord] | None:
+    # HttpOnly 只限制前端脚本读取，浏览器仍会随请求发送登录 Cookie。
+    # 用令牌摘要匹配数据库，只接受未撤销且未过期的会话。
     token = request.cookies.get(SESSION_COOKIE, "")
     if not token or len(token) > 128:
         if required:
@@ -200,6 +202,7 @@ def _require_csrf(
     factory: sessionmaker[Session],
     current: tuple[User, SessionRecord] | None,
 ) -> None:
+    # 浏览器会自动携带登录 Cookie，修改操作还要核对请求来源和 CSRF Token。
     origin = request.headers.get("origin")
     header_token = request.headers.get("x-csrf-token", "")
     cookie_token = request.cookies.get(CSRF_COOKIE, "")
@@ -220,6 +223,8 @@ def _require_csrf(
 
 
 def _set_csrf_cookie(response: Response, token: str, settings: Settings, max_age: int) -> None:
+    # CSRF Cookie 不设置 HttpOnly；前端通过 /auth/csrf 获取同一个令牌。
+    # 写请求把令牌放入请求头，后端再与 Cookie 和会话记录核对。
     response.set_cookie(
         CSRF_COOKIE,
         token,
@@ -408,6 +413,7 @@ def create_app(
 
     @app.get("/auth/csrf", response_model=CsrfResponse)
     def csrf_token(response: Response, request: Request) -> CsrfResponse:
+        # 复用有效令牌；已登录会话的 CSRF 绑定失效时，重新生成并更新记录。
         current = _current_auth(request, resolved_factory, required=False)
         cookie_token = request.cookies.get(CSRF_COOKIE, "")
         secret = resolved_settings.app_secret_key.get_secret_value()
@@ -439,6 +445,7 @@ def create_app(
 
     @app.post("/auth/login", response_model=UserResponse)
     def login(payload: LoginRequest, request: Request, response: Response) -> UserResponse:
+        # 验证账号密码后创建数据库会话，响应正文只返回用户信息。
         current = _current_auth(request, resolved_factory, required=False)
         _require_csrf(request, resolved_settings, resolved_factory, current)
         try:
@@ -491,6 +498,8 @@ def create_app(
                     expires_at=expires,
                 )
             )
+        # 登录 Cookie 保存随机令牌原值，数据库保存对应哈希。
+        # HttpOnly 禁止脚本读取，Secure 和 SameSite 的取值由配置决定。
         response.set_cookie(
             SESSION_COOKIE,
             raw_session,
@@ -506,11 +515,13 @@ def create_app(
 
     @app.get("/auth/me", response_model=UserResponse)
     def me(request: Request) -> UserResponse:
+        # 刷新页面后凭已有 Cookie 找回用户，无需重新提交账号密码。
         user, _ = _current_auth(request, resolved_factory) or _raise_auth()
         return UserResponse(id=user.id, username=user.username)
 
     @app.post("/auth/logout", status_code=204)
     def logout(request: Request, response: Response) -> Response:
+        # 先撤销数据库会话，再清除 Cookie，使退出前的旧令牌也无法继续使用。
         current = _current_auth(request, resolved_factory)
         _require_csrf(request, resolved_settings, resolved_factory, current)
         assert current is not None
