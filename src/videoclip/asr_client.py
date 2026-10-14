@@ -63,6 +63,7 @@ def _retry_after_header(response: httpx.Response) -> str | None:
     return value.strip()
 
 
+# 音频请求受阶段超时和总期限约束，响应体也按字节上限流式读取。
 def transcribe(
     audio_path: Path,
     *,
