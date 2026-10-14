@@ -131,6 +131,7 @@ def _finish_failed_upload(
     return True
 
 
+# 把待验证文件的接管意图先写入数据库，失败后仍可由恢复任务继续处理。
 def _create_handoff(
     factory: sessionmaker[Session],
     owner_id: uuid.UUID,
@@ -180,6 +181,7 @@ def _set_upload_promoting(factory: sessionmaker[Session], upload_id: uuid.UUID, 
         _intent_for_upload(session, upload.owner_id, upload_id, "promotion_pending")
 
 
+# 只有媒体探测通过且正式文件已落盘后，事务才把视频标为可用。
 def _complete_upload(factory: sessionmaker[Session], upload_id: uuid.UUID) -> Video:
     with db_transaction(factory) as session:
         upload = session.get(UploadHandoff, upload_id, with_for_update=True)
@@ -227,6 +229,7 @@ def upload_response_data(factory: sessionmaker[Session], upload_id: uuid.UUID) -
         return video
 
 
+# 上传流先写临时文件并限制总字节数，校验摘要和媒体格式后才接管为正式视频。
 async def receive_video_upload(
     request: Request,
     factory: sessionmaker[Session],
@@ -628,6 +631,7 @@ def _resume_media_cleanup(
         lease.release()
 
 
+# 先持久化媒体删除意图并取消未完成分析，再在事务外等待停止确认和清理文件。
 def delete_video_media(
     factory: sessionmaker[Session], store: MediaStore, owner_id: uuid.UUID, video_id: uuid.UUID
 ) -> bool:
@@ -736,6 +740,7 @@ def recover_pending_media_deletions(
     return completed
 
 
+# 删除视频记录前先检查活动尝试与停止证明，防止仍运行的进程继续访问源文件。
 def delete_video(
     factory: sessionmaker[Session], store: MediaStore, owner_id: uuid.UUID, video_id: uuid.UUID
 ) -> int:
@@ -1107,6 +1112,7 @@ def _set_media_cleanup_failure(
             intent.attempts += 1
 
 
+# 只清理已有可信停止确认的尝试文件；失败时保留意图和错误码供后续重试。
 def retry_attempt_cleanup(
     factory: sessionmaker[Session],
     store: MediaStore,
