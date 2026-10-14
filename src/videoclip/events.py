@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from videoclip.models import AnalysisEvent, AnalysisTask
 
+# 时间线事件名采用白名单，事件内容只保存内部引用，不写入转写正文或模型响应。
 EVENT_TYPES = frozenset(
     {
         "analysis_submitted",
