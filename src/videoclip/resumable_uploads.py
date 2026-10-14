@@ -349,6 +349,7 @@ async def write_upload_chunk(
         expected_sha = upload.expected_content_sha256
         if total_bytes is None or expected_sha is None:
             raise _error(500, "UPLOAD_STORAGE_CORRUPT")
+        # 先按数据库记录的确认偏移校准磁盘文件，再判断分片是重放还是下一片。
         chunks = _reconcile(factory, store, upload)
         next_index = len(chunks)
         replay = chunk_index < next_index
