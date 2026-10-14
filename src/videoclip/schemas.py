@@ -121,6 +121,7 @@ class AnalysisAttemptResponse(BaseModel):
     failure_code: str | None
 
 
+# 任务响应汇总前端恢复状态所需的投递、等待与重试信息。
 class AnalysisTaskResponse(BaseModel):
     id: UUID
     video_id: UUID
