@@ -416,8 +416,8 @@ def test_media_delete_invalidates_queued_wait_and_automatic_recovery_plans(
                     account_reference="stage-six-shared-account",
                     model="stage-six-model",
                     cooldown_until=due,
-                    consecutive_rate_limits=1,
-                    last_rate_limited_at=datetime.now(UTC),
+                    consecutive_backpressure_responses=1,
+                    last_backpressure_at=datetime.now(UTC),
                 )
                 session.add(cooldown)
                 session.flush()

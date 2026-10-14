@@ -26,6 +26,7 @@ EVENT_TYPES = frozenset(
         "model_wait_entered",
         "model_wait_resumed",
         "model_rate_limited",
+        "model_overloaded",
         "automatic_recovery_created",
         "manual_recovery_created",
         "manual_continuation_created",

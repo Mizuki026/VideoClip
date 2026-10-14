@@ -525,7 +525,10 @@ class SharedModelCooldown(Base):
     __tablename__ = "shared_model_cooldowns"
     __table_args__ = (
         UniqueConstraint("provider", "account_reference", "model", name="uq_shared_model_cooldown_identity"),
-        CheckConstraint("consecutive_rate_limits >= 0", name="ck_shared_model_cooldown_count_nonnegative"),
+        CheckConstraint(
+            "consecutive_backpressure_responses >= 0",
+            name="ck_shared_model_backpressure_count_nonnegative",
+        ),
         Index("ix_shared_model_cooldowns_until", "cooldown_until"),
     )
 
@@ -534,8 +537,8 @@ class SharedModelCooldown(Base):
     account_reference: Mapped[str] = mapped_column(String(64), nullable=False)
     model: Mapped[str] = mapped_column(String(128), nullable=False)
     cooldown_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    consecutive_rate_limits: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    last_rate_limited_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consecutive_backpressure_responses: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_backpressure_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )

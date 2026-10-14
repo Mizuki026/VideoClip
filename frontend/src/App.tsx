@@ -83,6 +83,7 @@ function eventLabel(type: string): string {
     model_wait_entered: '进入共享冷却等待',
     model_wait_resumed: '冷却等待已续接',
     model_rate_limited: '模型请求触发限流',
+    model_overloaded: '模型服务暂时过载',
     automatic_recovery_created: '已创建自动恢复尝试',
     manual_recovery_created: '已创建人工恢复尝试',
     manual_continuation_created: '已创建人工总结尝试',

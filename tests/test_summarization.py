@@ -360,16 +360,31 @@ def test_llm_client_sends_frozen_request_and_returns_bounded_metadata() -> None:
 
 
 @pytest.mark.parametrize(
-    ("status", "error_code"),
-    [(401, "LLM_AUTHENTICATION_FAILED"), (404, "LLM_MODEL_UNAVAILABLE"), (429, "LLM_RATE_LIMITED")],
+    ("status", "error_code", "retry_after"),
+    [
+        (401, "LLM_AUTHENTICATION_FAILED", None),
+        (404, "LLM_MODEL_UNAVAILABLE", None),
+        (429, "LLM_RATE_LIMITED", "17"),
+        (503, "LLM_MODEL_OVERLOADED", "17"),
+    ],
 )
-def test_llm_client_maps_provider_errors_without_storing_body(status: int, error_code: str) -> None:
+def test_llm_client_maps_provider_errors_without_storing_body(
+    status: int, error_code: str, retry_after: str | None
+) -> None:
     def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(status, json={"error": {"message": "sensitive provider diagnostic"}})
+        headers = {"Retry-After": retry_after} if retry_after is not None else {}
+        return httpx.Response(
+            status,
+            headers=headers,
+            json={"error": {"message": "sensitive provider diagnostic"}},
+        )
 
     with pytest.raises(LlmCallError) as error:
         request_completion(_request(), api_key="private-test-token", transport=httpx.MockTransport(handler))
     assert error.value.code == error_code
+    assert error.value.retry_after == retry_after
+    if retry_after is not None:
+        assert error.value.response_received_at is not None
     assert "sensitive" not in str(error.value)
 
 

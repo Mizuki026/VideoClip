@@ -72,7 +72,7 @@ def test_invalid_retry_after_uses_bounded_fallback(value: str | None) -> None:
     deadline, accepted = proposed_cooldown_deadline(
         now=NOW,
         retry_after=value,
-        consecutive_rate_limits=1,
+        consecutive_backpressure_responses=1,
         random_fraction=0,
         policy=CooldownPolicy(60, 900),
     )
@@ -150,7 +150,7 @@ def test_cooldown_transactions_serialize_and_never_shorten_the_shared_deadline(
         )
         assert row is not None
         assert row.cooldown_until == NOW + timedelta(seconds=120)
-        assert row.consecutive_rate_limits == 2
+        assert row.consecutive_backpressure_responses == 2
         session.commit()
     assert max(deadlines) == NOW + timedelta(seconds=120)
 
@@ -160,7 +160,7 @@ def test_cooldown_transactions_serialize_and_never_shorten_the_shared_deadline(
         row = session.scalar(select(SharedModelCooldown))
         assert row is not None
         assert row.cooldown_until == NOW + timedelta(seconds=120)
-        assert row.consecutive_rate_limits == 0
+        assert row.consecutive_backpressure_responses == 0
         session.commit()
     assert model_identity("siliconflow", "another-account", "Qwen/Qwen3.5-4B") != identity
 
@@ -204,14 +204,23 @@ def test_persisted_wait_deadlines_keep_single_and_cumulative_budgets_separate() 
     )
 
 
-def test_asr_and_llm_subprocesses_preserve_only_sanitized_retry_metadata(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("status", "asr_code", "llm_code"),
+    [
+        (429, "ASR_RATE_LIMITED", "LLM_RATE_LIMITED"),
+        (503, "ASR_MODEL_OVERLOADED", "LLM_MODEL_OVERLOADED"),
+    ],
+)
+def test_asr_and_llm_subprocesses_preserve_only_sanitized_backpressure_metadata(
+    tmp_path: Path, status: int, asr_code: str, llm_code: str
+) -> None:
     response_body = b"private supplier response must not cross this boundary"
 
     class RateLimitHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
             content_length = int(self.headers.get("Content-Length", "0"))
             self.rfile.read(content_length)
-            self.send_response(429)
+            self.send_response(status)
             self.send_header("Retry-After", "7")
             self.send_header("Content-Length", str(len(response_body)))
             self.end_headers()
@@ -303,9 +312,9 @@ def test_asr_and_llm_subprocesses_preserve_only_sanitized_retry_metadata(tmp_pat
     assert asr.returncode == llm.returncode == 0
     asr_result = json.loads(asr_output.read_text(encoding="utf-8"))
     llm_result = json.loads(llm_output.read_text(encoding="utf-8"))
-    for result in (asr_result, llm_result):
+    for result, error_code in ((asr_result, asr_code), (llm_result, llm_code)):
         assert set(result) == {"error_code", "retry_after", "response_received_at"}
-        assert result["error_code"] in {"ASR_RATE_LIMITED", "LLM_RATE_LIMITED"}
+        assert result["error_code"] == error_code
         assert result["retry_after"] == "7"
         assert datetime.fromisoformat(result["response_received_at"]).tzinfo is not None
         assert "private-test-key" not in json.dumps(result)

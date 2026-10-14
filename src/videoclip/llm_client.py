@@ -151,7 +151,7 @@ def request_completion(
             ) as response:
                 if response.status_code >= 400:
                     code = _status_code(response.status_code)
-                    if response.status_code == 429:
+                    if response.status_code in {429, 503}:
                         raise LlmCallError(
                             code,
                             retry_after=_retry_after_header(response),
@@ -219,7 +219,7 @@ def main() -> int:
         result = request_completion(request)
     except LlmCallError as exc:
         result = {"error_code": exc.code}
-        if exc.code == "LLM_RATE_LIMITED":
+        if exc.code in {"LLM_RATE_LIMITED", "LLM_MODEL_OVERLOADED"}:
             if exc.retry_after is not None:
                 result["retry_after"] = exc.retry_after
             if exc.response_received_at is not None:

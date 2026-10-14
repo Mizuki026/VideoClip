@@ -103,7 +103,7 @@ def transcribe(
                 ) as response:
                     if response.status_code >= 400:
                         code = _status_code(response.status_code)
-                        if response.status_code == 429:
+                        if response.status_code in {429, 503}:
                             raise AsrCallError(
                                 code,
                                 retry_after=_retry_after_header(response),
@@ -178,7 +178,7 @@ def main() -> int:
     except AsrCallError as exc:
         try:
             error_payload: dict[str, Any] = {"error_code": exc.code}
-            if exc.code == "ASR_RATE_LIMITED":
+            if exc.code in {"ASR_RATE_LIMITED", "ASR_MODEL_OVERLOADED"}:
                 if exc.retry_after is not None:
                     error_payload["retry_after"] = exc.retry_after
                 if exc.response_received_at is not None:

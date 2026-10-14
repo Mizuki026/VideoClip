@@ -15,6 +15,10 @@ from sqlalchemy.orm import Session, sessionmaker
 from videoclip.models import SharedModelCooldown
 from videoclip.services import db_transaction
 
+ASR_BACKPRESSURE_ERROR_CODES = frozenset({"ASR_RATE_LIMITED", "ASR_MODEL_OVERLOADED"})
+LLM_BACKPRESSURE_ERROR_CODES = frozenset({"LLM_RATE_LIMITED", "LLM_MODEL_OVERLOADED"})
+MODEL_BACKPRESSURE_ERROR_CODES = ASR_BACKPRESSURE_ERROR_CODES | LLM_BACKPRESSURE_ERROR_CODES
+
 _DELAY_SECONDS = re.compile(r"^[0-9]+$")
 _ASCTIME_DATE = re.compile(
     r"^[A-Za-z]{3} [A-Za-z]{3} (?:[0-9]{2}| [0-9]) [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}$"
@@ -45,7 +49,7 @@ class CooldownPolicy:
 class CooldownUpdate:
     identity: ModelIdentity
     cooldown_until: datetime
-    consecutive_rate_limits: int
+    consecutive_backpressure_responses: int
     retry_after_accepted: bool
 
 
@@ -108,19 +112,19 @@ def retry_after_deadline(value: str | None, *, now: datetime) -> datetime | None
 
 
 def fallback_cooldown_seconds(
-    consecutive_rate_limits: int,
+    consecutive_backpressure_responses: int,
     *,
     policy: CooldownPolicy,
     random_fraction: float,
 ) -> int:
     """Bounded equal-jitter exponential backoff with an injected random fraction."""
-    if consecutive_rate_limits < 1:
-        raise ValueError("consecutive rate limit count must be positive")
+    if consecutive_backpressure_responses < 1:
+        raise ValueError("consecutive backpressure response count must be positive")
     if policy.backoff_base_seconds < 1 or policy.backoff_max_seconds < policy.backoff_base_seconds:
         raise ValueError("invalid cooldown backoff policy")
     if not math.isfinite(random_fraction) or not 0 <= random_fraction <= 1:
         raise ValueError("random fraction must be between zero and one")
-    exponent = min(consecutive_rate_limits - 1, 30)
+    exponent = min(consecutive_backpressure_responses - 1, 30)
     nominal = min(policy.backoff_max_seconds, policy.backoff_base_seconds * (2**exponent))
     lower = int(math.ceil(nominal / 2))
     width = nominal - lower
@@ -131,7 +135,7 @@ def proposed_cooldown_deadline(
     *,
     now: datetime,
     retry_after: str | None,
-    consecutive_rate_limits: int,
+    consecutive_backpressure_responses: int,
     random_fraction: float,
     policy: CooldownPolicy,
 ) -> tuple[datetime, bool]:
@@ -140,7 +144,7 @@ def proposed_cooldown_deadline(
     if provider_deadline is not None:
         return provider_deadline, True
     seconds = fallback_cooldown_seconds(
-        consecutive_rate_limits,
+        consecutive_backpressure_responses,
         policy=policy,
         random_fraction=random_fraction,
     )
@@ -158,7 +162,7 @@ def current_cooldown_until(session: Session, identity: ModelIdentity) -> datetim
     return require_utc(row.cooldown_until) if row is not None else None
 
 
-# 冷却期限按服务商、账户引用和模型共享，并通过行锁合并并发收到的 429。
+# 429 与模型过载的冷却期限按服务商、账户引用和模型共享。
 def extend_shared_cooldown(
     factory: sessionmaker[Session],
     identity: ModelIdentity,
@@ -180,8 +184,8 @@ def extend_shared_cooldown(
                 account_reference=identity.account_reference,
                 model=identity.model,
                 cooldown_until=timestamp,
-                consecutive_rate_limits=0,
-                last_rate_limited_at=timestamp,
+                consecutive_backpressure_responses=0,
+                last_backpressure_at=timestamp,
             )
             .on_conflict_do_nothing(
                 index_elements=[
@@ -202,18 +206,18 @@ def extend_shared_cooldown(
         )
         if row is None:
             raise RuntimeError("shared model cooldown reservation disappeared")
-        count = row.consecutive_rate_limits + 1
+        count = row.consecutive_backpressure_responses + 1
         candidate, accepted = proposed_cooldown_deadline(
             now=observed_at,
             retry_after=retry_after,
-            consecutive_rate_limits=count,
+            consecutive_backpressure_responses=count,
             random_fraction=random_fraction,
             policy=policy,
         )
         current = require_utc(row.cooldown_until)
         row.cooldown_until = max(current, candidate)
-        row.consecutive_rate_limits = count
-        row.last_rate_limited_at = timestamp
+        row.consecutive_backpressure_responses = count
+        row.last_backpressure_at = timestamp
         return CooldownUpdate(identity, require_utc(row.cooldown_until), count, accepted)
 
 
@@ -235,4 +239,4 @@ def record_model_success(
             .with_for_update()
         )
         if row is not None and require_utc(row.cooldown_until) <= started:
-            row.consecutive_rate_limits = 0
+            row.consecutive_backpressure_responses = 0

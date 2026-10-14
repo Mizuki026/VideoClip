@@ -40,6 +40,9 @@ from videoclip.execution_gate import (
     find_unconfirmed_execution,
 )
 from videoclip.model_cooling import (
+    ASR_BACKPRESSURE_ERROR_CODES,
+    LLM_BACKPRESSURE_ERROR_CODES,
+    MODEL_BACKPRESSURE_ERROR_CODES,
     CooldownPolicy,
     ModelIdentity,
     current_cooldown_until,
@@ -119,7 +122,7 @@ def _response_received_at(payload: dict[str, Any]) -> datetime | None:
     return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
 
 
-def _rate_limit_identity(claim: ClaimedAttempt, code: str, settings: Settings) -> ModelIdentity:
+def _backpressure_identity(claim: ClaimedAttempt, code: str, settings: Settings) -> ModelIdentity:
     field = "asr" if code.startswith("ASR_") else "summary"
     section = claim.snapshot.get(field)
     if not isinstance(section, dict):
@@ -1034,12 +1037,12 @@ def _fail_task(maker: sessionmaker[Session], lease: ExecutionLease, claim: Claim
             stage=task.stage,
             error_code=code,
         )
-        if code in {"ASR_RATE_LIMITED", "LLM_RATE_LIMITED"}:
+        if code in MODEL_BACKPRESSURE_ERROR_CODES:
             record_analysis_event(
                 session,
                 task_id=task.id,
-                event_key=f"model-rate-limited:{claim.execution_id}:{code}",
-                event_type="model_rate_limited",
+                event_key=f"model-backpressure:{claim.execution_id}:{code}",
+                event_type="model_rate_limited" if code.endswith("RATE_LIMITED") else "model_overloaded",
                 attempt_id=attempt.id,
                 execution_id=claim.execution_id,
                 stage=task.stage,
@@ -1191,13 +1194,15 @@ def _read_asr_result(path: Path, return_code: int, max_bytes: int) -> tuple[str,
     if isinstance(code, str):
         if len(code) > 64 or not code.replace("_", "").isalnum():
             raise AnalysisFailure("ASR_INVALID_RESPONSE")
-        retry_after = payload.get("retry_after") if code == "ASR_RATE_LIMITED" else None
+        retry_after = payload.get("retry_after") if code in ASR_BACKPRESSURE_ERROR_CODES else None
         if not isinstance(retry_after, str) or len(retry_after) > 128:
             retry_after = None
         raise AnalysisFailure(
             code,
             retry_after=retry_after,
-            response_received_at=_response_received_at(payload) if code == "ASR_RATE_LIMITED" else None,
+            response_received_at=(
+                _response_received_at(payload) if code in ASR_BACKPRESSURE_ERROR_CODES else None
+            ),
         )
     if return_code != 0:
         raise AnalysisFailure("ASR_REQUEST_FAILED")
@@ -1680,13 +1685,15 @@ def _read_llm_result(path: Path, maximum_bytes: int) -> tuple[str, dict[str, Any
     if isinstance(code, str):
         if len(code) > 64 or not code.replace("_", "").isalnum():
             raise AnalysisFailure("LLM_INVALID_RESPONSE")
-        retry_after = payload.get("retry_after") if code == "LLM_RATE_LIMITED" else None
+        retry_after = payload.get("retry_after") if code in LLM_BACKPRESSURE_ERROR_CODES else None
         if not isinstance(retry_after, str) or len(retry_after) > 128:
             retry_after = None
         raise AnalysisFailure(
             code,
             retry_after=retry_after,
-            response_received_at=_response_received_at(payload) if code == "LLM_RATE_LIMITED" else None,
+            response_received_at=(
+                _response_received_at(payload) if code in LLM_BACKPRESSURE_ERROR_CODES else None
+            ),
         )
     if (
         not isinstance(payload, dict)
@@ -2038,9 +2045,9 @@ def transcribe_analysis(task_id_value: str, attempt_id_value: str | None = None)
         except AnalysisFailure as exc:
             failure_code = exc.code
             terminal_reason = exc.code
-            if exc.code in {"ASR_RATE_LIMITED", "LLM_RATE_LIMITED"}:
+            if exc.code in MODEL_BACKPRESSURE_ERROR_CODES:
                 try:
-                    identity = _rate_limit_identity(claim, exc.code, settings)
+                    identity = _backpressure_identity(claim, exc.code, settings)
                     update = extend_shared_cooldown(
                         maker,
                         identity,
@@ -2052,12 +2059,14 @@ def transcribe_analysis(task_id_value: str, attempt_id_value: str | None = None)
                     )
                     logger.info(
                         "shared_model_cooldown_extended provider=%s account_reference=%s model=%s "
-                        "until=%s consecutive=%s retry_after=%s",
+                        "error_code=%s until=%s consecutive_backpressure_responses=%s "
+                        "retry_after_accepted=%s",
                         identity.provider,
                         identity.account_reference,
                         identity.model,
+                        exc.code,
                         update.cooldown_until.isoformat(),
-                        update.consecutive_rate_limits,
+                        update.consecutive_backpressure_responses,
                         update.retry_after_accepted,
                     )
                 except Exception:

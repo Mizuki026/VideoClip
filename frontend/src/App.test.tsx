@@ -118,6 +118,15 @@ describe('published result cleanup separation', () => {
         media_status: 'available', media_error_code: null,
         created_at: '2026-10-02T00:00:00Z', analysis_task_exists: true, analysis_task_id: 'task-id',
       });
+      if (path === '/api/videos/video-id/events') return jsonResponse({
+        items: [{
+          id: 1, video_id: 'video-id', task_id: 'task-id', attempt_id: 'attempt-id',
+          execution_id: 'execution-id', request_reference: null, event_type: 'model_overloaded',
+          stage: 'failed', error_code: 'LLM_MODEL_OVERLOADED', actor: 'system',
+          occurred_at: '2026-10-02T00:00:02Z',
+        }],
+        has_more: false, next_before_id: null,
+      });
       if (path === '/api/videos/video-id/tasks/task-id') return jsonResponse({
         ...task,
         attempt: { ...task.attempt, cleanup_state: cleanupState, cleanup_error_code: cleanupState === 'failed' ? 'ATTEMPT_TEMP_CLEANUP_FAILED' : null },
@@ -144,6 +153,7 @@ describe('published result cleanup separation', () => {
 
     render(<App />);
     expect(await screen.findByText('Synthetic summary remains available')).toBeInTheDocument();
+    expect(await screen.findByText('模型服务暂时过载')).toBeInTheDocument();
     expect(screen.getByText('临时文件清理失败。分析结果状态保持不变，可单独重试清理。')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '重试清理' }));
 

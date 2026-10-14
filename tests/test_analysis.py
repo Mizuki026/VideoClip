@@ -62,6 +62,7 @@ from videoclip.execution_gate import EXECUTION_ADVISORY_LOCK_KEY
 from videoclip.main import create_app
 from videoclip.models import (
     AnalysisAttempt,
+    AnalysisEvent,
     AnalysisExecution,
     AnalysisSummary,
     AnalysisTask,
@@ -2383,8 +2384,8 @@ def test_automatic_recovery_waits_for_shared_cooldown_without_charging_budget(
                 account_reference=test_settings.siliconflow_account_reference,
                 model=test_settings.asr_model,
                 cooldown_until=cooldown_until,
-                consecutive_rate_limits=1,
-                last_rate_limited_at=now,
+                consecutive_backpressure_responses=1,
+                last_backpressure_at=now,
             )
         )
     first_scan = coordinate_due_analysis_recoveries(
@@ -2761,6 +2762,116 @@ def _mock_llm_process(monkeypatch: pytest.MonkeyPatch, replies: list[tuple[str, 
         )
 
     monkeypatch.setattr(analysis_worker, "_run_process", run)
+
+
+def _mock_llm_error_process(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    error_code: str,
+    retry_after: str,
+    response_received_at: datetime,
+) -> None:
+    def run(command: list[str], **_: Any) -> None:
+        output_path = Path(command[command.index("--output") + 1])
+        output_path.write_text(
+            json.dumps(
+                {
+                    "error_code": error_code,
+                    "retry_after": retry_after,
+                    "response_received_at": response_received_at.isoformat(),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(analysis_worker, "_run_process", run)
+
+
+def test_llm_overload_persists_shared_cooldown_before_automatic_recovery(
+    test_settings: Settings,
+    test_engine: Any,
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MediaStore(test_settings.app_data_root)
+    with TestClient(create_app(test_settings, session_factory, store, run_recovery=False)) as client:
+        owner_id = _register(client, "analysis-llm-overload-cooldown")
+        video_id = _video(session_factory, store, owner_id)
+    task_id, parent_id = _seed_stopped_complete_transcript(
+        session_factory, owner_id, video_id, test_settings
+    )
+    followup = create_followup_attempt(
+        session_factory,
+        task_id=task_id,
+        video_id=video_id,
+        parent_attempt_id=parent_id,
+        mode="manual_summary",
+        owner_id=owner_id,
+        settings=test_settings,
+    )
+    assert followup.queued
+    attempt_id = followup.submission.attempt_id
+    response_received_at = datetime.now(UTC)
+
+    monkeypatch.setattr(analysis_worker, "get_settings", lambda: test_settings)
+    monkeypatch.setattr(analysis_worker, "_get_or_make_worker_components", lambda _: (test_engine, store))
+    monkeypatch.setattr(
+        analysis_worker,
+        "_transcribe",
+        lambda *_args, **_kwargs: pytest.fail("summary-only recovery must not call ASR"),
+    )
+    _mock_llm_error_process(
+        monkeypatch,
+        error_code="LLM_MODEL_OVERLOADED",
+        retry_after="300",
+        response_received_at=response_received_at,
+    )
+
+    assert transcribe_analysis(str(task_id), str(attempt_id)) == {"status": "failed"}
+
+    cooldown_until = response_received_at + timedelta(seconds=300)
+    with session_factory() as session:
+        cooldown = session.scalar(
+            select(SharedModelCooldown).where(
+                SharedModelCooldown.provider == "siliconflow",
+                SharedModelCooldown.account_reference == test_settings.siliconflow_account_reference,
+                SharedModelCooldown.model == test_settings.llm_model,
+            )
+        )
+        request = session.scalar(
+            select(SummaryRequest).where(
+                SummaryRequest.task_id == task_id,
+                SummaryRequest.attempt_id == attempt_id,
+            )
+        )
+        assert cooldown is not None and cooldown.cooldown_until == cooldown_until
+        assert cooldown.consecutive_backpressure_responses == 1
+        assert request is not None and request.status == "failed"
+        assert request.error_code == "LLM_MODEL_OVERLOADED"
+        overload_event = session.scalar(
+            select(AnalysisEvent).where(
+                AnalysisEvent.task_id == task_id,
+                AnalysisEvent.attempt_id == attempt_id,
+                AnalysisEvent.event_type == "model_overloaded",
+            )
+        )
+        assert overload_event is not None and overload_event.error_code == "LLM_MODEL_OVERLOADED"
+
+    recovery = coordinate_due_analysis_recoveries(
+        session_factory,
+        settings=test_settings,
+        now=response_received_at + timedelta(seconds=1),
+    )
+    assert recovery.resumed == 0 and recovery.waiting == 1
+    with session_factory() as session:
+        task = session.get(AnalysisTask, task_id)
+        request_count = session.scalar(
+            select(func.count(SummaryRequest.id)).where(SummaryRequest.task_id == task_id)
+        )
+        assert task is not None and task.status == "waiting_model"
+        assert task.model_wait_until == cooldown_until
+        assert task.auto_recovery_count == 0
+        assert request_count == 1
 
 
 def test_stopped_summary_continuation_publishes_once_without_asr(
