@@ -87,6 +87,7 @@ def _trace_id(response: httpx.Response) -> str | None:
     return safe or None
 
 
+# 总请求期限覆盖完整响应读取，避免慢速分块绕过单次读取超时。
 def request_completion(
     request: dict[str, Any],
     *,
