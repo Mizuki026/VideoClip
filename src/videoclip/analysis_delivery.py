@@ -401,6 +401,7 @@ def coordinate_analysis_delivery(
         return state
     code: str | None
     try:
+        # Broker 确认可能丢失；generation 会记录不确定结果，后续补投扫描负责收敛。
         publisher(str(task_id), str(attempt_id))
     except Exception as exc:
         if isinstance(exc, EncodeError):
