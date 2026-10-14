@@ -300,6 +300,7 @@ def submit_analysis_task(
                 raise HTTPException(status_code=503, detail="analysis attempt needs maintenance")
             return SubmittedTask(task_id=task.id, attempt_id=attempt.id, created=False)
 
+        # 源文件指纹和模型、切片配置会冻结进任务快照，恢复时据此核对检查点。
         snapshot = build_configuration_snapshot(video, settings)
         config_hash = canonical_sha256(snapshot)
         source_hash = snapshot["source"]["fingerprint"]
