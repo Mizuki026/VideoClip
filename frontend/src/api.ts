@@ -56,6 +56,7 @@ export async function requestResult<T>(
 ): Promise<{ status: number; data: T }> {
   const headers = new Headers({ Accept: 'application/json' });
   new Headers(options.headers).forEach((value, key) => headers.set(key, value));
+  // 登录凭据由 Cookie 携带；CSRF Token 另放请求头，供写接口校验。
   if (options.csrf) headers.set('X-CSRF-Token', options.csrf);
   if (options.body !== undefined) headers.set('Content-Type', 'application/json');
 
@@ -65,6 +66,7 @@ export async function requestResult<T>(
       method: options.method ?? 'GET',
       headers,
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      // 同源请求由浏览器携带 Cookie，页面无需读取 HttpOnly 登录令牌。
       credentials: 'same-origin',
       cache: 'no-store',
       signal: options.signal,
@@ -80,6 +82,7 @@ export async function requestResult<T>(
 
 export function getCsrfToken(): Promise<{ csrf_token: string }> {
   if (csrfTokenRequest) return csrfTokenRequest;
+  // 接口返回可提交到请求头的 CSRF Token，不是 HttpOnly 登录令牌。
   const pending = request<{ csrf_token: string }>('/auth/csrf');
   csrfTokenRequest = pending;
   void pending.finally(() => {
@@ -91,6 +94,7 @@ export function getCsrfToken(): Promise<{ csrf_token: string }> {
 let csrfTokenRequest: Promise<{ csrf_token: string }> | null = null;
 
 export function getCurrentUser(): Promise<User> {
+  // 刷新后凭已有 Cookie 查询用户，会话是否有效由服务端判断。
   return request('/auth/me');
 }
 
