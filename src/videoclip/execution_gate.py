@@ -11,6 +11,7 @@ from videoclip.models import AnalysisAttempt, AnalysisExecution, AnalysisTask, V
 EXECUTION_ADVISORY_LOCK_KEY = 0x566964656F436C69
 
 
+# 事务级互斥只保护短暂的投递预留过程，函数返回后锁随事务结束。
 def try_acquire_execution_gate(session: Session) -> bool:
     """Serialize a short delivery reservation with the Worker execution lease."""
     return bool(
@@ -21,6 +22,7 @@ def try_acquire_execution_gate(session: Session) -> bool:
     )
 
 
+# 只要存在未确认停止的执行，部署级分析槽位就仍被占用。
 def find_unconfirmed_execution(session: Session) -> AnalysisExecution | None:
     """Return the deployment-wide execution that still holds the analysis slot."""
     return session.scalar(
@@ -31,6 +33,7 @@ def find_unconfirmed_execution(session: Session) -> AnalysisExecution | None:
     )
 
 
+# 候选任务按持久化入队时间和编号排序，确保多个工作进程遵守同一先进先出顺序。
 def find_next_queued_task(session: Session) -> uuid.UUID | None:
     """Return the oldest currently eligible Stage-4 task by its durable queue key."""
     return session.scalar(
