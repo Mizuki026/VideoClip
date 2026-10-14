@@ -31,9 +31,12 @@ class Settings(BaseSettings):
         repr=False,
     )
     app_data_root: Path = Field(default=Path("data/mvp-stage-1/app"), alias="APP_DATA_ROOT")
+    # 登录 Cookie 的发送限制：Secure 要求 HTTPS，SameSite 控制跨站携带。
     cookie_secure: bool | None = Field(default=None, alias="COOKIE_SECURE")
     cookie_samesite: Literal["lax", "strict"] = Field(default="lax", alias="COOKIE_SAMESITE")
+    # 同时决定数据库会话的过期时间和 Cookie 的 Max-Age，默认 24 小时。
     session_ttl_hours: int = Field(default=24, ge=1, le=168, alias="SESSION_TTL_HOURS")
+    # 超过上限时，登录流程撤销最早创建的有效会话。
     max_sessions_per_user: int = Field(default=8, ge=1, le=32, alias="MAX_SESSIONS_PER_USER")
     max_json_body_bytes: int = Field(default=16_384, ge=1024, le=65_536, alias="MAX_JSON_BODY_BYTES")
     upload_total_timeout_seconds: int = Field(
@@ -155,6 +158,7 @@ class Settings(BaseSettings):
             or self.app_origin.endswith("/")
         ):
             raise ValueError("APP_ORIGIN must be an exact http(s) origin without a trailing slash")
+        # 生产环境不允许显式关闭 Secure，避免登录 Cookie 经普通 HTTP 发送。
         if self.app_env == "production" and self.cookie_secure is False:
             raise ValueError("COOKIE_SECURE cannot be false in production")
         asr_endpoint = urlsplit(self.asr_base_url)
@@ -168,6 +172,7 @@ class Settings(BaseSettings):
 
     @property
     def secure_cookie(self) -> bool:
+        # 显式配置优先；未指定时生产环境启用 Secure，本地开发允许 HTTP。
         if self.cookie_secure is not None:
             return self.cookie_secure
         return self.app_env == "production"
