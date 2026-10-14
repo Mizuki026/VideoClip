@@ -37,20 +37,24 @@ def verify_password(password_hash: str, password: str) -> bool:
 
 # Cookie 返回随机令牌，数据库只保存其 SHA-256 摘要以便校验会话。
 def new_session_token() -> str:
+    # 用 32 字节安全随机数生成令牌，不把用户编号或密码编码进 Cookie。
     return secrets.token_urlsafe(32)
 
 
 def token_hash(token: str) -> str:
+    # 会话表只存 SHA-256 摘要；收到 Cookie 后用相同算法查找会话。
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def new_csrf_token(secret: str) -> str:
+    # 给随机值附上服务端签名，用于核验 CSRF Token 是否由本服务签发。
     nonce = secrets.token_urlsafe(32)
     signature = hmac.new(secret.encode("utf-8"), nonce.encode("ascii"), hashlib.sha256).digest()
     return f"{nonce}.{base64.urlsafe_b64encode(signature).decode('ascii').rstrip('=')}"
 
 
 def verify_csrf_token(secret: str, token: str) -> bool:
+    # 此处检查格式和签名；与 Cookie、登录会话的匹配由接口层检查。
     if len(token) > 256 or token.count(".") != 1:
         return False
     nonce, provided = token.split(".", 1)
