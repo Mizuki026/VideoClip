@@ -76,6 +76,7 @@ def validate_probe(probe: dict[str, Any], max_seconds: float = 1200.0) -> MediaI
         raise MediaError("UNSUPPORTED_AUDIO_CODEC", "only AAC audio is allowlisted")
     if "start_time" not in fmt:
         raise MediaError("INSUFFICIENT_TIMESTAMP_EVIDENCE", "container timestamp evidence is missing")
+    # 时间戳映射要求容器与音视频轨道从零起点开始，非零偏移会被拒绝。
     format_start = _number(fmt["start_time"], "format.start_time")
     for stream, name in ((video, "video"), (audio, "audio")):
         if "start_time" not in stream or "time_base" not in stream:
