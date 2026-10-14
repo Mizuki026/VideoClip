@@ -7,6 +7,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 
+# 注册和登录模型限定接口可接收的字段与长度，额外字段会被拒绝。
 class RegisterRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=False)
 
@@ -57,6 +58,7 @@ class UploadResponse(BaseModel):
     video: VideoDetailResponse
 
 
+# 创建续传会话时声明文件名、总字节数和整文件摘要，服务端据此建立上传记录。
 class ResumableUploadCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=False)
 
@@ -82,6 +84,7 @@ class UploadChunkSummary(BaseModel):
     sha256: str
 
 
+# 续传状态同时返回数据库确认偏移、下一片序号和已确认分片清单。
 class ResumableUploadStatusResponse(BaseModel):
     upload_id: UUID
     state: str
@@ -107,6 +110,7 @@ class UploadChunkResponse(BaseModel):
     replayed: bool
 
 
+# 尝试响应单独展示停止确认和清理状态，避免把任务失败误当成执行已退出。
 class AnalysisAttemptResponse(BaseModel):
     id: UUID
     attempt_number: int
@@ -176,6 +180,7 @@ class AnalysisTaskResponse(BaseModel):
     attempt: AnalysisAttemptResponse
 
 
+# 摘要响应携带转写清单与内容摘要，便于核对结果所依据的输入版本。
 class AnalysisSummaryResponse(BaseModel):
     video_id: UUID
     task_id: UUID
@@ -209,6 +214,7 @@ class AnalysisEventResponse(BaseModel):
     occurred_at: datetime
 
 
+# 事件响应通过事件编号继续分页，避免一次性返回整条任务时间线。
 class AnalysisEventsResponse(BaseModel):
     items: list[AnalysisEventResponse]
     has_more: bool
@@ -242,6 +248,7 @@ class VideoDeletionProgress(BaseModel):
     stop_confirmation_required: bool
 
 
+# 媒体删除进度同时报告待停止的尝试，前端据此区分删除等待和清理失败。
 class VideoMediaDeletionProgress(BaseModel):
     video_id: UUID
     media_status: str
@@ -262,6 +269,7 @@ class TranscriptSegmentResponse(BaseModel):
     status: str
 
 
+# 转写响应明确区分转写是否完整与摘要状态，二者不会混为一个完成标志。
 class TranscriptResponse(BaseModel):
     task_id: UUID
     complete: bool
