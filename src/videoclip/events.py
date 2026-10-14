@@ -46,6 +46,7 @@ _SAFE_REQUEST_REFERENCE = re.compile(
 )
 
 
+# 先锁定所属任务并按业务键查重，再在当前事务中写入事件，保证并发记录可收敛。
 def record_analysis_event(
     session: Session,
     *,
