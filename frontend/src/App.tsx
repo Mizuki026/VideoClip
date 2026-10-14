@@ -164,9 +164,11 @@ function AuthPage({
         setFeedback('账户已创建，请登录继续。');
         return;
       }
+      // 浏览器接收登录响应的 Set-Cookie，页面不读取或持久化登录令牌。
       await request<User>('/auth/login', {
         method: 'POST', csrf, body: { username, password },
       });
+      // 登录会更新 CSRF 绑定，重新获取令牌后再加载当前用户。
       const csrfResult = await getCsrfToken();
       const user = await getCurrentUser();
       onCsrf(csrfResult.csrf_token);
@@ -1259,6 +1261,7 @@ export default function App() {
   }, []);
 
   const sessionExpired = useCallback(() => {
+    // 会话失效后清空页面用户状态，并为下一次登录获取匿名 CSRF Token。
     setUploadSessionEpoch((value) => value + 1);
     setSession({ user: null, csrf: '', message: '登录状态已失效，请重新登录。' });
     window.history.replaceState(null, '', '/');
@@ -1278,6 +1281,7 @@ export default function App() {
   const logout = useCallback(async () => {
     setUploadSessionEpoch((value) => value + 1);
     try {
+      // 后端先撤销会话并清除 Cookie，成功后页面清空用户并获取匿名 CSRF Token。
       await request<void>('/auth/logout', { method: 'POST', csrf: session.csrf });
       const csrf = await getCsrfToken().catch(() => ({ csrf_token: '' }));
       setSession({ user: null, csrf: csrf.csrf_token, message: '已安全退出登录。' });
