@@ -134,6 +134,7 @@ class Settings(BaseSettings):
         default=Path("data/mvp-stage-1/secrets/postgres_password"), alias="DB_PASSWORD_FILE"
     )
 
+    # 配置校验在入口处拦截无效参数，避免弱密钥或错误退避设置进入请求流程。
     @model_validator(mode="after")
     def validate_security_settings(self) -> Settings:
         if not re.fullmatch(
