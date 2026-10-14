@@ -19,6 +19,7 @@ from videoclip.storage import MediaStore
 
 
 def test_password_hash_is_argon2id_and_session_hash_is_one_way() -> None:
+    # 密码用 Argon2id 验证，会话令牌另用 SHA-256 保存摘要。
     value = hash_password("correct horse battery staple")
     assert value.startswith("$argon2id$")
     assert extract_parameters(value).type.name == "ID"
@@ -30,6 +31,7 @@ def test_password_hash_is_argon2id_and_session_hash_is_one_way() -> None:
 
 
 def test_csrf_token_signature_is_bound_to_secret() -> None:
+    # CSRF Token 必须由同一服务端密钥验签，换密钥或篡改内容都应失效。
     token = new_csrf_token("s" * 32)
     assert verify_csrf_token("s" * 32, token)
     assert not verify_csrf_token("x" * 32, token)
@@ -39,6 +41,7 @@ def test_csrf_token_signature_is_bound_to_secret() -> None:
 def test_two_users_register_login_and_logout_invalidates_session(
     session_factory: sessionmaker[Session], test_settings: Settings, tmp_path: Path, caplog
 ) -> None:
+    # 用两个独立客户端验证用户隔离、登录 Cookie 属性和退出后的会话失效。
     app = create_app(test_settings, session_factory, MediaStore(tmp_path / "data"))
     with TestClient(app) as first, TestClient(app) as second:
         first_registration = register(first, "Alice")
@@ -53,6 +56,7 @@ def test_two_users_register_login_and_logout_invalidates_session(
         assert first.get("/auth/me").json()["username"] == "alice"
         assert second.get("/auth/me").json()["username"] == "bob"
 
+        # 登录令牌只通过 HttpOnly Cookie 下发，不应出现在响应正文中。
         raw_session = first.cookies.get(SESSION_COOKIE)
         assert raw_session and raw_session not in first_login.text
         session_cookie = next(
@@ -69,6 +73,7 @@ def test_two_users_register_login_and_logout_invalidates_session(
         assert test_settings.app_secret_key.get_secret_value() not in caplog.text
         assert str(test_settings.app_data_root) not in caplog.text
 
+        # 会话表按摘要查询，不保存可直接用于登录的原始令牌。
         with session_factory() as session:
             stored = session.scalar(
                 select(SessionRecord).where(SessionRecord.token_hash == token_hash(raw_session))
@@ -82,6 +87,7 @@ def test_two_users_register_login_and_logout_invalidates_session(
         logout = first.post("/auth/logout", headers=mutate_headers(token))
         assert logout.status_code == 204
         assert SESSION_COOKIE not in first.cookies
+        # 重放退出前的旧 Cookie 仍应返回 401，证明数据库会话已撤销。
         first.cookies.set(SESSION_COOKIE, raw_session)
         assert first.get("/auth/me").status_code == 401
         with session_factory() as session:
@@ -117,6 +123,7 @@ def test_active_session_limit_revokes_oldest_session(
 def test_secure_cookie_defaults_to_https_and_production_rejects_insecure_override(
     test_settings: Settings, tmp_path: Path
 ) -> None:
+    # 生产环境默认启用 Secure，显式关闭会被配置校验拒绝。
     https_settings = Settings(
         _env_file=None,
         APP_ENV="production",
