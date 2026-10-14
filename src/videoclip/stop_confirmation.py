@@ -46,6 +46,7 @@ class StopEvidence:
     sha256: str
 
 
+# 从数据库执行记录提取进程、会话和容器身份，后续证据必须与这些字段一致。
 def identity_from_execution(execution: AnalysisExecution) -> ExecutionIdentity | None:
     worker_instance_id = execution.worker_instance_id
     worker_container_id = execution.worker_container_id
@@ -97,6 +98,7 @@ def _evidence_hash(identity: ExecutionIdentity, source: StopSource, observation:
     return hashlib.sha256(encoded).hexdigest()
 
 
+# 监督器确认整组进程退出后生成绑定执行身份的证据摘要。
 def worker_stop_evidence(identity: ExecutionIdentity, *, session_stopped: bool) -> StopEvidence:
     if not session_stopped or identity.process_scope != PROCESS_SCOPE:
         raise ValueError("the controlled process boundary is not proven empty")
@@ -109,6 +111,7 @@ def worker_stop_evidence(identity: ExecutionIdentity, *, session_stopped: bool) 
     )
 
 
+# 人工确认只接受目标容器的可信退出状态，并绑定对应执行身份。
 def operator_container_stop_evidence(
     identity: ExecutionIdentity, *, container_id: str, exited: bool
 ) -> StopEvidence:
@@ -129,6 +132,7 @@ def _matches(execution: AnalysisExecution, identity: ExecutionIdentity) -> bool:
     return identity_from_execution(execution) == identity
 
 
+# 在锁定任务、尝试和执行记录后核对证据，只更新当前这一次执行的停止状态。
 def confirm_stopped_execution(
     factory: sessionmaker[Session], evidence: StopEvidence
 ) -> Literal["confirmed", "already_confirmed", "rejected"]:
