@@ -10,6 +10,7 @@ from videoclip.model_cooling import ModelIdentity, require_utc
 from videoclip.models import AnalysisAttempt, AnalysisTask
 
 
+# 在进入等待前计算单次和累计冷却预算，超出上限的任务会转为明确失败状态。
 def wait_budget_error(
     *,
     task: AnalysisTask,
@@ -41,6 +42,7 @@ def wait_budget_error(
     return None
 
 
+# 等待期限和原因写回任务后清空排队时间，任务由维护扫描唤醒而不占用执行位。
 def enter_model_wait(
     session: Session,
     task: AnalysisTask,
@@ -113,6 +115,7 @@ def require_manual_wait(task: AnalysisTask, attempt: AnalysisAttempt, error_code
     attempt.failure_code = attempt.failure_code or error_code
 
 
+# 唤醒时结算已等待时长并清除当前等待字段，累计预算仍保留在任务记录中。
 def finish_model_wait(task: AnalysisTask, *, now: datetime) -> None:
     timestamp = require_utc(now)
     if task.model_wait_started_at is not None:
