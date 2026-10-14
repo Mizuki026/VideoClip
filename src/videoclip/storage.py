@@ -18,6 +18,7 @@ class StorageFailure(OSError):
 
 
 @dataclass
+# 跨进程写入租约保护同一上传文件，调用方必须持有租约才能修改分片。
 class WriterLease:
     handle: BinaryIO
     path: Path
@@ -41,6 +42,7 @@ class WriterLease:
             self.handle.close()
 
 
+# 媒体存储统一管理临时分片、正式文件、路径校验和清理操作。
 class MediaStore:
     def __init__(self, root: Path) -> None:
         self.root = root.expanduser().resolve()
@@ -111,10 +113,12 @@ class MediaStore:
             view = view[written:]
 
     @staticmethod
+    # 确认分片前先刷新用户态缓冲并同步到磁盘，数据库偏移不会领先于已落盘数据。
     def flush_part(handle: BinaryIO) -> None:
         handle.flush()
         os.fsync(handle.fileno())
 
+    # 只保留数据库确认范围内且摘要匹配的内容，未确认尾部会被截断或重建。
     def reconcile_resumable_part(
         self,
         upload_id: UUID,
