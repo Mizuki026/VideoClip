@@ -60,6 +60,7 @@ def _is_promoted_upload_valid(store: MediaStore, upload: UploadHandoff, timeout_
     return matches(target)
 
 
+# 对已进入正式交接阶段的文件重新核对摘要和大小，再补齐数据库完成状态。
 def _complete_promoted(factory: sessionmaker[Session], upload_id: uuid.UUID) -> bool:
     with db_transaction(factory) as session:
         upload = session.scalar(select(UploadHandoff).where(UploadHandoff.id == upload_id).with_for_update())
@@ -106,6 +107,7 @@ def _mark_cleanup_pending(factory: sessionmaker[Session], upload_id: uuid.UUID, 
         _intent_for_upload(session, owner_id, upload_id, "cleanup_pending")
 
 
+# 未进入正式交接的上传只清理临时分片，并通过清理意图保留可重试记录。
 def _discard_interrupted(factory: sessionmaker[Session], store: MediaStore, upload_id: uuid.UUID) -> bool:
     with factory() as session:
         upload = session.get(UploadHandoff, upload_id)
@@ -173,6 +175,7 @@ def _recover_one(
                 logger.warning("upload_lease_cleanup_pending upload_id=%s", upload_id.hex)
 
 
+# 启动恢复逐条扫描中断上传，按数据库状态选择完成交接或清理临时文件。
 def recover_interrupted_work(factory: sessionmaker[Session], settings: Settings, store: MediaStore) -> None:
     store.prepare()
     recover_resumable_uploads_on_startup(factory, store)
