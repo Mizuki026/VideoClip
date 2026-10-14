@@ -110,6 +110,7 @@ def _source_is_current(video: Video, parent: AnalysisAttempt) -> bool:
         return False
 
 
+# 只接受与当前尝试和执行身份完全匹配的监督器或容器退出证据。
 def _verified_stop(
     session: Session,
     task: AnalysisTask,
@@ -145,6 +146,7 @@ def _verified_stop(
     return find_unconfirmed_execution(session) is None
 
 
+# 只有用户明确发起的操作才登记为后续尝试，并保留原任务的配置快照。
 def _enroll_explicit_task(task: AnalysisTask, now: datetime, settings: Settings | None) -> None:
     if task.stage5_enrolled_at is None:
         task.stage5_enrolled_at = now
@@ -161,6 +163,7 @@ def _manual_permanent_error(parent: AnalysisAttempt, task: AnalysisTask) -> str 
     return code if is_manual_recovery_blocked(code) else None
 
 
+# 自动恢复、手动恢复和摘要续跑统一在事务中核对旧尝试后创建新尝试。
 def create_followup_attempt(
     factory: sessionmaker[Session],
     *,
@@ -503,6 +506,7 @@ class RecoveryCycleResult:
     exhausted: int
 
 
+# 扫描到期恢复候选；每个候选仍须重新通过状态、预算和停止证据核验。
 def coordinate_due_analysis_recoveries(
     factory: sessionmaker[Session],
     *,
