@@ -179,6 +179,7 @@ def _positive_number(value: Any) -> bool:
     return _finite_number(value) and float(value) > 0
 
 
+# 按冻结配置解析模型、提示版本和输出结构，阻止恢复流程静默切换摘要契约。
 def resolve_summary_contract(snapshot: Mapping[str, Any]) -> SummaryContract:
     """Resolve only explicitly versioned requests or the measured legacy contract."""
     summary = snapshot.get("summary")
@@ -320,6 +321,7 @@ def normalize_quote(value: str) -> str:
     return "".join(normalized.split())
 
 
+# 从可引用转写片段构造有限选项，模型只能引用后端提供的片段编号。
 def citation_options(text: str) -> list[str]:
     source = text.strip()
     if not source:
@@ -359,6 +361,7 @@ def best_source_excerpt(summary_text: str, transcript_text: str) -> str:
     return best_quote
 
 
+# 验证片段编号、时长、顺序和来源指纹，生成摘要请求使用的清单摘要。
 def validate_transcript_manifest(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -494,6 +497,7 @@ def validate_transcript_manifest(
     return normalized, transcript_fingerprint
 
 
+# 提示词只包含经过核验的转写片段及其编号，不让模型自行补造原文。
 def build_summary_prompt(segments: Sequence[Mapping[str, Any]], prompt_version: str) -> str:
     instructions = _PROMPT_INSTRUCTIONS_BY_VERSION.get(prompt_version)
     if instructions is None:
@@ -510,6 +514,7 @@ def build_summary_prompt(segments: Sequence[Mapping[str, Any]], prompt_version: 
     )
 
 
+# 在发起请求前估算输入上下文规模，超出预算时明确拒绝。
 def validate_context_budget(prompt: str, contract: SummaryContract) -> int:
     required = len(prompt.encode("utf-8")) + contract.max_output_tokens + CHAT_MESSAGE_OVERHEAD_TOKENS
     if required > contract.context_tokens:
@@ -563,6 +568,7 @@ def _quote_for(text: str, source: str) -> str:
     return quote
 
 
+# 解析输出并逐项校验片段编号、引用原文和时间范围，再由后端生成最终引用。
 def validate_summary_output(
     raw: str,
     segments: Sequence[Mapping[str, Any]],
