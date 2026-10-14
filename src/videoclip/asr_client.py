@@ -21,6 +21,7 @@ class AsrCallError(RuntimeError):
         self.response_received_at = response_received_at
 
 
+# 响应以流式方式读取并累计字节上限，超限或超时会立即中止本次调用。
 def _read_response(response: httpx.Response, maximum: int, deadline: float) -> bytes:
     length_header = response.headers.get("content-length")
     if length_header and length_header.isdecimal() and int(length_header) > maximum:
@@ -64,6 +65,7 @@ def _retry_after_header(response: httpx.Response) -> str | None:
 
 
 # 音频请求受阶段超时和总期限约束，响应体也按字节上限流式读取。
+# 请求按连接、读取和总耗时分别限时，并保留限流重试时间供共享冷却逻辑使用。
 def transcribe(
     audio_path: Path,
     *,
@@ -132,6 +134,7 @@ def transcribe(
         raise AsrCallError("ASR_TRANSPORT_ERROR") from exc
 
 
+# 命令行入口只把识别结果写到指定文件，业务流程通过结构化返回值读取内容。
 def _write_result(path: Path, result: dict[str, Any], maximum: int) -> None:
     encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(encoded) > maximum:
