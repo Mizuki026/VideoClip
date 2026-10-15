@@ -13,3 +13,5 @@ __pycache__/
 /frontend/dist/
 /frontend/test-results/
 /frontend/playwright-report/
+/AGENTS.md
+/docs/agents/
