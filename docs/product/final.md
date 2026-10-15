@@ -1,6 +1,6 @@
 # 课迹：最终版产品设计
 
-> 状态：最终目标、范围及架构审查中的关键取舍已确认；第 1 至第 6 窗口按各自范围完成。第 7 窗口已核验 Stage 2 部署、schema/时间线、真实长样片分段闭环、隔离故障回归及资源；本窗口和最终版验收结论均为部分完成。主要缺项为调用后账户额度/账单证据、真实 20 分钟课程模型处理及单次全绿 Stage 7 Playwright 记录。逐项状态见[第 7 窗口验收矩阵](../../.scratch/final-stage-7/acceptance-matrix.md)与[验证记录](../../.scratch/final-stage-7/validation.md)。MVP 已完成，历史范围见 [MVP 产品设计](mvp.md)。
+> 状态：最终目标、范围及架构审查中的关键取舍已确认；Stage 1 至 Stage 6 按各自范围完成。Stage 7 已核验 Stage 2 部署、schema/时间线、真实长样片分段闭环、隔离故障回归及资源；本阶段和最终版验收结论均为部分完成。主要缺项为调用后账户额度/账单证据、真实 20 分钟课程模型处理及单次全绿 Stage 7 Playwright 记录。逐项状态见[Stage 7 验收矩阵](../../.scratch/final-stage-7/acceptance-matrix.md)与[验证记录](../../.scratch/final-stage-7/validation.md)。MVP 已完成，历史范围见 [MVP 产品设计](mvp.md)。
 > 更新日期：2026-10-05。
 
 ## 1. 目标与定位
@@ -62,16 +62,16 @@ MVP 已提供账号隔离、普通流式上传、单任务异步分析、真实 
 
 ## 6. 当前进度与实施顺序
 
-MVP 最终验收已经通过，证据见[第六窗口验收记录](../../.scratch/mvp-stage-6/validation.md)。最终版第 0 窗口约 17 分 41 秒样片基线在真实浏览器完成；本次第 7 窗口又以新账户和新记录运行当前 Stage 2 版本：刷新重选后从服务端偏移续传，36 段真实 ASR、1 次真实 LLM 与唯一摘要发布，引用原文/时间核验、两处引用播放、可信停止后 API/Worker 重启读回、媒体删除保留笔记及整条删除均有分段真实浏览器证据。主 Playwright 记录由于验收脚本查询列假设和按钮名称/日志变量问题没有一次全绿，因此不称为单次完整 E2E 通过。第 4 至第 6 窗口的限流、执行中断、队列、预算和删除竞态另在隔离 Compose 与本地模型替身中通过；不代表供应商真实故障注入。真实 20 分钟处理、账户剩余额度及调用后账单证据仍缺失。
+MVP 最终验收已经通过，证据见[Stage 6 验收记录](../../.scratch/mvp-stage-6/validation.md)。最终版 Stage 0 约 17 分 41 秒样片基线在真实浏览器完成；本次 Stage 7 又以新账户和新记录运行当前 Stage 2 版本：刷新重选后从服务端偏移续传，36 段真实 ASR、1 次真实 LLM 与唯一摘要发布，引用原文/时间核验、两处引用播放、可信停止后 API/Worker 重启读回、媒体删除保留笔记及整条删除均有分段真实浏览器证据。主 Playwright 记录由于验收脚本查询列假设和按钮名称/日志变量问题没有一次全绿，因此不称为单次完整 E2E 通过。Stage 4 至 Stage 6 的限流、执行中断、队列、预算和删除竞态另在隔离 Compose 与本地模型替身中通过；不代表供应商真实故障注入。真实 20 分钟处理、账户剩余额度及调用后账单证据仍缺失。
 
 后续按以下顺序推进，每阶段完成后记录真实验证结果：
 
-1. **约 17 分 41 秒真实主流程已完成两次验收。** 第 7 窗口使用独立新账户和记录重新完成续传、真实模型处理、引用播放、重启读回与删除；37 点资源采样覆盖临时空间峰值、容器 SizeRw、内存和 E 盘余量。媒体文件及容器未关闭句柄已核对。Docker LogPath 精确大小和 WSL VHDX 物理变化不可得，E 盘结束余量约有 0.5 MiB 差异未作虚假逐字节归因。20 分钟真实模型处理及调用后账单/额度仍未验证。
-2. **第 1 窗口后端与第 2 窗口浏览器续传/临时上传周期回收已完成。** 后端分片接口、真实浏览器重选续传及 Beat→Redis→维护 Worker 周期回收均已验收；普通上传兼容接口保留。第 2 窗口记录见[规格](../../.scratch/final-stage-2/spec.md)和[验收记录](../../.scratch/final-stage-2/validation.md)。
-3. **第 3 窗口可信停止确认已完成。** 每个新 execution 绑定一次性 Worker 代次、容器、Linux boot ID 和受控 session；同容器监督器先确认整个 session 中本地执行者及后代退出，再通过统一事务登记证据。不能证明停止时保留全局占位，状态接口报告 `stop_unconfirmed` / `STOP_CONFIRMATION_REQUIRED`，禁止恢复和工作目录清理，人工入口只确认精确退出的 Worker 容器。真实进程和容器故障证据见[第 3 窗口验收记录](../../.scratch/final-stage-3/validation.md)。停止证明只覆盖已绑定的 Stage 2 Linux execution session；监督器/容器强停、身份缺失和证据不可验证时仍须人工处理。
-4. **第 4 窗口排队协调与投递补偿已完成。** 不同视频可在分析位占用时持久排队，按入队时间和 task ID 公平领取；pending、unknown、已发送未领取和忙时 ACK 均由 PostgreSQL 维护的代次、检查时间及独立补投预算接续。真实 Beat→Redis→maintenance Worker→analysis Worker 链路确认忙时 ACK 后仍自动推进，全局最大未确认 execution 为 1。参数、历史行迁移和故障证据见[第 4 窗口记录](../../.scratch/final-stage-4/validation.md)。该窗口不自动恢复已经开始执行的失败 attempt。
-5. **共享模型冷却与执行失败后的受控自动恢复已完成。** 共用额度以供应商、非秘密账户引用和模型为键；保留 60–900 秒本地退避、24 小时单次等待、72 小时累计等待、每 task 两次自动恢复和三次总结请求上限，并与第 4 窗口补投预算分开。历史 `failed` / `awaiting_summary` 不由迁移自动启用。参数和本地替身验收边界见[第 5 窗口规格](../../.scratch/final-stage-5/spec.md)及[验收记录](../../.scratch/final-stage-5/validation.md)。
-6. **第 6 窗口已完成。** 删除意图事务取消未完成分析；新媒体请求、任务恢复和迟到结果被拒绝；合法笔记保留；清理在可信停止后幂等重试。隔离浏览器覆盖媒体删除、刷新/API 重启读回与后续整条删除。实现、状态、迁移和验收证据见[第 6 窗口规格](../../.scratch/final-stage-6/spec.md)及[验收记录](../../.scratch/final-stage-6/validation.md)。
-7. **第 7 窗口部分完成。** 当前部署 schema 一致；轻量事务时间线已上线；真实长样片分段浏览器流程和 Stage 4–6 隔离故障回归有证据；README、运行说明、架构边界和脱敏展示材料已交付。最终版标准仍部分满足：缺调用后账户费用/额度证据、真实 20 分钟课程处理，且真实完整 E2E 未取得一次全绿运行。按[验收矩阵](../../.scratch/final-stage-7/acceptance-matrix.md)补验，不以历史窗口记录降低标准。
+1. **约 17 分 41 秒真实主流程已完成两次验收。** Stage 7 使用独立新账户和记录重新完成续传、真实模型处理、引用播放、重启读回与删除；37 点资源采样覆盖临时空间峰值、容器 SizeRw、内存和 E 盘余量。媒体文件及容器未关闭句柄已核对。Docker LogPath 精确大小和 WSL VHDX 物理变化不可得，E 盘结束余量约有 0.5 MiB 差异未作虚假逐字节归因。20 分钟真实模型处理及调用后账单/额度仍未验证。
+2. **Stage 1 后端与 Stage 2 浏览器续传/临时上传周期回收已完成。** 后端分片接口、真实浏览器重选续传及 Beat→Redis→维护 Worker 周期回收均已验收；普通上传兼容接口保留。Stage 2 记录见[规格](../../.scratch/final-stage-2/spec.md)和[验收记录](../../.scratch/final-stage-2/validation.md)。
+3. **Stage 3 可信停止确认已完成。** 每个新 execution 绑定一次性 Worker 代次、容器、Linux boot ID 和受控 session；同容器监督器先确认整个 session 中本地执行者及后代退出，再通过统一事务登记证据。不能证明停止时保留全局占位，状态接口报告 `stop_unconfirmed` / `STOP_CONFIRMATION_REQUIRED`，禁止恢复和工作目录清理，人工入口只确认精确退出的 Worker 容器。真实进程和容器故障证据见[Stage 3 验收记录](../../.scratch/final-stage-3/validation.md)。停止证明只覆盖已绑定的 Stage 2 Linux execution session；监督器/容器强停、身份缺失和证据不可验证时仍须人工处理。
+4. **Stage 4 排队协调与投递补偿已完成。** 不同视频可在分析位占用时持久排队，按入队时间和 task ID 公平领取；pending、unknown、已发送未领取和忙时 ACK 均由 PostgreSQL 维护的代次、检查时间及独立补投预算接续。真实 Beat→Redis→maintenance Worker→analysis Worker 链路确认忙时 ACK 后仍自动推进，全局最大未确认 execution 为 1。参数、历史行迁移和故障证据见[Stage 4 记录](../../.scratch/final-stage-4/validation.md)。该阶段不自动恢复已经开始执行的失败 attempt。
+5. **共享模型冷却与执行失败后的受控自动恢复已完成。** 共用额度以供应商、非秘密账户引用和模型为键；保留 60–900 秒本地退避、24 小时单次等待、72 小时累计等待、每 task 两次自动恢复和三次总结请求上限，并与 Stage 4 补投预算分开。历史 `failed` / `awaiting_summary` 不由迁移自动启用。参数和本地替身验收边界见[Stage 5 规格](../../.scratch/final-stage-5/spec.md)及[验收记录](../../.scratch/final-stage-5/validation.md)。
+6. **Stage 6 已完成。** 删除意图事务取消未完成分析；新媒体请求、任务恢复和迟到结果被拒绝；合法笔记保留；清理在可信停止后幂等重试。隔离浏览器覆盖媒体删除、刷新/API 重启读回与后续整条删除。实现、状态、迁移和验收证据见[Stage 6 规格](../../.scratch/final-stage-6/spec.md)及[验收记录](../../.scratch/final-stage-6/validation.md)。
+7. **Stage 7 部分完成。** 当前部署 schema 一致；轻量事务时间线已上线；真实长样片分段浏览器流程和 Stage 4–6 隔离故障回归有证据；README、运行说明、架构边界和脱敏展示材料已交付。最终版标准仍部分满足：缺调用后账户费用/额度证据、真实 20 分钟课程处理，且真实完整 E2E 未取得一次全绿运行。按[验收矩阵](../../.scratch/final-stage-7/acceptance-matrix.md)补验，不以历史阶段记录降低标准。
 
 本文定义最终版目标；具体接口、状态转换、迁移和测试方案在各实施阶段设计，不以本文件替代技术方案。

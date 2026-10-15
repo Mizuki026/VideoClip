@@ -1,8 +1,8 @@
 # 课迹：最终版技术方案
 
-> 状态：架构审查与关键取舍已确认；第 1 至第 6 窗口按各自范围完成。第 7 窗口已完成 Stage 2 当前部署/schema 核验、持久化事件时间线、真实长样片分段浏览器闭环、隔离故障回归及资源采样；第 7 窗口和最终版整体结论均为部分完成。调用后账户用量/账单、真实 20 分钟课程模型处理和单次全绿长流程 Playwright 仍缺失。见[第 7 窗口验收矩阵](../../.scratch/final-stage-7/acceptance-matrix.md)和[验证记录](../../.scratch/final-stage-7/validation.md)。MVP 已通过最终验收。
+> 状态：架构审查与关键取舍已确认；Stage 1 至 Stage 6 按各自范围完成。Stage 7 已完成 Stage 2 当前部署/schema 核验、持久化事件时间线、真实长样片分段浏览器闭环、隔离故障回归及资源采样；Stage 7 和最终版整体结论均为部分完成。调用后账户用量/账单、真实 20 分钟课程模型处理和单次全绿长流程 Playwright 仍缺失。见[Stage 7 验收矩阵](../../.scratch/final-stage-7/acceptance-matrix.md)和[验证记录](../../.scratch/final-stage-7/validation.md)。MVP 已通过最终验收。
 > 更新日期：2026-10-05。
-> 范围依据：[最终版产品设计](../product/final.md)。已有能力与历史取舍见 [MVP 技术方案](mvp.md) 和 [第六窗口验收记录](../../.scratch/mvp-stage-6/validation.md)。产品行为及验收范围以最终版产品设计为准。
+> 范围依据：[最终版产品设计](../product/final.md)。已有能力与历史取舍见 [MVP 技术方案](mvp.md) 和 [Stage 6 验收记录](../../.scratch/mvp-stage-6/validation.md)。产品行为及验收范围以最终版产品设计为准。
 
 ## 1. 目标、边界与实施原则
 
@@ -62,7 +62,7 @@ flowchart LR
 | 任务生命周期 | 管理 task、attempt、投递、执行停止事实和预算；统一提交检查点与总结，协调共享冷却、到期等待与媒体取消。 |
 | 模型适配器 | 返回转写或待校验总结，以及稳定错误码、可取得的等待提示和筛选后的诊断元数据；供应商响应格式和密钥不作为跨模块业务参数。 |
 | 存储操作 | 提供受租约保护的偏移写入、截断、同步、摘要核对、交接和可重入清理；调用者不得自行拼接受控路径或绕过写入者租约。 |
-| 进程监督 | 第 3 窗口已落地：execution/task/attempt 绑定 Worker 代次、容器和 Linux session；同容器 PID 1 监督器回收 session 内的 FFmpeg、ASR/LLM 请求及其他受控后代，业务事务校验证据后写入对应执行记录。 |
+| 进程监督 | Stage 3 已落地：execution/task/attempt 绑定 Worker 代次、容器和 Linux session；同容器 PID 1 监督器回收 session 内的 FFmpeg、ASR/LLM 请求及其他受控后代，业务事务校验证据后写入对应执行记录。 |
 
 接口包含错误、超时、幂等性与副作用约束；持久化适配器在业务操作内部协作，ORM 会话不作为跨模块业务入口的公共参数。通过组合装配这些依赖。状态转换、错误分类、恢复资格、退避、检查点匹配和请求指纹使用纯函数，显式传入冻结配置、时间及必要的随机输入；网络、进程、文件和事务副作用留在业务操作与适配器中。
 
@@ -74,17 +74,17 @@ flowchart LR
 
 本关记录账户侧模型可用性及计费信息，区分本地零费率配置与实际账单事实。20 分钟时长边界另行验证，不能把约 17 分钟实测称作完整 20 分钟模型验收。
 
-**第 0 窗口实测（2026-10-03）与第 7 窗口复验（2026-10-05）：**同一约 17 分 41 秒 MP4/H.264/AAC 授权源在 Stage 2 新账户/记录完成当前代码分片上传、中断后刷新并重选续传、36/36 ASR 成功、1 次 LLM 合法唯一摘要发布、引用原文/时间核对及两处浏览器定位播放。停止确认后仅重启 API/Worker，结果和时间线仍可读；随后媒体删除返回 410 且笔记可读，整条删除相关接口 404。E2E 因测试审计 SQL/selector/日志变量问题分段完成，没有一次全绿长流程运行。第 7 窗口 37 点采样记录了目录、E 盘、内存、SizeRw 和 Docker 分类；WSL VHDX 物理变化及 Docker LogPath 精确长度不可得。v4 在 3072、6144 输出上限触及 `finish_reason=length`，v5 新任务仍为冻结配置；旧 v4 快照未变。详见[第 0 窗口历史记录](../../.scratch/final-stage-0/validation.md)与[第 7 窗口验证](../../.scratch/final-stage-7/validation.md)。1200 秒边界 fixture 通过，但真实 20 分钟模型处理、剩余额度和调用后账单仍未验证。
+**Stage 0 实测（2026-10-03）与 Stage 7 复验（2026-10-05）：**同一约 17 分 41 秒 MP4/H.264/AAC 授权源在 Stage 2 新账户/记录完成当前代码分片上传、中断后刷新并重选续传、36/36 ASR 成功、1 次 LLM 合法唯一摘要发布、引用原文/时间核对及两处浏览器定位播放。停止确认后仅重启 API/Worker，结果和时间线仍可读；随后媒体删除返回 410 且笔记可读，整条删除相关接口 404。E2E 因测试审计 SQL/selector/日志变量问题分段完成，没有一次全绿长流程运行。Stage 7 37 点采样记录了目录、E 盘、内存、SizeRw 和 Docker 分类；WSL VHDX 物理变化及 Docker LogPath 精确长度不可得。v4 在 3072、6144 输出上限触及 `finish_reason=length`，v5 新任务仍为冻结配置；旧 v4 快照未变。详见[Stage 0 历史记录](../../.scratch/final-stage-0/validation.md)与[Stage 7 验证](../../.scratch/final-stage-7/validation.md)。1200 秒边界 fixture 通过，但真实 20 分钟模型处理、剩余额度和调用后账单仍未验证。
 
 ## 4. 分片续传
 
 ### 4.1 协议与持久化
 
-选择 **8 MiB** 为默认分片大小，最后一片可更小；这是传输单元，不是视频字节上限。大文件使用顺序分片，避免并行写同一源文件。继续保留现有普通上传接口供已有调用方使用；第 2 窗口后浏览器默认使用分片续传接口。
+选择 **8 MiB** 为默认分片大小，最后一片可更小；这是传输单元，不是视频字节上限。大文件使用顺序分片，避免并行写同一源文件。继续保留现有普通上传接口供已有调用方使用；Stage 2 后浏览器默认使用分片续传接口。
 
 在现有 `UploadHandoff` 上增加协议类型、声明总字节、预期完整 SHA-256、已确认偏移、到期时间与完成结果；新增按 `upload_id + chunk_index` 唯一的分片记录，保存偏移、长度与 SHA-256。`Video.upload_id` 的唯一约束继续保证一次上传只生成一条视频。会话归属用户，沿用 Cookie / CSRF 校验与受控文件名，上传会话编号不授予跨账号访问权。
 
-第 1 窗口已定稿并实现以下 HTTP 路径。创建带用户范围的 `Idempotency-Key`；分片请求使用 `application/octet-stream` 和 `X-Chunk-SHA256`。所有变更沿用 Cookie/CSRF/Origin 验证和用户归属检查：
+Stage 1 已定稿并实现以下 HTTP 路径。创建带用户范围的 `Idempotency-Key`；分片请求使用 `application/octet-stream` 和 `X-Chunk-SHA256`。所有变更沿用 Cookie/CSRF/Origin 验证和用户归属检查：
 
 | 操作 | 行为 |
 | --- | --- |
@@ -92,9 +92,9 @@ flowchart LR
 | `GET /uploads/{id}` | 返回状态、服务端确认偏移、下一索引、分片摘要、到期时间及完成后的视频 ID；不续期，并在租约下核验确认内容、截去未确认尾部。 |
 | `PUT /uploads/{id}/chunks/{index}` | 流式校验实际长度及摘要，严格顺序写入一个受控 `.part` 文件；文件 `fsync` 后才提交分片行与确认偏移。完全相同重放幂等，冲突/乱序返回稳定错误。 |
 | `POST /uploads/{id}/complete` | 核对全部分片和完整 SHA-256、ffprobe 时长与时间轴规则，再沿用持久化交接意图、原子改名和唯一视频登记；重复完成返回同一视频。 |
-| `DELETE /uploads/{id}` | 持租约放弃并清理未完成会话；已登记视频必须走原视频删除接口。可重试的到期回收入口为 `reclaim_expired_uploads(factory, store, now=None, limit=100) -> int`；第 2 窗口已把它接入独立维护周期。 |
+| `DELETE /uploads/{id}` | 持租约放弃并清理未完成会话；已登记视频必须走原视频删除接口。可重试的到期回收入口为 `reclaim_expired_uploads(factory, store, now=None, limit=100) -> int`；Stage 2 已把它接入独立维护周期。 |
 
-会话从创建或最后一次成功的新分片/完全相同重放起有效 24 小时。查询、错误请求和部分传输不续期。主要稳定错误包括 `UPLOAD_BUSY`、`UPLOAD_OUT_OF_ORDER`、`UPLOAD_CHUNK_CONFLICT`、`UPLOAD_INCOMPLETE`、`UPLOAD_EXPIRED`、`UPLOAD_STORAGE_CORRUPT`、`UPLOAD_CONFIRMATION_PENDING`、`UPLOAD_FINALIZATION_PENDING` 和 `UPLOAD_CLEANUP_PENDING`；完整表、状态图及请求/响应样例见[第 1 窗口规格](../../.scratch/final-stage-1/spec.md)。
+会话从创建或最后一次成功的新分片/完全相同重放起有效 24 小时。查询、错误请求和部分传输不续期。主要稳定错误包括 `UPLOAD_BUSY`、`UPLOAD_OUT_OF_ORDER`、`UPLOAD_CHUNK_CONFLICT`、`UPLOAD_INCOMPLETE`、`UPLOAD_EXPIRED`、`UPLOAD_STORAGE_CORRUPT`、`UPLOAD_CONFIRMATION_PENDING`、`UPLOAD_FINALIZATION_PENDING` 和 `UPLOAD_CLEANUP_PENDING`；完整表、状态图及请求/响应样例见[Stage 1 规格](../../.scratch/final-stage-1/spec.md)。
 
 ### 4.2 写入与故障边界
 
@@ -108,31 +108,31 @@ flowchart LR
 
 鉴权播放与 Range 响应在正常结束、客户端断开或响应取消时关闭已打开的媒体文件句柄，避免已删除视频因未完成的播放器请求继续占用 E 盘。关闭服务端句柄不撤销已经发送到客户端的字节，也不把文件租约当作在途媒体读取的停止证明。
 
-原始文件与处理中间文件可能同时占用空间。准入不依据固定 5 GiB 水位或单文件字节上限，但实际磁盘不足应中止当前操作、记录可见错误并清理；不能宣布上传完成或分析成功。第 0 窗口的容器可写层处理中峰值及 E 盘空闲差额归因仍未验证；第 1 窗口记录了实际 HTTP 上传前后的应用目录字节数与 E 盘可用空间，但没有进行峰值采样或归因，不替代上述未验证项。
+原始文件与处理中间文件可能同时占用空间。准入不依据固定 5 GiB 水位或单文件字节上限，但实际磁盘不足应中止当前操作、记录可见错误并清理；不能宣布上传完成或分析成功。Stage 0 的容器可写层处理中峰值及 E 盘空闲差额归因仍未验证；Stage 1 记录了实际 HTTP 上传前后的应用目录字节数与 E 盘可用空间，但没有进行峰值采样或归因，不替代上述未验证项。
 
 ### 4.3 浏览器摘要与恢复
 
-第 2 窗口将默认浏览器上传切换为上述分片接口，保留 `/videos` 普通上传路由供旧调用方。`@noble/hashes` 锁定为 `1.8.0`；Web Worker 对 8 MiB 的 `Blob.slice()` 增量计算完整 SHA-256 和各片 SHA-256，不把大文件读入内存。摘要计算、上传与完成校验分别显示，XHR 请求可中止；已确认偏移与当前片发送进度分开展示。
+Stage 2 将默认浏览器上传切换为上述分片接口，保留 `/videos` 普通上传路由供旧调用方。`@noble/hashes` 锁定为 `1.8.0`；Web Worker 对 8 MiB 的 `Blob.slice()` 增量计算完整 SHA-256 和各片 SHA-256，不把大文件读入内存。摘要计算、上传与完成校验分别显示，XHR 请求可中止；已确认偏移与当前片发送进度分开展示。
 
 在首次创建请求前，浏览器按用户 ID 在 `localStorage` 持久化文件名、长度、摘要、幂等键、会话 ID 和创建时间，不持久化视频内容或凭据。刷新后必须重新选文件并重算摘要；摘要一致时复用同一幂等键和服务端会话。不同内容即使同名同长度也使用新会话，不接续旧分片。每次不确定的创建、分片或完成结果都先查询服务端状态；只根据 `confirmed_offset` 推进，不以已发送字节推测确认。暂停中止本地计算/请求并保留会话；放弃调用 DELETE，只有 204 清理完成时才删除本地条目，202 保留待清理状态。登出、会话过期或当前账户组件卸载时中止旧请求并释放文件引用。
 
 ### 4.4 临时上传周期回收
 
-第 2 窗口新增单实例 Beat，默认每 60 秒投递临时上传回收；第 4 窗口在同一个 Beat 增加分析投递协调任务。持久调度文件位于 Stage 2 的 `data/mvp-stage-2/app/maintenance-beat-schedule`。分析任务明确路由到 `analysis`，分析 Worker 只消费该队列且 `--concurrency=1`、prefetch 1；维护 Worker 只消费 `maintenance`、并发 1。上传回收与投递协调各自默认扫描 4 项并限制在 1–8；分析协调节拍默认 60 秒，均通过现有维护任务运行。维护 Worker 调用回收和统一投递业务入口，不领取分析任务、不调用 ASR/LLM。投递操作保留既有 ACK 与可信停止语义，并由分析 Worker 在实际领取处执行全局安全门禁。
+Stage 2 新增单实例 Beat，默认每 60 秒投递临时上传回收；Stage 4 在同一个 Beat 增加分析投递协调任务。持久调度文件位于 Stage 2 的 `data/mvp-stage-2/app/maintenance-beat-schedule`。分析任务明确路由到 `analysis`，分析 Worker 只消费该队列且 `--concurrency=1`、prefetch 1；维护 Worker 只消费 `maintenance`、并发 1。上传回收与投递协调各自默认扫描 4 项并限制在 1–8；分析协调节拍默认 60 秒，均通过现有维护任务运行。维护 Worker 调用回收和统一投递业务入口，不领取分析任务、不调用 ASR/LLM。投递操作保留既有 ACK 与可信停止语义，并由分析 Worker 在实际领取处执行全局安全门禁。
 
-Beat 发布前以 Redis 单飞键合并重复的排队/运行任务；维护任务再以各自 PostgreSQL advisory lock 跳过并发扫描。Celery late-ack 和 Worker 丢失拒绝策略让维护 Worker 重启后重新处理；上传清理失败仍由持久化 `cleanup_intent` 标识并供后续周期重试。文件清理须取得上传租约并核对完成交接、登记视频；活跃写入跳过，稳定 inode 的租约标记不删除。分析协调额外使用独立的 owner-token Redis 锁（180 秒 TTL），数据库连接释放时 advisory lock 随之释放；任务超时为 140/150 秒，锁释放核对 owner，遗留 Redis 锁可过期恢复。上传回收与分析协调各有独立锁和有界扫描，在并发 1 的维护 Worker 队列中轮转。Compose 复用后端镜像；维护 Worker 与 Beat 分别设 384 MiB/192 MiB 内存和 64 PID 上限，各自 JSON 日志轮转 10 MiB × 2。实测 Beat 空闲约 69 MiB，因此最终上限为 192 MiB；实际资源及上传回收证据见[第 2 窗口验收记录](../../.scratch/final-stage-2/validation.md)，投递协调证据见[第 4 窗口验收记录](../../.scratch/final-stage-4/validation.md)。
+Beat 发布前以 Redis 单飞键合并重复的排队/运行任务；维护任务再以各自 PostgreSQL advisory lock 跳过并发扫描。Celery late-ack 和 Worker 丢失拒绝策略让维护 Worker 重启后重新处理；上传清理失败仍由持久化 `cleanup_intent` 标识并供后续周期重试。文件清理须取得上传租约并核对完成交接、登记视频；活跃写入跳过，稳定 inode 的租约标记不删除。分析协调额外使用独立的 owner-token Redis 锁（180 秒 TTL），数据库连接释放时 advisory lock 随之释放；任务超时为 140/150 秒，锁释放核对 owner，遗留 Redis 锁可过期恢复。上传回收与分析协调各有独立锁和有界扫描，在并发 1 的维护 Worker 队列中轮转。Compose 复用后端镜像；维护 Worker 与 Beat 分别设 384 MiB/192 MiB 内存和 64 PID 上限，各自 JSON 日志轮转 10 MiB × 2。实测 Beat 空闲约 69 MiB，因此最终上限为 192 MiB；实际资源及上传回收证据见[Stage 2 验收记录](../../.scratch/final-stage-2/validation.md)，投递协调证据见[Stage 4 验收记录](../../.scratch/final-stage-4/validation.md)。
 
 ## 5. 排队协调、补投与后续恢复
 
 ### 5.1 Stage 4：持久化资格和唯一领取
 
-第 4 窗口已把可排队、尚未领取的分析任务交给 PostgreSQL 协调。新视频 task 按 (queue_entered_at, task.id) 排序；提交相同时使用稳定 task UUID 决胜。HTTP / 人工恢复和 Beat 扫描不能用发布顺序改变领取公平性。分析 Worker 在实际 claim 处再核对同一排序、视频可用性、task 当前 attempt、attempt 仍 queued 且 claim_count=0，并使用原全局 execution advisory lock 与未确认 execution 查询。一个 task / attempt 的过期消息会被忽略并 ACK，不产生副作用。
+Stage 4 已把可排队、尚未领取的分析任务交给 PostgreSQL 协调。新视频 task 按 (queue_entered_at, task.id) 排序；提交相同时使用稳定 task UUID 决胜。HTTP / 人工恢复和 Beat 扫描不能用发布顺序改变领取公平性。分析 Worker 在实际 claim 处再核对同一排序、视频可用性、task 当前 attempt、attempt 仍 queued 且 claim_count=0，并使用原全局 execution advisory lock 与未确认 execution 查询。一个 task / attempt 的过期消息会被忽略并 ACK，不产生副作用。
 
 HTTP 提交、人工恢复和扫描都调用 analysis_delivery.coordinate_analysis_delivery。reservation 在短事务锁定 video、task、attempt、delivery 并写入操作代次；Celery 网络发送在事务外发生；回执在另一短事务中按代次与当前资格 CAS。reservation 提交后进程退出、发送结果 unknown、成功发送但确认写回丢失、发送后未领取，都由 delivery_next_check_at 及下一代操作协调。sent 不等同于已领取。Redis 只承载 task / attempt 消息，不是业务事实源。
 
 两个维护锁互相独立：上传回收和分析投递协调各有 Redis SET NX token lock（TTL 180 秒、释放时 owner 比对）及 PostgreSQL advisory lock。过期 Redis 锁自行释放；进程退出会释放 PostgreSQL session lock。两项 Beat 节拍默认 60 秒，维护任务扫描上界为 4 项，软/硬时限 140/150 秒；维护 Worker 并发 1，继续消费已有临时上传回收和新增分析协调任务。独立键和有界扫描避免遗留锁永久停扫，也避免一个长扫描长期饿死另一个维护操作。维护 Worker 只扫描、判定和发起投递，不 claim 分析、不调用 ASR/LLM；分析 Worker 仍并发 1、prefetch 1，ACK 策略和可信停止流程不变。
 
-若全局未确认 execution 的绑定身份完整、监督器已登记且 process_scope 受第 3 窗口支持，状态可报告 execution_slot_occupied。身份缺失、监督器/容器异常或边界不受支持时报告 stop_confirmation_required，并保持人工处理；排队资格不构成接管许可。即使之后人工确认停止，本窗口也不自动重试任何已经开始执行的 attempt。
+若全局未确认 execution 的绑定身份完整、监督器已登记且 process_scope 受 Stage 3 支持，状态可报告 execution_slot_occupied。身份缺失、监督器/容器异常或边界不受支持时报告 stop_confirmation_required，并保持人工处理；排队资格不构成接管许可。即使之后人工确认停止，本阶段也不自动重试任何已经开始执行的 attempt。
 
 ### 5.2 Stage 4：独立、有界的投递预算
 
@@ -154,7 +154,7 @@ delivery_deadline_at 在首次 reservation 时设定，只累计可以推进投�
 
 ### 5.3 迁移和历史兼容
 
-迁移 b4c91e7a2d60 只添加本窗口必需的 nullable task 协调列、排序索引和 TaskDelivery.operation_generation，不为历史行回填默认值。协调器只扫描显式初始化了队列时间与预算的任务；既有 failed / awaiting_summary 不自动重新排队，不按 attempt 序号估算预算，不修改冻结快照、来源不匹配记录、已发布结果或检查点。符合旧有人工恢复资格的历史任务可由显式操作一次性初始化新的协调预算；这不推断旧供应商请求是否到达。
+迁移 b4c91e7a2d60 只添加本阶段必需的 nullable task 协调列、排序索引和 TaskDelivery.operation_generation，不为历史行回填默认值。协调器只扫描显式初始化了队列时间与预算的任务；既有 failed / awaiting_summary 不自动重新排队，不按 attempt 序号估算预算，不修改冻结快照、来源不匹配记录、已发布结果或检查点。符合旧有人工恢复资格的历史任务可由显式操作一次性初始化新的协调预算；这不推断旧供应商请求是否到达。
 
 ### 5.4 Stage 5：共享冷却与受控自动恢复（已完成）
 
@@ -169,9 +169,9 @@ delivery_deadline_at 在首次 reservation 时设定，只累计可以推进投�
 
 客户端子进程只通过稳定错误码、最多 128 字符的 `Retry-After` 原值及 UTC 响应观测时间回传 429；不传递密钥或响应正文。按照 RFC 9110 §10.2.3 解析非负秒数或 HTTP-date。没有合法字段时使用 `[ceil(nominal/2), nominal]` 的 equal-jitter 指数退避，`nominal=min(max, base×2^(n-1))`；随机值与 UTC 时间由纯函数显式注入。429 更新用数据库行锁原子累积次数并写 `max(当前截止, 新截止)`，较短建议不缩短共享截止。成功请求仅在请求开始时间已过截止后清零连续限流数。
 
-ASR 每段、summary 及同 attempt 的有限修复请求在启动/预留前都再次检查共享冷却，并先提交预留事务，再发起网络请求。调用前被门禁阻断是正常等待，不记作执行失败，不预留 ASR/总结请求或自动恢复次数；已经启动的 429 是真实失败，预算不返还。等待状态、额度身份、起点、供应商截止、单次期限、累计已等待和下一阶段持久化；due 扫描复核当前共享冷却，冷却延长时只更新等待，不创建重复 attempt。`waiting_model` 不进入可执行队列；到期后经统一生命周期事务重新入队。冷却期间暂停第 4 窗口投递 deadline，解除后顺延；8 次补投与 24 小时可推进期限保持原义。
+ASR 每段、summary 及同 attempt 的有限修复请求在启动/预留前都再次检查共享冷却，并先提交预留事务，再发起网络请求。调用前被门禁阻断是正常等待，不记作执行失败，不预留 ASR/总结请求或自动恢复次数；已经启动的 429 是真实失败，预算不返还。等待状态、额度身份、起点、供应商截止、单次期限、累计已等待和下一阶段持久化；due 扫描复核当前共享冷却，冷却延长时只更新等待，不创建重复 attempt。`waiting_model` 不进入可执行队列；到期后经统一生命周期事务重新入队。冷却期间暂停 Stage 4 投递 deadline，解除后顺延；8 次补投与 24 小时可推进期限保持原义。
 
-自动恢复只接受稳定白名单：可信 Supervisor 确认后的 `WORKER_EXECUTION_INTERRUPTED`、ASR/LLM 网络和超时、上游 5xx/过载及 429。鉴权/权限、无效模型、源文件、非法媒体、冻结来源或指纹不匹配、总结结果校验失败、未知错误和停止无法证明均不自动重跑。旧 execution 必须有第 3 窗口可信证据，当前 task/video 绑定及其他门禁有效后才能创建 child。自动操作接受并创建 child 时同事务增加恢复数，每 task 最多 2 次；等待续接、扫描、人工恢复和补投不增加它。完整转写使用 `summary-only`，未完成转写只复制 manifest 与音频/请求指纹均匹配的已成功片段。供应商响应已经返回但检查点尚未提交时可能再次请求，不承诺外部请求恰好一次。
+自动恢复只接受稳定白名单：可信 Supervisor 确认后的 `WORKER_EXECUTION_INTERRUPTED`、ASR/LLM 网络和超时、上游 5xx/过载及 429。鉴权/权限、无效模型、源文件、非法媒体、冻结来源或指纹不匹配、总结结果校验失败、未知错误和停止无法证明均不自动重跑。旧 execution 必须有 Stage 3 可信证据，当前 task/video 绑定及其他门禁有效后才能创建 child。自动操作接受并创建 child 时同事务增加恢复数，每 task 最多 2 次；等待续接、扫描、人工恢复和补投不增加它。完整转写使用 `summary-only`，未完成转写只复制 manifest 与音频/请求指纹均匹配的已成功片段。供应商响应已经返回但检查点尚未提交时可能再次请求，不承诺外部请求恰好一次。
 
 | 预算 | Stage 5 完成规则 |
 | --- | --- |
@@ -179,11 +179,11 @@ ASR 每段、summary 及同 attempt 的有限修复请求在启动/预留前都�
 | 执行失败自动恢复 | 每 task 最多 2 次；仅自动接受并创建子 attempt 时原子计数。 |
 | 总结请求 | 每 task 最多 3 次，跨自动/人工 attempt 共用；每次请求开始前预留，失败或预留后中断不返还。预算耗尽保留合法转写并关闭无效恢复入口。 |
 
-迁移 `7c2a91e5b04d` 只增加 Stage 5 所需字段和冷却表；历史 `failed` / `awaiting_summary` 不自动纳入或伪造预算、账户身份、冻结快照。新任务显式初始化预算；部署后的显式人工恢复/总结操作在被接受时才登记历史 task 的 Stage 5 纳入与独立预算。完整参数、状态表、故障分类和验收证据见[第 5 窗口规格](../../.scratch/final-stage-5/spec.md)及[验收记录](../../.scratch/final-stage-5/validation.md)。
+迁移 `7c2a91e5b04d` 只增加 Stage 5 所需字段和冷却表；历史 `failed` / `awaiting_summary` 不自动纳入或伪造预算、账户身份、冻结快照。新任务显式初始化预算；部署后的显式人工恢复/总结操作在被接受时才登记历史 task 的 Stage 5 纳入与独立预算。完整参数、状态表、故障分类和验收证据见[Stage 5 规格](../../.scratch/final-stage-5/spec.md)及[验收记录](../../.scratch/final-stage-5/validation.md)。
 
-第 6 窗口已实现视频媒体与笔记分离删除；第 4 窗口保留的整条删除门禁继续兼容。删除和投递 reservation 共用视频/task 锁，删除获胜后撤销队列资格；发送中的迟到结果无法恢复 task，迟到消息也无法通过 Worker claim。
+Stage 6 已实现视频媒体与笔记分离删除；Stage 4 保留的整条删除门禁继续兼容。删除和投递 reservation 共用视频/task 锁，删除获胜后撤销队列资格；发送中的迟到结果无法恢复 task，迟到消息也无法通过 Worker claim。
 
-第 3 窗口的真实停止确认边界保持不变：只覆盖已绑定的 Stage 2 Linux execution session。监督器/容器/宿主机强停、缺少 execution 身份或不可验证的证据仍阻断自动接管及危险清理，需要人工核对；详见[第 3 窗口规格](../../.scratch/final-stage-3/spec.md)和[验收记录](../../.scratch/final-stage-3/validation.md)。
+Stage 3 的真实停止确认边界保持不变：只覆盖已绑定的 Stage 2 Linux execution session。监督器/容器/宿主机强停、缺少 execution 身份或不可验证的证据仍阻断自动接管及危险清理，需要人工核对；详见[Stage 3 规格](../../.scratch/final-stage-3/spec.md)和[验收记录](../../.scratch/final-stage-3/validation.md)。
 
 ## 6. 单独删除原视频并保留笔记
 
@@ -205,7 +205,7 @@ ASR 每段、summary 及同 attempt 的有限修复请求在启动/预留前都�
 
 现有状态表保持唯一事实源。为演示和刷新后追溯，增加轻量执行事件记录：时间、视频/task/attempt 编号、阶段、稳定错误码、自动/人工动作和关联请求编号。日志使用结构化字段关联同一事件；不写入密码、Cookie、密钥、课程原文、完整转写或原始模型响应。页面只返回当前用户的数据与经过筛选的诊断信息。
 
-第 7 窗口已实现 `analysis_events`（迁移 `1a7e3c9d5b42`）。事件通过 `record_analysis_event()` 在 owning transaction 中锁定 task 行、按 task/event key 幂等插入；业务状态和事件同事务提交/回滚。请求只允许白名单内部引用，按用户/视频范围查询，最大 100 条游标分页；重启后从 PostgreSQL 读回，整条记录删除时级联移除。旧任务不回填历史事件，事件不能驱动状态转换或恢复门禁。Stage 2 `alembic check` 无差异。
+Stage 7 已实现 `analysis_events`（迁移 `1a7e3c9d5b42`）。事件通过 `record_analysis_event()` 在 owning transaction 中锁定 task 行、按 task/event key 幂等插入；业务状态和事件同事务提交/回滚。请求只允许白名单内部引用，按用户/视频范围查询，最大 100 条游标分页；重启后从 PostgreSQL 读回，整条记录删除时级联移除。旧任务不回填历史事件，事件不能驱动状态转换或恢复门禁。Stage 2 `alembic check` 无差异。
 
 Compose 增加 Beat 与维护 Worker，两者复用现有后端镜像；Beat 的本地调度文件和业务临时文件落在 `E:\VideoClip\data` 的项目目录。继续隔离 Stage 1 测试库与 Stage 2 演示数据，服务仅开放本机需要的端口。记录新增镜像/缓存、容器层与日志占用；预计及实测不超过 7 GiB 才沿用现有 Docker 环境。全局 Docker 调整必须先做已有项目基线、备份、回滚和运行验证。
 
@@ -215,17 +215,17 @@ Alembic 分阶段迁移：先加入可空或带默认值的新字段及新表，
 
 任务状态约束需容纳等待与恢复阶段，且区分“分析结果终态”“执行停止确认”“清理状态”；迁移前核对现有历史 `failed` / `awaiting_summary` 数据及两条已知来源失配任务，不擅自自动恢复或清理它们。保留当前 `task_acks_late=False` 等投递行为，先用数据库协调补齐恢复；调整 Celery 消息确认策略必须另做重复投递和执行门禁测试。
 
-迁移按窗口拆分：第 4 窗口 `b4c91e7a2d60` 仅增加 nullable 排队协调字段、排序索引和投递操作代次；后续窗口才增加各自所需的媒体、共享冷却或执行恢复字段。MVP 历史 attempt 均不能仅按序号回填成自动恢复次数；新计数字段的默认值也不代表历史失败任务已获自动恢复授权，已有任务的纳入范围在迁移前明确核对。
+迁移按阶段拆分：Stage 4 `b4c91e7a2d60` 仅增加 nullable 排队协调字段、排序索引和投递操作代次；后续阶段才增加各自所需的媒体、共享冷却或执行恢复字段。MVP 历史 attempt 均不能仅按序号回填成自动恢复次数；新计数字段的默认值也不代表历史失败任务已获自动恢复授权，已有任务的纳入范围在迁移前明确核对。
 
 ## 9. 分阶段实施与验证
 
 | 阶段 | 交付和直接验证 |
 | --- | --- |
-| 0. 长样本基线 | **约 17 分 41 秒真实主流程已通过第 0 窗口并于第 7 窗口复验。** 36 段真实 ASR、唯一总结、引用播放、API/Worker 重启读回和删除有当前代码浏览器/API 证据。第 7 窗口采集容器可写层、内存、E 盘和 Docker 分类；Docker 净增量 MB 级、低于 7 GiB。精确 WSL VHDX/LogPath 大小仍未知；20 分钟真实模型处理和调用后账户费用/额度未验证。 |
-| 1. 分片续传 | **第 1 窗口后端完成**：迁移、HTTP 会话与分片接口、启动恢复、租约回收和 Stage 2 后端验收。**第 2 窗口完成**：浏览器摘要/重选/续传、独立临时上传周期回收、Stage 2 真浏览器和 Beat→Redis→维护 Worker 验收。详见[第 1 窗口规格](../../.scratch/final-stage-1/spec.md)、[第 1 窗口验收](../../.scratch/final-stage-1/validation.md)和[第 2 窗口验收](../../.scratch/final-stage-2/validation.md)。 |
-| 2. 可信停止与排队活性 | **第 3 窗口可信停止确认、第 4 窗口排队协调/投递补偿及第 5 窗口共享冷却/受控自动恢复均已完成**：Stage 3 绑定 Linux session 的停止门禁；Stage 4 持久化队列资格、8 次补投及 24 小时可推进期限；Stage 5 账户/模型共享冷却、到期续接、最多两次自动恢复和三次总结请求独立额度，均以本地隔离服务和浏览器验收。详见[第 5 窗口验收记录](../../.scratch/final-stage-5/validation.md)。 |
-| 3. 视频/笔记分离 | **第 6 窗口已完成。** 独立状态、原子取消、笔记固定 attempt、迟到结果/领取门禁、可信停止后文件清理、失败重试、媒体 GET/HEAD/Range、真实受控进程和隔离浏览器读回通过。详见[规格](../../.scratch/final-stage-6/spec.md)及[验收记录](../../.scratch/final-stage-6/validation.md)。 |
-| 4. 最终验收 | **第 7 窗口部分完成；最终版标准部分满足。** Stage 2 schema、迁移、事件时间线、真实样片分段用户流程、Stage 4–6 替身故障回归、边界 fixture、资源采样和展示材料有逐项证据。调用后账户证据、真实 20 分钟处理和一次全绿长流程 Playwright 缺失；逐项状态见[验收矩阵](../../.scratch/final-stage-7/acceptance-matrix.md)。 |
+| 0. 长样本基线 | **约 17 分 41 秒真实主流程已通过 Stage 0 并于 Stage 7 复验。** 36 段真实 ASR、唯一总结、引用播放、API/Worker 重启读回和删除有当前代码浏览器/API 证据。Stage 7 采集容器可写层、内存、E 盘和 Docker 分类；Docker 净增量 MB 级、低于 7 GiB。精确 WSL VHDX/LogPath 大小仍未知；20 分钟真实模型处理和调用后账户费用/额度未验证。 |
+| 1. 分片续传 | **Stage 1 后端完成**：迁移、HTTP 会话与分片接口、启动恢复、租约回收和 Stage 2 后端验收。**Stage 2 完成**：浏览器摘要/重选/续传、独立临时上传周期回收、Stage 2 真浏览器和 Beat→Redis→维护 Worker 验收。详见[Stage 1 规格](../../.scratch/final-stage-1/spec.md)、[Stage 1 验收](../../.scratch/final-stage-1/validation.md)和[Stage 2 验收](../../.scratch/final-stage-2/validation.md)。 |
+| 2. 可信停止与排队活性 | **Stage 3 可信停止确认、Stage 4 排队协调/投递补偿及 Stage 5 共享冷却/受控自动恢复均已完成**：Stage 3 绑定 Linux session 的停止门禁；Stage 4 持久化队列资格、8 次补投及 24 小时可推进期限；Stage 5 账户/模型共享冷却、到期续接、最多两次自动恢复和三次总结请求独立额度，均以本地隔离服务和浏览器验收。详见[Stage 5 验收记录](../../.scratch/final-stage-5/validation.md)。 |
+| 3. 视频/笔记分离 | **Stage 6 已完成。** 独立状态、原子取消、笔记固定 attempt、迟到结果/领取门禁、可信停止后文件清理、失败重试、媒体 GET/HEAD/Range、真实受控进程和隔离浏览器读回通过。详见[规格](../../.scratch/final-stage-6/spec.md)及[验收记录](../../.scratch/final-stage-6/validation.md)。 |
+| 4. 最终验收 | **Stage 7 部分完成；最终版标准部分满足。** Stage 2 schema、迁移、事件时间线、真实样片分段用户流程、Stage 4–6 替身故障回归、边界 fixture、资源采样和展示材料有逐项证据。调用后账户证据、真实 20 分钟处理和一次全绿长流程 Playwright 缺失；逐项状态见[验收矩阵](../../.scratch/final-stage-7/acceptance-matrix.md)。 |
 
 每个阶段先跑直接相关测试，再跑受影响范围的完整后端 pytest、Stage 0 回归、Ruff、mypy、前端 lint/单测/构建及必要的 Playwright 测试。跨模块里程碑还检查 Alembic、Compose 配置、依赖完整性及重启后持久化。新增行为需要回归测试；不得用直接改写 Stage 2 业务表伪造真实验收场景。
 
@@ -245,9 +245,9 @@ Alembic 分阶段迁移：先加入可空或带默认值的新字段及新表，
 
 | 项目 | 当前事实 |
 | --- | --- |
-| MVP | 第六窗口验收通过；真实浏览器验证约 6 分钟样片，13 段转写、总结和人工恢复。 |
-| 最终版设计 | 第 1 至第 6 窗口均按各自范围完成；第 7 窗口部分完成，完整矩阵与展示材料见 `.scratch/final-stage-7/`。整体不宣布通过。 |
-| 新样片与第 0/7 窗口 | 当前版本完成真实分片续传、36 段 ASR、一次 LLM、引用播放、重启读回及两种删除；长流程 E2E 因 harness 失败分段验证。资源峰值已采样；20 分钟真实处理及调用后账单仍未验证。 |
-| 增量功能 | 第 1 至第 6 窗口隔离回归历史记录仍有效；第 7 窗口本次重跑 Stage 4/5/6 本地替身链路通过。它们不证明真实供应商故障注入或收费情况。 |
+| MVP | Stage 6 验收通过；真实浏览器验证约 6 分钟样片，13 段转写、总结和人工恢复。 |
+| 最终版设计 | Stage 1 至 Stage 6 均按各自范围完成；Stage 7 部分完成，完整矩阵与展示材料见 `.scratch/final-stage-7/`。整体不宣布通过。 |
+| 新样片与 Stage 0/Stage 7 | 当前版本完成真实分片续传、36 段 ASR、一次 LLM、引用播放、重启读回及两种删除；长流程 E2E 因 harness 失败分段验证。资源峰值已采样；20 分钟真实处理及调用后账单仍未验证。 |
+| 增量功能 | Stage 1 至 Stage 6 隔离回归历史记录仍有效；Stage 7 本次重跑 Stage 4/5/6 本地替身链路通过。它们不证明真实供应商故障注入或收费情况。 |
 
-第 7 窗口不是最终版整体通过：待账户提供调用后账单/剩余额度证据；若 20 分钟真实课程仍为必需项，需另有授权样片并先核对免费额度；真实 E2E 单次全绿记录也待补。隔离替身结果与真实供应商调用在材料中分开列示。Stage 2 原历史数据完整保留，Stage 7 新测试用户和视频已按流程清理。
+Stage 7 不是最终版整体通过：待账户提供调用后账单/剩余额度证据；若 20 分钟真实课程仍为必需项，需另有授权样片并先核对免费额度；真实 E2E 单次全绿记录也待补。隔离替身结果与真实供应商调用在材料中分开列示。Stage 2 原历史数据完整保留，Stage 7 新测试用户和视频已按流程清理。
