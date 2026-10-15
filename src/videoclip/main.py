@@ -464,7 +464,7 @@ def create_app(
                 if user is not None:
                     user.password_hash = hash_password(payload.password)
 
-        raw_session = new_session_token()
+        raw_session = new_session_token() # 生成随机会话令牌
         raw_csrf = new_csrf_token(resolved_settings.app_secret_key.get_secret_value())
         now = datetime.now(UTC)
         expires = now + timedelta(hours=resolved_settings.session_ttl_hours)
@@ -491,13 +491,14 @@ def create_app(
             while len(active) >= resolved_settings.max_sessions_per_user:
                 active.pop(0).revoked_at = now
             session.add(
+                # 把令牌哈希和会话信息保存到数据库
                 SessionRecord(
                     user_id=user_id,
                     token_hash=token_hash(raw_session),
                     csrf_hash=hashlib.sha256(raw_csrf.encode("ascii")).hexdigest(),
                     expires_at=expires,
                 )
-            )
+            ) # 通过 response.set_cookie() 返回登录 Cookie
         # 登录 Cookie 保存随机令牌原值，数据库保存对应哈希。
         # HttpOnly 禁止脚本读取，Secure 和 SameSite 的取值由配置决定。
         response.set_cookie(
