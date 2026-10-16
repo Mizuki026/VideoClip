@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# 本模块收口账户、媒体上传和删除服务，通过持久化交接意图把数据库状态与文件操作协调起来。
+
 import asyncio
 import hashlib
 import logging
@@ -270,6 +272,7 @@ async def receive_video_upload(
             raise HTTPException(status_code=408, detail="upload exceeded its total deadline") from exc
         part_file.close()
         part_file = None
+        # 只有请求流完整结束且文件关闭后才探测媒体，避免对仍在写入的临时文件建立正式记录。
         if byte_count == 0:
             raise HTTPException(status_code=422, detail="empty video uploads are not accepted")
         digest_value = digest.hexdigest()
@@ -296,6 +299,7 @@ async def receive_video_upload(
                 raise
         except MediaError as exc:
             raise HTTPException(status_code=422, detail=exc.code.lower()) from exc
+        # 先持久化 promoting 交接状态再改名，进程中断后恢复器才能判断文件是否已开始接管。
         _set_upload_promoting(factory, upload_id, media)
         store.promote(upload_id, upload_id.hex)
         finalization_attempted = True
