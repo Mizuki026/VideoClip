@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# 本模块封装本地媒体与分析文件的受控路径、跨进程写入租约和清理操作。
 import errno
 import hashlib
 import importlib
@@ -241,6 +242,7 @@ class MediaStore:
         )
 
     def promote(self, upload_id: UUID, storage_name: str) -> None:
+        # 用文件名替换完成临时分片到正式媒体路径的交接，避免复制期间暴露半成品。
         os.replace(self.part_path(upload_id), self.target_path(storage_name))
         self._verified_upload_prefixes.pop(upload_id, None)
 
@@ -271,6 +273,7 @@ class MediaStore:
             raise StorageFailure(errno.EINVAL, "invalid generated attempt path")
         if not path.exists():
             return
+        # 遍历时不进入符号链接目录，清理范围限制在已校验过的本次尝试目录内。
         for root, directories, files in os.walk(path, topdown=False, followlinks=False):
             root_path = Path(root)
             for name in files:
