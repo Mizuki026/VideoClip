@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# 本模块负责把数据库中的排队任务转换为消息代理投递，并持久记录补投预算与不确定回执。
+
 import logging
 import uuid
 from collections.abc import Callable
@@ -251,6 +253,7 @@ def _reserve_delivery(
         if not _is_current_unclaimed(video, task, attempt):
             return None, "not_eligible"
 
+        # 协调器与 Worker 共用执行闸门；执行位被占用时先挂起投递期限，避免把等待误算为失败。
         if not try_acquire_execution_gate(session):
             active_execution = _active_execution_wait(session)
             blocked_reason = (
@@ -404,6 +407,7 @@ def coordinate_analysis_delivery(
     if reservation is None:
         return state
     code: str | None
+    # 预留事务已在网络调用前提交，不跨代理请求持有数据库锁；回执再按 generation 条件回写。
     try:
         # Broker 确认可能丢失；generation 会记录不确定结果，后续补投扫描负责收敛。
         publisher(str(task_id), str(attempt_id))
