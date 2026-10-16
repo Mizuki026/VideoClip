@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# 本模块通过受限的 ffprobe 探测读取媒体信息，并只接受已经验证过的容器、编码和时间轴组合。
+
 import json
 import math
 import os
@@ -95,9 +97,11 @@ def validate_probe(probe: dict[str, Any], max_seconds: float = 1200.0) -> MediaI
     audio_duration = _number(audio.get("duration", container_duration), "audio.duration")
     if video_duration <= 0 or audio_duration <= 0:
         raise MediaError("INVALID_DURATION", "audio and video durations must be positive")
+    # 以容器和必需音视频轨道中最短的时长作为可用区间，避免暴露缺少实际音画内容的尾段。
     effective_duration = min(container_duration, video_duration, audio_duration)
     if effective_duration > max_seconds:
         raise MediaError("VIDEO_DURATION_LIMIT", "video exceeds the 1200 second duration limit")
+    # 仅把业务需要且已检查过的轨道字段写入结果，避免直接持久化 ffprobe 的任意原始输出。
     sanitized_streams = [
         {
             "index": int(stream.get("index", index)),
