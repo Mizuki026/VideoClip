@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# 本模块在分析任务所属事务内追加事件时间线，持久化实体引用和状态变化而不保存正文内容。
+
 import re
 import uuid
 
@@ -69,6 +71,7 @@ def record_analysis_event(
         raise ValueError("unsupported analysis event actor")
     if request_reference is not None and not _SAFE_REQUEST_REFERENCE.fullmatch(request_reference):
         raise ValueError("analysis event request reference must be a safe internal identifier")
+    # 先锁住任务行，使同一 task 的并发追加按顺序检查幂等键并写入。
     task = session.scalar(select(AnalysisTask).where(AnalysisTask.id == task_id).with_for_update())
     if task is None:
         return None
@@ -80,6 +83,7 @@ def record_analysis_event(
     )
     if existing is not None:
         return existing
+    # 事件只记录执行身份、阶段和受限错误码，不复制转写片段或模型响应。
     event = AnalysisEvent(
         owner_id=task.owner_id,
         video_id=task.video_id,
