@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# 本模块构造并核验 Worker 停止证据，供任务恢复流程安全解除执行占用。
 import argparse
 import hashlib
 import json
@@ -117,6 +118,7 @@ def operator_container_stop_evidence(
 ) -> StopEvidence:
     if not exited or identity.process_scope != PROCESS_SCOPE or not _CONTAINER_ID.fullmatch(container_id):
         raise ValueError("the exact Worker container stop is not proven")
+    # 容器短 ID 用于关联 Worker 实例；后续还会把该证据与完整执行身份及数据库记录复核。
     if not identity.worker_container_id or container_id[:12] != identity.worker_container_id[:12]:
         raise ValueError("the stopped container does not match this execution's Worker instance")
     observation: dict[str, object] = {"container_id": container_id, "container_state": "exited"}
