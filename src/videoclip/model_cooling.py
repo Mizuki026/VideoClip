@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# 本模块按服务商、非秘密账户引用和模型共享限流状态，并把供应商重试时间与本地退避合并为统一冷却期限。
+
 import math
 import re
 import uuid
@@ -179,6 +181,7 @@ def extend_shared_cooldown(
     timestamp = require_utc(now)
     observed_at = require_utc(response_received_at) if response_received_at is not None else timestamp
     with db_transaction(factory) as session:
+        # 先确保复合身份对应的冷却行存在，再加行锁合并并发响应，避免不同 worker 互相覆盖状态。
         session.execute(
             insert(SharedModelCooldown)
             .values(
@@ -218,6 +221,7 @@ def extend_shared_cooldown(
             policy=policy,
         )
         current = require_utc(row.cooldown_until)
+        # 冷却期限只向后延长；较短或乱序到达的响应不能提前解除其他请求已登记的等待。
         row.cooldown_until = max(current, candidate)
         row.consecutive_backpressure_responses = count
         row.last_backpressure_at = timestamp
@@ -242,5 +246,6 @@ def record_model_success(
             )
             .with_for_update()
         )
+        # 仅当本次成功请求开始时旧冷却已经结束才重置计数，避免迟到的成功抹掉新一轮限流。
         if row is not None and require_utc(row.cooldown_until) <= started:
             row.consecutive_backpressure_responses = 0
