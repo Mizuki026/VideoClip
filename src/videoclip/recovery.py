@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# 本模块在服务启动时修复未完成的上传交接和清理任务，依据数据库中的持久状态决定继续接管还是安全回收。
+
 import hashlib
 import logging
 import uuid
@@ -195,8 +197,10 @@ def recover_interrupted_work(factory: sessionmaker[Session], settings: Settings,
                 select(Video.owner_id, Video.id).where(Video.status.in_(("deleting", "cleanup_failed")))
             ).all()
         )
+    # 查询阶段只收集待办编号；摘要校验和文件操作在会话关闭后逐条执行，避免长时间占用事务。
     for upload_id in pending_upload_ids:
         _recover_one(factory, settings, store, upload_id)
+    # 删除恢复复用服务层的停止证明和清理门禁，不在启动扫描中绕过业务约束直接删文件。
     for owner_id, video_id in pending_deletions:
         try:
             delete_video(factory, store, owner_id, video_id)
