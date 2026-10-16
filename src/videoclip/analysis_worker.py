@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# 本模块执行已领取的分析尝试：在受控执行边界内生成转写检查点，并按冻结配置校验和发布摘要。
+
 import hashlib
 import json
 import logging
@@ -2023,6 +2025,7 @@ def transcribe_analysis(task_id_value: str, attempt_id_value: str | None = None)
             return {"status": "global_execution_busy"}
         worker_id = f"{socket.gethostname()}:{os.getpid()}"
         try:
+            # 队列消息只是唤醒信号；领取时仍需重新核对任务顺序、当前尝试和执行身份。
             claim = _claim_attempt(lease, task_id, attempt_id, worker_id, boundary)
         except IntegrityError:
             return {"status": "global_execution_busy"}
@@ -2041,6 +2044,7 @@ def transcribe_analysis(task_id_value: str, attempt_id_value: str | None = None)
                 return {"status": "stop_confirmation_required"}
         attempt_deadline = time.monotonic() + int(claim.snapshot["limits"]["attempt_total_seconds"])
         try:
+            # 摘要续跑复用已持久化的完整转写，不重新切片或重复调用 ASR。
             if claim.execution_mode != "summary_only":
                 _transcribe(maker, lease, claim, settings, store, attempt_deadline)
             _summarize(maker, lease, claim, store, attempt_deadline, settings)
@@ -2056,6 +2060,7 @@ def transcribe_analysis(task_id_value: str, attempt_id_value: str | None = None)
             failure_code = exc.code
             terminal_reason = exc.code
             if exc.code in MODEL_BACKPRESSURE_ERROR_CODES:
+                # 限流或过载响应按服务商返回时刻更新共享冷却，实际失败状态仍由后续事务记录。
                 try:
                     identity = _backpressure_identity(claim, exc.code, settings)
                     update = extend_shared_cooldown(
