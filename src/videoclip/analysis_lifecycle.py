@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# 本模块统一处理分析尝试的续跑与恢复，保证新尝试只从已核实的父尝试派生。
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -182,6 +183,7 @@ def create_followup_attempt(
         DeliveryPolicy.from_settings(settings) if settings is not None else DeliveryPolicy()
     )
     with db_transaction(factory) as session:
+        # 按视频、任务、父尝试逐级加锁，避免并发恢复重复创建子尝试或跨任务续跑。
         video_query = select(Video).where(Video.id == video_id)
         if owner_id is not None:
             video_query = video_query.where(Video.owner_id == owner_id)
