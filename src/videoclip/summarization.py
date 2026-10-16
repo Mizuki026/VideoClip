@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# 本模块固定摘要请求与响应契约，并从已保存的转写片段中重建可验证的引文和播放时间。
+
 import hashlib
 import json
 import math
@@ -579,9 +581,11 @@ def validate_summary_output(
         result = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise SummaryFailure("SUMMARY_INVALID_JSON") from exc
+    # 顶层字段必须与契约完全一致，多余输出也拒绝，避免模型扩展字段绕过后端校验。
     if not isinstance(result, dict) or set(result) != {"chapters", "key_points"}:
         raise SummaryFailure("SUMMARY_INVALID_SCHEMA")
     by_id: dict[int, Mapping[str, Any]] = {}
+    # 先建立连续且无重复的片段索引，后续引用只能指向本次已验证的转写清单。
     for item in segments:
         number = item.get("segment_number")
         if type(number) is not int or number in by_id:
