@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# 本模块提供分析任务的提交、恢复和结果读取入口，具体尝试状态变更交由生命周期与投递协调模块完成。
+
 import hashlib
 import json
 import math
@@ -378,6 +380,7 @@ def recover_analysis_attempt(
             )
         )
         session.commit()
+    # 先验证任务确属当前用户，再让生命周期模块核对停止证据、失败类型和恢复预算。
     if task_owner != owner_id:
         raise HTTPException(status_code=404, detail="analysis task not found")
     return create_followup_attempt(
@@ -455,6 +458,7 @@ def task_response(
         current_attempt_id = task.current_attempt_id
         if current_attempt_id is None:
             raise HTTPException(status_code=503, detail="analysis task state needs maintenance")
+        # 允许读取指定尝试的结果，但后续仍单独标记它是否为当前尝试，以限制恢复操作。
         selected_attempt_id = attempt_id or current_attempt_id
         attempt = session.get(AnalysisAttempt, selected_attempt_id)
         if attempt is not None and attempt.task_id != task.id:
