@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# 本模块管理可续传上传会话，依据已确认偏移、分片摘要和文件租约协调重放、校验与正式接管。
+
 import asyncio
 import errno
 import hashlib
@@ -161,6 +163,7 @@ def create_upload_session(
             session.flush()
             return upload_id, upload.state, total_bytes, 0, expires_at, False
     except IntegrityError:
+        # 并发创建由数据库唯一约束选出胜者；重新读取会话后仍须确认请求元数据完全一致。
         existing = find_existing()
         if existing is None or not _matching_create_request(existing, display_name, total_bytes, sha256):
             raise _error(409, "UPLOAD_IDEMPOTENCY_CONFLICT") from None
@@ -590,6 +593,7 @@ async def complete_upload_session(
                 confirmed_offset=upload.confirmed_offset,
                 total_bytes=total_bytes,
             )
+        # 分片逐片校验不能替代整文件复核，完成前再次核对声明总长度和完整内容摘要。
         try:
             byte_count, actual_sha = store.file_sha256(upload_id)
         except StorageFailure as exc:
@@ -650,6 +654,7 @@ async def complete_upload_session(
             _mark_failed(factory, upload_id, "UPLOAD_INVALID_MEDIA")
             raise _error(422, "UPLOAD_INVALID_MEDIA") from exc
 
+        # 探测通过后先落库交接状态，再改名并登记视频，失败时可由恢复流程继续完成。
         _set_upload_promoting(factory, upload_id, media)
         try:
             store.promote(upload_id, upload_id.hex)
