@@ -36,7 +36,7 @@ def verify_password(password_hash: str, password: str) -> bool:
     except (VerifyMismatchError, VerificationError, InvalidHashError):
         return False
 
-
+# 生成随机令牌和计算哈希
 # Cookie 返回随机令牌，数据库只保存其 SHA-256 摘要以便校验会话。
 def new_session_token() -> str:
     # 用 32 字节安全随机数生成令牌，不把用户编号或密码编码进 Cookie。
