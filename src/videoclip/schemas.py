@@ -6,7 +6,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-
+# 定义 Pydantic 校验规则，字段没有默认值，所以必须提供。extra="forbid" 表示拒绝未定义的字段，例如额外传入 role 会校验失败
 # 注册和登录模型限定接口可接收的字段与长度，额外字段会被拒绝。
 class RegisterRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=False)
