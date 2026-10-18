@@ -40,7 +40,7 @@ from videoclip.storage import MediaStore, StorageFailure, WriterLease
 
 logger = logging.getLogger("videoclip.services")
 
-
+# 控制数据库事务，db_transaction() 使用 SQLAlchemy 的 session.begin() 管理事务，正常结束时提交，异常时回滚
 @contextmanager
 def db_transaction(factory: sessionmaker[Session]) -> Iterator[Session]:
     with factory() as session:
