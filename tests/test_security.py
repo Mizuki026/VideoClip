@@ -17,7 +17,7 @@ from videoclip.security import hash_password, new_csrf_token, token_hash, verify
 from videoclip.settings import Settings
 from videoclip.storage import MediaStore
 
-
+# 具体的测试用例
 def test_password_hash_is_argon2id_and_session_hash_is_one_way() -> None:
     # 密码用 Argon2id 验证，会话令牌另用 SHA-256 保存摘要。
     value = hash_password("correct horse battery staple")
@@ -37,7 +37,7 @@ def test_csrf_token_signature_is_bound_to_secret() -> None:
     assert not verify_csrf_token("x" * 32, token)
     assert not verify_csrf_token("s" * 32, token + ".extra")
 
-
+# 创建 FastAPI 应用，通过两个 TestClient 模拟不同用户，完成注册、登录、查询当前用户和退出。除了检查响应，还会查询数据库，确认只保存令牌哈希
 def test_two_users_register_login_and_logout_invalidates_session(
     session_factory: sessionmaker[Session], test_settings: Settings, tmp_path: Path, caplog
 ) -> None:
