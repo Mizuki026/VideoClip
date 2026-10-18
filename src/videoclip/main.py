@@ -435,6 +435,7 @@ def create_app(
         response.headers["Cache-Control"] = "no-store"
         return CsrfResponse(csrf_token=token)
 
+    # 定义注册、登录接口，FastAPI 根据这两个参数类型，自动调用 Pydantic 校验请求
     @app.post("/auth/register", status_code=201, response_model=UserResponse)
     def register(payload: RegisterRequest, request: Request, response: Response) -> UserResponse:
         current = _current_auth(request, resolved_factory, required=False)
