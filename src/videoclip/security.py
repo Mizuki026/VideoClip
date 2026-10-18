@@ -12,7 +12,7 @@ from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatc
 PASSWORDS = PasswordHasher(time_cost=3, memory_cost=65_536, parallelism=2, hash_len=32, salt_len=16)
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,31}$")
 
-
+# 检查用户名格式，必须以英文字母或数字开头，后续允许英文字母、数字、下划线、点和短横线，总长度3到32
 # 用户名先按统一规则校验并规范化，数据库唯一性检查使用规范化后的值。
 def validate_username(value: str) -> str:
     normalized = value.strip().lower()
