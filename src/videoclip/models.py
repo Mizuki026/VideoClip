@@ -36,7 +36,7 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-
+# 定义会话表的存储结构，新会话创建时，revoked_at 默认为空，表示尚未撤销；退出登录时才写入撤销时间，并不是登录时写入一个布尔状态
 class SessionRecord(Base):
     # 登录会话保存在 sessions 表，Cookie 中的原始令牌不入库。
     __tablename__ = "sessions"
